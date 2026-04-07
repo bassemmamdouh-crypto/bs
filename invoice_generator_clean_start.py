@@ -14,16 +14,11 @@ import xlwings as xw
 # SETTINGS (EDIT THIS SECTION)
 # =============================
 ORDERS_FILE = r"E:\Marbah Products\Marbah Invoices script\orders_data.xlsx"
-DEFAULT_TEMPLATE_FILE = r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx"
+DEFAULT_TEMPLATE_FILE = r"E:\Marbah Products\Marbah Invoices script\invoice_templet.xlsx"
 OUTPUT_ROOT = r"E:\Marbah Products\Marbah Invoices script"
 
-# Optional area-specific templates:
-AREA_TEMPLATE_MAP = {
-    "EL MANSOUR": r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx",
-    "AMRIA": r"E:\Marbah Products\Marbah Invoices script\eldora_invoice_template.xlsx",
-    "EL GAMAA": r"E:\Marbah Products\Marbah Invoices script\Pepsi_invoice_template.xlsx",
-    "OTAYFIA & ALAWY": r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx",
-}
+# Use one template for all invoices (no area-specific templates).
+AREA_TEMPLATE_MAP: Dict[str, str] = {}
 
 
 @dataclass
@@ -76,6 +71,12 @@ class ScriptConfig:
     )
     item_name_column_candidates: List[str] = field(
         default_factory=lambda: ["sku_name", "item_name", "product_name", "product_name_ar", "item", "description"]
+    )
+    brand_column_candidates: List[str] = field(
+        default_factory=lambda: ["brand", "brand_name", "product_brand", "manufacturer"]
+    )
+    size_column_candidates: List[str] = field(
+        default_factory=lambda: ["size", "pack_size", "sku_size", "item_size", "variant_size"]
     )
     qty_column_candidates: List[str] = field(default_factory=lambda: ["purchased_item_count", "qty", "quantity", "item_qty"])
     unit_column_candidates: List[str] = field(default_factory=lambda: ["unit", "uom", "unit_name"])
@@ -291,8 +292,9 @@ def aggregate_order_level_numeric(order_df: pd.DataFrame, column_name: str) -> f
 
 
 def choose_template_file(area_value: str, config: ScriptConfig) -> str:
-    key = safe_str(area_value).upper()
-    return config.area_template_map.get(key, config.default_template_file)
+    _ = area_value
+    # Always use the same invoice template file for all areas.
+    return config.default_template_file
 
 
 def get_sheet_if_exists(workbook: xw.Book, sheet_name: str) -> Optional[xw.Sheet]:
@@ -428,6 +430,49 @@ def infer_line_item_name(row: pd.Series, config: ScriptConfig) -> str:
     return "Unnamed Item"
 
 
+def extract_size_text(item_name: str) -> str:
+    # Extract simple textual size patterns (e.g., 330ml, 1.5L, 90 g).
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*(ml|l|g|kg|gm|cl|oz|pcs|pc)?", safe_str(item_name, ""), re.IGNORECASE)
+    if not match:
+        return ""
+    num = match.group(1).replace(",", ".")
+    unit = safe_str(match.group(2), "").lower()
+    return f"{num}{unit}"
+
+
+def parse_size_sort(size_text: str) -> tuple:
+    text = safe_str(size_text, "").lower()
+    if not text:
+        return (9, float("inf"), "")
+
+    unit_order = {
+        "ml": 1,
+        "l": 2,
+        "g": 3,
+        "gm": 3,
+        "kg": 4,
+        "cl": 5,
+        "oz": 6,
+        "pcs": 7,
+        "pc": 7,
+    }
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*([a-z]+)?", text)
+    if not match:
+        return (8, float("inf"), text)
+
+    size_num = safe_float(match.group(1).replace(",", "."), float("inf"))
+    unit = safe_str(match.group(2), "").lower()
+    return (unit_order.get(unit, 8), size_num, unit)
+
+
+def sku_sort_key(item: Dict[str, object]) -> tuple:
+    brand = safe_str(item.get("brand", ""), "").lower()
+    size = safe_str(item.get("size", ""), "")
+    unit_rank, size_num, unit = parse_size_sort(size)
+    item_name = safe_str(item.get("item_name", ""), "").lower()
+    return (brand, unit_rank, size_num, unit, item_name)
+
+
 def row_first_value(row: pd.Series, candidates: List[str], default: object = "") -> object:
     for col in candidates:
         if col in row.index:
@@ -442,12 +487,20 @@ def build_base_items(order_df: pd.DataFrame, config: ScriptConfig) -> List[Dict[
     for _, row in order_df.iterrows():
         name = infer_line_item_name(row, config)
         unit = safe_str(row_first_value(row, config.unit_column_candidates, ""), "")
+        brand = safe_str(row_first_value(row, config.brand_column_candidates, ""), "")
+        if not brand:
+            brand = safe_str(name.split(" ")[0] if safe_str(name, "") else "", "")
+        size = safe_str(row_first_value(row, config.size_column_candidates, ""), "")
+        if not size:
+            size = extract_size_text(name)
         qty = safe_float(row_first_value(row, config.qty_column_candidates, 0), 0.0)
         amount = safe_float(row_first_value(row, config.amount_column_candidates, 0), 0.0)
-        key = f"{name}||{unit}"
+        key = f"{brand}||{size}||{name}||{unit}"
         if key not in aggregated:
             aggregated[key] = {
                 "item_name": name,
+                "brand": brand,
+                "size": size,
                 "qty": 0.0,
                 "unit": unit,
                 "gift_qty": 0.0,
@@ -461,7 +514,8 @@ def build_base_items(order_df: pd.DataFrame, config: ScriptConfig) -> List[Dict[
         for item in aggregated.values()
         if safe_float(item["qty"], 0.0) != 0.0 or safe_float(item["net_amount"], 0.0) != 0.0
     ]
-    items.sort(key=lambda x: safe_str(x["item_name"], ""))
+    # Required ordering: brand first, then size.
+    items.sort(key=sku_sort_key)
     return items
 
 
