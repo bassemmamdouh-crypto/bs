@@ -59,6 +59,37 @@ class ScriptConfig:
     adjustment_row: int = 157
     net_total_row: int = 158
     free_row: int = 159
+    gift_quantity_columns: List[str] = field(
+        default_factory=lambda: ["second_run_gift", "doritos_gift"]
+    )
+    discount_amount_candidates: List[str] = field(
+        default_factory=lambda: [
+            "discount_amount",
+            "offer_discount_amount",
+            "promo_discount",
+            "order_discount",
+        ]
+    )
+    discount_percent_candidates: List[str] = field(
+        default_factory=lambda: [
+            "discount_percent",
+            "offer_discount_percent",
+            "promo_discount_percent",
+        ]
+    )
+    adjustment_amount_candidates: List[str] = field(
+        default_factory=lambda: ["adjustment_amount", "offer_adjustment", "promo_adjustment"]
+    )
+    offer_item_name_candidates: List[str] = field(
+        default_factory=lambda: ["offer_item_name", "offer_name", "promo_item_name", "promo_name"]
+    )
+    offer_item_qty_candidates: List[str] = field(
+        default_factory=lambda: ["offer_item_qty", "offer_qty", "promo_qty"]
+    )
+    offer_item_price_candidates: List[str] = field(
+        default_factory=lambda: ["offer_item_price", "offer_item_amount", "promo_amount"]
+    )
+    include_offer_lines: bool = True
     routes: List[RouteConfig] = field(
         default_factory=lambda: [
             RouteConfig("EL MANSOUR", TEMPLATE_FILE, "El-Mansour"),
@@ -95,9 +126,34 @@ REQUIRED_COLUMNS: Dict[str, object] = {
     "item_name": "",
     "product_name": "",
     "product_name_ar": "",
+    "discount_amount": 0,
+    "discount_percent": 0,
+    "adjustment_amount": 0,
+    "offer_item_name": "",
+    "offer_item_qty": 0,
+    "offer_item_price": 0,
+    "offer_discount_amount": 0,
+    "offer_discount_percent": 0,
+    "promo_discount": 0,
+    "promo_discount_percent": 0,
+    "offer_adjustment": 0,
+    "promo_adjustment": 0,
+    "offer_name": "",
+    "promo_name": "",
+    "offer_qty": 0,
+    "promo_qty": 0,
+    "offer_item_amount": 0,
+    "promo_amount": 0,
     "second_run_gift": 0,
     "doritos_gift": 0,
 }
+
+
+@dataclass
+class OfferResult:
+    line_items: List[Dict[str, float]]
+    discount_amount: float
+    adjustment_amount: float
 
 
 def log_warning(message: str) -> None:
@@ -191,6 +247,22 @@ def first_existing_value(row: pd.Series, candidates: List[str], default: str = "
     return default
 
 
+def prettify_column_name(column_name: str) -> str:
+    return str(column_name).replace("_", " ").strip().title()
+
+
+def aggregate_offer_numeric(series: pd.Series) -> float:
+    numeric = pd.to_numeric(series, errors="coerce").fillna(0)
+    non_zero = numeric[numeric != 0]
+    if non_zero.empty:
+        return 0.0
+    unique_values = non_zero.unique()
+    # If the same order-level value is repeated per row, do not multiply it.
+    if len(unique_values) == 1 and len(non_zero) > 1:
+        return float(unique_values[0])
+    return float(non_zero.sum())
+
+
 def safe_write(ws: xw.Sheet, cell: str, value: object) -> None:
     try:
         ws[cell].value = value
@@ -272,6 +344,67 @@ def build_invoice_items(
     items = list(aggregated.values())
     items.sort(key=lambda x: x["item_name"])
     return items
+
+
+def build_offer_result(
+    order_data: pd.DataFrame,
+    subtotal_price: float,
+    config: ScriptConfig,
+) -> OfferResult:
+    offer_lines: Dict[str, Dict[str, float]] = {}
+
+    # 1) Gift quantities from configured gift columns.
+    for gift_col in config.gift_quantity_columns:
+        if gift_col not in order_data.columns:
+            continue
+        gift_qty = aggregate_offer_numeric(order_data[gift_col])
+        if gift_qty <= 0:
+            continue
+        label = f"{prettify_column_name(gift_col)} Offer"
+        offer_lines[label] = {
+            "item_name": label,
+            "qty": gift_qty,
+            "price": 0.0,
+        }
+
+    # 2) Optional explicit offer item rows.
+    for _, row in order_data.iterrows():
+        offer_name = first_existing_value(row, config.offer_item_name_candidates, "")
+        if not offer_name:
+            continue
+
+        offer_qty = safe_float(first_existing_value(row, config.offer_item_qty_candidates, 0), 0)
+        offer_price = safe_float(first_existing_value(row, config.offer_item_price_candidates, 0), 0)
+        if offer_name not in offer_lines:
+            offer_lines[offer_name] = {"item_name": offer_name, "qty": 0.0, "price": 0.0}
+        offer_lines[offer_name]["qty"] += offer_qty
+        offer_lines[offer_name]["price"] += offer_price
+
+    # 3) Discount logic from amount and percent columns.
+    discount_amount = 0.0
+    for discount_col in config.discount_amount_candidates:
+        if discount_col in order_data.columns:
+            discount_amount += aggregate_offer_numeric(order_data[discount_col])
+
+    discount_percent = 0.0
+    for percent_col in config.discount_percent_candidates:
+        if percent_col in order_data.columns:
+            discount_percent += aggregate_offer_numeric(order_data[percent_col])
+    if discount_percent:
+        discount_amount += subtotal_price * (discount_percent / 100.0)
+
+    # 4) Adjustments (positive/negative) if needed.
+    adjustment_amount = 0.0
+    for adjustment_col in config.adjustment_amount_candidates:
+        if adjustment_col in order_data.columns:
+            adjustment_amount += aggregate_offer_numeric(order_data[adjustment_col])
+
+    result_lines = sorted(list(offer_lines.values()), key=lambda x: x["item_name"])
+    return OfferResult(
+        line_items=result_lines,
+        discount_amount=safe_float(discount_amount, 0.0),
+        adjustment_amount=safe_float(adjustment_amount, 0.0),
+    )
 
 
 def ensure_line_capacity(ws: xw.Sheet, required_lines: int, config: ScriptConfig) -> int:
@@ -377,39 +510,31 @@ def fill_invoice_lines(
         ws.range((excel_row, 6)).value = item["price"]
 
 
-def add_free_item_and_totals(
+def write_totals(
     ws: xw.Sheet,
-    order_data: pd.DataFrame,
-    free_products: List[int],
+    line_items: List[Dict[str, float]],
+    offer_result: OfferResult,
     config: ScriptConfig,
     row_shift: int,
 ) -> None:
-    if "product_id" in order_data.columns:
-        free_qty = safe_float(order_data[order_data["product_id"].isin(free_products)]["purchased_item_count"].sum())
-    else:
-        free_qty = 0.0
-
-    shifted_free_row = config.free_row + row_shift
     shifted_totals_row = config.totals_row + row_shift
     shifted_subtotal_row = config.subtotal_row + row_shift
     shifted_discount_row = config.discount_row + row_shift
     shifted_adjustment_row = config.adjustment_row + row_shift
     shifted_net_total_row = config.net_total_row + row_shift
 
-    if free_qty > 0:
-        ws.range((shifted_free_row, 2)).value = "هدايه"
-        ws.range((shifted_free_row, 3)).value = free_qty
-        ws.range((shifted_free_row, 6)).value = 0
-
-    total_qty = safe_float(order_data.get("purchased_item_count", pd.Series(dtype=float)).sum()) + free_qty
-    total_price = safe_float(order_data.get("total_price", pd.Series(dtype=float)).sum())
+    total_qty = sum(safe_float(item.get("qty", 0), 0.0) for item in line_items)
+    subtotal_price = sum(safe_float(item.get("price", 0), 0.0) for item in line_items)
+    discount_amount = max(0.0, safe_float(offer_result.discount_amount, 0.0))
+    adjustment_amount = safe_float(offer_result.adjustment_amount, 0.0)
+    net_total = subtotal_price - discount_amount + adjustment_amount
 
     ws.range((shifted_totals_row, 3)).value = total_qty
-    ws.range((shifted_totals_row, 6)).value = total_price
-    ws.range((shifted_subtotal_row, 5)).value = total_price
-    ws.range((shifted_discount_row, 5)).value = 0
-    ws.range((shifted_adjustment_row, 5)).value = 0
-    ws.range((shifted_net_total_row, 5)).value = total_price
+    ws.range((shifted_totals_row, 6)).value = subtotal_price
+    ws.range((shifted_subtotal_row, 5)).value = subtotal_price
+    ws.range((shifted_discount_row, 5)).value = discount_amount
+    ws.range((shifted_adjustment_row, 5)).value = adjustment_amount
+    ws.range((shifted_net_total_row, 5)).value = net_total
 
 
 def process_route(route_cfg: RouteConfig, orders_df: pd.DataFrame, app: xw.App, config: ScriptConfig) -> Optional[str]:
@@ -467,7 +592,13 @@ def process_route(route_cfg: RouteConfig, orders_df: pd.DataFrame, app: xw.App, 
         new_ws.name = make_unique_sheet_name(normalized_order_id, existing_names)
 
         write_header_data(new_ws, order_data, normalized_order_id)
-        line_items = build_invoice_items(order_data, normalized_order_id, mapping_column, config)
+        base_items = build_invoice_items(order_data, normalized_order_id, mapping_column, config)
+        subtotal_price = sum(safe_float(item.get("price", 0), 0.0) for item in base_items)
+        offer_result = build_offer_result(order_data, subtotal_price, config)
+        line_items = list(base_items)
+        if config.include_offer_lines and offer_result.line_items:
+            line_items.extend(offer_result.line_items)
+
         row_shift = ensure_line_capacity(new_ws, len(line_items), config)
         fill_invoice_lines(
             new_ws,
@@ -475,7 +606,7 @@ def process_route(route_cfg: RouteConfig, orders_df: pd.DataFrame, app: xw.App, 
             config,
             row_shift,
         )
-        add_free_item_and_totals(new_ws, order_data, config.free_products, config, row_shift)
+        write_totals(new_ws, line_items, offer_result, config, row_shift)
 
     if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
         output_wb.sheets["TempSheet"].delete()
