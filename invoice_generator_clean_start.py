@@ -19,6 +19,12 @@ OUTPUT_ROOT = r"E:\Marbah Products\Marbah Invoices script"
 
 # Use one template for all invoices (no area-specific templates).
 AREA_TEMPLATE_MAP: Dict[str, str] = {}
+TEMPLATE_FILENAME_CANDIDATES = [
+    "invoice_templet.xlsx",
+    "invoice_template.xlsx",
+    "invoice templet.xlsx",
+    "invoice template.xlsx",
+]
 
 
 @dataclass
@@ -170,6 +176,9 @@ REQUIRED_COLUMNS_DEFAULTS: Dict[str, object] = {
     "route_agent": "",
     "run": "",
     "sku_name": "",
+}
+
+OPTIONAL_COLUMNS_DEFAULTS: Dict[str, object] = {
     "sku_code": "",
 }
 
@@ -203,11 +212,12 @@ def apply_column_aliases(df: pd.DataFrame, aliases: Dict[str, List[str]]) -> pd.
     return df
 
 
-def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object]) -> pd.DataFrame:
+def ensure_columns(df: pd.DataFrame, defaults: Dict[str, object], warn_missing: bool = True) -> pd.DataFrame:
     for col, default in defaults.items():
         if col not in df.columns:
             df[col] = default
-            log_warning(f"Column '{col}' missing in orders file. Default value applied.")
+            if warn_missing:
+                log_warning(f"Column '{col}' missing in orders file. Default value applied.")
     return df
 
 
@@ -291,10 +301,26 @@ def aggregate_order_level_numeric(order_df: pd.DataFrame, column_name: str) -> f
     return float(non_zero.sum())
 
 
+def resolve_template_path(template_path: str) -> str:
+    """
+    Return first existing template path among common filename variants.
+    """
+    if os.path.exists(template_path):
+        return template_path
+
+    base_path = Path(template_path)
+    parent = base_path.parent
+    for candidate_name in TEMPLATE_FILENAME_CANDIDATES:
+        candidate_path = parent / candidate_name
+        if candidate_path.exists():
+            return str(candidate_path)
+    return template_path
+
+
 def choose_template_file(area_value: str, config: ScriptConfig) -> str:
     _ = area_value
     # Always use the same invoice template file for all areas.
-    return config.default_template_file
+    return resolve_template_path(config.default_template_file)
 
 
 def get_sheet_if_exists(workbook: xw.Book, sheet_name: str) -> Optional[xw.Sheet]:
@@ -765,7 +791,8 @@ def main() -> None:
     orders_df = pd.read_excel(config.orders_file)
     orders_df = normalize_columns(orders_df)
     orders_df = apply_column_aliases(orders_df, COLUMN_ALIASES)
-    orders_df = ensure_columns(orders_df, REQUIRED_COLUMNS_DEFAULTS)
+    orders_df = ensure_columns(orders_df, REQUIRED_COLUMNS_DEFAULTS, warn_missing=True)
+    orders_df = ensure_columns(orders_df, OPTIONAL_COLUMNS_DEFAULTS, warn_missing=False)
     for dt_col in [config.delivery_date_column, "order_date", "order_time"]:
         if dt_col in orders_df.columns:
             orders_df[dt_col] = pd.to_datetime(orders_df[dt_col], errors="coerce")
