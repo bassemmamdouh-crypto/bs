@@ -338,20 +338,43 @@ def make_unique_sheet_name(base_name: str, existing_names: set) -> str:
     return candidate[:31]
 
 
-def ensure_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig) -> int:
+def adjust_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig) -> int:
+    """
+    Adjust line section size to exactly match required_count:
+    - insert rows before footer if items exceed template capacity
+    - delete empty template rows before footer if items are fewer
+
+    Returns signed row shift applied to footer rows.
+    """
     base_capacity = config.line_end_row - config.line_start_row + 1
-    if required_count <= base_capacity:
-        return 0
-    extra = required_count - base_capacity
-    inserted = 0
-    for _ in range(extra):
-        try:
-            ws.api.Rows(config.totals_row).Insert()
-            inserted += 1
-        except Exception as exc:
-            log_warning(f"Unable to insert invoice rows before footer: {exc}")
-            break
-    return inserted
+    target_count = max(0, required_count)
+    requested_shift = target_count - base_capacity
+
+    if requested_shift > 0:
+        inserted = 0
+        for _ in range(requested_shift):
+            try:
+                ws.api.Rows(config.totals_row).Insert()
+                inserted += 1
+            except Exception as exc:
+                log_warning(f"Unable to insert invoice rows before footer: {exc}")
+                break
+        return inserted
+
+    if requested_shift < 0:
+        delete_count = abs(requested_shift)
+        delete_start_row = config.line_start_row + target_count
+        deleted = 0
+        for _ in range(delete_count):
+            try:
+                ws.api.Rows(delete_start_row).Delete()
+                deleted += 1
+            except Exception as exc:
+                log_warning(f"Unable to delete empty invoice row before footer: {exc}")
+                break
+        return -deleted
+
+    return 0
 
 
 def clear_invoice_lines(ws: xw.Sheet, start_row: int, end_row: int) -> None:
@@ -655,7 +678,7 @@ def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: Sc
         if config.include_offer_lines:
             final_lines.extend(offer_result["offer_lines"])
 
-        row_shift = ensure_line_capacity(new_ws, len(final_lines), config)
+        row_shift = adjust_line_capacity(new_ws, len(final_lines), config)
         fill_invoice_lines(new_ws, final_lines, config, row_shift)
         write_totals(new_ws, final_lines, safe_float(offer_result["discount_total"], 0.0), config, row_shift)
 
