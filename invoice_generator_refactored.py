@@ -38,8 +38,26 @@ class ScriptConfig:
     mapping_column_candidates: List[str] = field(
         default_factory=lambda: ["new_inovice_mapping", "new_invoice_mapping"]
     )
+    sku_name_column_candidates: List[str] = field(
+        default_factory=lambda: [
+            "sku_name",
+            "item_name",
+            "product_name",
+            "product_name_ar",
+            "new_inovice_mapping",
+            "new_invoice_mapping",
+        ]
+    )
+    sku_code_column_candidates: List[str] = field(
+        default_factory=lambda: ["sku", "sku_code", "product_id", "item_id"]
+    )
     line_start_row: int = 16
-    line_end_row: int = 154
+    line_end_row: int = 153
+    totals_row: int = 154
+    subtotal_row: int = 155
+    discount_row: int = 156
+    adjustment_row: int = 157
+    net_total_row: int = 158
     free_row: int = 159
     routes: List[RouteConfig] = field(
         default_factory=lambda: [
@@ -69,6 +87,14 @@ REQUIRED_COLUMNS: Dict[str, object] = {
     "route_agent": "",
     "run": "",
     "new_inovice_mapping": "",
+    "new_invoice_mapping": "",
+    "sku": "",
+    "sku_code": "",
+    "item_id": "",
+    "sku_name": "",
+    "item_name": "",
+    "product_name": "",
+    "product_name_ar": "",
     "second_run_gift": 0,
     "doritos_gift": 0,
 }
@@ -156,6 +182,15 @@ def first_value(df: pd.DataFrame, column: str, default: object = "") -> object:
     return value
 
 
+def first_existing_value(row: pd.Series, candidates: List[str], default: str = "") -> str:
+    for col in candidates:
+        if col in row.index:
+            value = safe_str(row.get(col, ""))
+            if value:
+                return value
+    return default
+
+
 def safe_write(ws: xw.Sheet, cell: str, value: object) -> None:
     try:
         ws[cell].value = value
@@ -188,6 +223,82 @@ def get_mapping_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]
         if col in df.columns:
             return col
     return None
+
+
+def infer_item_label(
+    row: pd.Series,
+    order_id: str,
+    mapping_column: Optional[str],
+    config: ScriptConfig,
+) -> str:
+    item_name = first_existing_value(row, config.sku_name_column_candidates, "")
+
+    if mapping_column and (not item_name):
+        mapping_value = safe_str(row.get(mapping_column, ""))
+        if mapping_value:
+            item_name = (
+                safe_str(mapping_value[len(order_id):], "")
+                if mapping_value.startswith(order_id)
+                else mapping_value
+            )
+
+    sku_code = first_existing_value(row, config.sku_code_column_candidates, "")
+
+    if item_name and sku_code and sku_code not in item_name:
+        return f"{sku_code} - {item_name}"
+    if item_name:
+        return item_name
+    if sku_code:
+        return f"SKU {sku_code}"
+    return "Unknown SKU"
+
+
+def build_invoice_items(
+    order_data: pd.DataFrame,
+    order_id: str,
+    mapping_column: Optional[str],
+    config: ScriptConfig,
+) -> List[Dict[str, float]]:
+    aggregated: Dict[str, Dict[str, float]] = {}
+
+    for _, row in order_data.iterrows():
+        item_label = infer_item_label(row, order_id, mapping_column, config)
+        if item_label not in aggregated:
+            aggregated[item_label] = {"item_name": item_label, "qty": 0.0, "price": 0.0}
+
+        aggregated[item_label]["qty"] += safe_float(row.get("purchased_item_count", 0))
+        aggregated[item_label]["price"] += safe_float(row.get("total_price", 0))
+
+    items = list(aggregated.values())
+    items.sort(key=lambda x: x["item_name"])
+    return items
+
+
+def ensure_line_capacity(ws: xw.Sheet, required_lines: int, config: ScriptConfig) -> int:
+    base_capacity = config.line_end_row - config.line_start_row + 1
+    if required_lines <= base_capacity:
+        return 0
+
+    extra_lines = required_lines - base_capacity
+    inserted_lines = 0
+    for _ in range(extra_lines):
+        try:
+            # Insert before totals/footer to preserve template bottom section.
+            ws.api.Rows(config.totals_row).Insert()
+            inserted_lines += 1
+        except Exception as exc:
+            log_warning(f"Could not insert extra SKU rows before totals: {exc}")
+            break
+    return inserted_lines
+
+
+def clear_line_area(ws: xw.Sheet, start_row: int, end_row: int) -> None:
+    if end_row < start_row:
+        return
+    # Clear only SKU name/qty/price columns to preserve other template formulas.
+    ws.range((start_row, 2), (end_row, 2)).value = None
+    ws.range((start_row, 3), (end_row, 3)).value = None
+    ws.range((start_row, 6), (end_row, 6)).value = None
 
 
 def make_unique_sheet_name(order_id: str, existing_names: set) -> str:
@@ -252,78 +363,53 @@ def write_header_data(ws: xw.Sheet, order_data: pd.DataFrame, order_id: str) -> 
 
 def fill_invoice_lines(
     ws: xw.Sheet,
-    order_data: pd.DataFrame,
-    order_id: str,
-    line_start_row: int,
-    line_end_row: int,
-    mapping_column: Optional[str],
+    line_items: List[Dict[str, float]],
+    config: ScriptConfig,
+    row_shift: int,
 ) -> None:
-    qty_lookup: Dict[str, float] = {}
-    price_lookup: Dict[str, float] = {}
+    dynamic_line_end = config.line_end_row + row_shift
+    clear_line_area(ws, config.line_start_row, dynamic_line_end)
 
-    if mapping_column is None:
-        log_warning(
-            "Mapping column not found ('new_inovice_mapping'/'new_invoice_mapping'). "
-            "Invoice lines will stay with quantity/price = 0."
-        )
-    else:
-        for _, row in order_data.iterrows():
-            key = safe_str(row.get(mapping_column, ""))
-            if not key:
-                continue
-            qty_lookup[key] = qty_lookup.get(key, 0.0) + safe_float(row.get("purchased_item_count", 0))
-            price_lookup[key] = price_lookup.get(key, 0.0) + safe_float(row.get("total_price", 0))
-
-    for excel_row in range(line_start_row, line_end_row + 1):
-        item_name = ws.range((excel_row, 2)).value
-        if item_name in ("", None):
-            continue
-        key = f"{order_id}{safe_str(item_name)}"
-        ws.range((excel_row, 3)).value = qty_lookup.get(key, 0.0)
-        ws.range((excel_row, 6)).value = price_lookup.get(key, 0.0)
+    for idx, item in enumerate(line_items):
+        excel_row = config.line_start_row + idx
+        ws.range((excel_row, 2)).value = item["item_name"]
+        ws.range((excel_row, 3)).value = item["qty"]
+        ws.range((excel_row, 6)).value = item["price"]
 
 
 def add_free_item_and_totals(
     ws: xw.Sheet,
     order_data: pd.DataFrame,
     free_products: List[int],
-    free_row: int,
+    config: ScriptConfig,
+    row_shift: int,
 ) -> None:
     if "product_id" in order_data.columns:
         free_qty = safe_float(order_data[order_data["product_id"].isin(free_products)]["purchased_item_count"].sum())
     else:
         free_qty = 0.0
 
+    shifted_free_row = config.free_row + row_shift
+    shifted_totals_row = config.totals_row + row_shift
+    shifted_subtotal_row = config.subtotal_row + row_shift
+    shifted_discount_row = config.discount_row + row_shift
+    shifted_adjustment_row = config.adjustment_row + row_shift
+    shifted_net_total_row = config.net_total_row + row_shift
+
     if free_qty > 0:
-        ws.range((free_row, 2)).value = "هدايه"
-        ws.range((free_row, 3)).value = free_qty
-        ws.range((free_row, 6)).value = 0
+        ws.range((shifted_free_row, 2)).value = "هدايه"
+        ws.range((shifted_free_row, 3)).value = free_qty
+        ws.range((shifted_free_row, 6)).value = 0
 
     total_qty = safe_float(order_data.get("purchased_item_count", pd.Series(dtype=float)).sum()) + free_qty
     total_price = safe_float(order_data.get("total_price", pd.Series(dtype=float)).sum())
 
-    ws.range("C154").value = total_qty
-    ws.range("F154").value = total_price
-    ws.range("E155").value = total_price
-    ws.range("E156").value = 0
-    ws.range("E157").value = 0
-    ws.range("E158").value = total_price
-
-
-def remove_zero_qty_rows(ws: xw.Sheet, line_start_row: int, line_end_row: int) -> None:
-    for excel_row in range(line_end_row, line_start_row - 1, -1):
-        value = ws.range((excel_row, 3)).value
-        if value in ("", None):
-            try:
-                ws.api.Rows(excel_row).Delete()
-            except Exception as exc:
-                log_warning(f"Could not delete empty qty row {excel_row}: {exc}")
-            continue
-        if safe_float(value, default=0.0) == 0.0:
-            try:
-                ws.api.Rows(excel_row).Delete()
-            except Exception as exc:
-                log_warning(f"Could not delete zero qty row {excel_row}: {exc}")
+    ws.range((shifted_totals_row, 3)).value = total_qty
+    ws.range((shifted_totals_row, 6)).value = total_price
+    ws.range((shifted_subtotal_row, 5)).value = total_price
+    ws.range((shifted_discount_row, 5)).value = 0
+    ws.range((shifted_adjustment_row, 5)).value = 0
+    ws.range((shifted_net_total_row, 5)).value = total_price
 
 
 def process_route(route_cfg: RouteConfig, orders_df: pd.DataFrame, app: xw.App, config: ScriptConfig) -> Optional[str]:
@@ -374,22 +460,22 @@ def process_route(route_cfg: RouteConfig, orders_df: pd.DataFrame, app: xw.App, 
 
     for order_id in sorted(route_df["order_id"].dropna().unique()):
         order_data = route_df[route_df["order_id"] == order_id]
+        normalized_order_id = safe_str(order_id)
 
         invoice_template_ws.api.Copy(Before=output_wb.sheets["TempSheet"].api)
         new_ws = output_wb.sheets[0]
-        new_ws.name = make_unique_sheet_name(safe_str(order_id), existing_names)
+        new_ws.name = make_unique_sheet_name(normalized_order_id, existing_names)
 
-        write_header_data(new_ws, order_data, safe_str(order_id))
+        write_header_data(new_ws, order_data, normalized_order_id)
+        line_items = build_invoice_items(order_data, normalized_order_id, mapping_column, config)
+        row_shift = ensure_line_capacity(new_ws, len(line_items), config)
         fill_invoice_lines(
             new_ws,
-            order_data,
-            safe_str(order_id),
-            config.line_start_row,
-            config.line_end_row,
-            mapping_column,
+            line_items,
+            config,
+            row_shift,
         )
-        add_free_item_and_totals(new_ws, order_data, config.free_products, config.free_row)
-        remove_zero_qty_rows(new_ws, config.line_start_row, config.line_end_row)
+        add_free_item_and_totals(new_ws, order_data, config.free_products, config, row_shift)
 
     if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
         output_wb.sheets["TempSheet"].delete()
