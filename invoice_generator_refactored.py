@@ -148,6 +148,25 @@ REQUIRED_COLUMNS: Dict[str, object] = {
     "doritos_gift": 0,
 }
 
+COLUMN_ALIASES: Dict[str, List[str]] = {
+    "route": ["route_name", "delivery_route"],
+    "order_id": ["orderid", "order_number", "order no", "order_no"],
+    "estimated_delivery_date": ["delivery_date", "estimated_date"],
+    "purchased_item_count": ["qty", "quantity", "item_qty", "purchased_qty"],
+    "total_price": ["line_total", "item_total", "price", "amount"],
+    "retailer_name": ["retailer", "customer_name", "customer"],
+    "market_name": ["market", "marketname", "store_name", "store"],
+    "order_date": ["created_date"],
+    "order_time": ["created_time"],
+    "mobile": ["phone", "mobile_number", "customer_phone"],
+    "polygon_name": ["area", "region", "zone"],
+    "sales_agent": ["salesman", "sales_rep", "sales_agent_name"],
+    "route_agent": ["driver", "route_rep"],
+    "new_inovice_mapping": ["new_invoice_mapping", "invoice_mapping", "mapping_key"],
+    "sku_name": ["item", "item_desc", "description", "product"],
+    "sku_code": ["sku_id", "product_code"],
+}
+
 
 @dataclass
 class OfferResult:
@@ -162,6 +181,22 @@ def log_warning(message: str) -> None:
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c).strip().lower() for c in df.columns]
+    return df
+
+
+def apply_column_aliases(df: pd.DataFrame, aliases: Dict[str, List[str]]) -> pd.DataFrame:
+    rename_map: Dict[str, str] = {}
+    existing = set(df.columns)
+    for target, candidates in aliases.items():
+        if target in existing:
+            continue
+        for candidate in candidates:
+            candidate_norm = candidate.strip().lower()
+            if candidate_norm in existing:
+                rename_map[candidate_norm] = target
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
     return df
 
 
@@ -200,7 +235,16 @@ def safe_float(value: object, default: float = 0.0) -> float:
     try:
         if pd.isna(value):
             return default
-        return float(value)
+        x = str(value).strip()
+        arabic_digits = "٠١٢٣٤٥٦٧٨٩"
+        for i, digit in enumerate(arabic_digits):
+            x = x.replace(digit, str(i))
+        x = x.replace(",", "").replace(" ", "")
+        x = x.replace("EGP", "").replace("egp", "")
+        x = re.sub(r"[^0-9.\-]", "", x)
+        if x in ("", ".", "-", "-.", ".-"):
+            return default
+        return float(x)
     except Exception:
         return default
 
@@ -242,7 +286,7 @@ def first_existing_value(row: pd.Series, candidates: List[str], default: str = "
     for col in candidates:
         if col in row.index:
             value = safe_str(row.get(col, ""))
-            if value:
+            if value and value.lower() not in {"nan", "none", "null", "nat", "0", "0.0"}:
                 return value
     return default
 
@@ -293,7 +337,37 @@ def get_invoice_template_sheet(workbook: xw.Book, candidates: List[str]) -> Opti
 def get_mapping_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     for col in candidates:
         if col in df.columns:
+            cleaned = (
+                df[col]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .replace({"nan": "", "none": "", "null": "", "nat": ""})
+            )
+            if cleaned.ne("").any():
+                return col
+    for col in candidates:
+        if col in df.columns:
             return col
+    return None
+
+
+def copy_invoice_sheet(template_ws: xw.Sheet, output_wb: xw.Book, temp_sheet_name: str) -> Optional[xw.Sheet]:
+    before_names = [sheet.name for sheet in output_wb.sheets]
+    template_ws.api.Copy(Before=output_wb.sheets[temp_sheet_name].api)
+
+    for sheet in output_wb.sheets:
+        if sheet.name not in before_names:
+            return sheet
+
+    # Fallback: take the sheet immediately before TempSheet.
+    names = [sheet.name for sheet in output_wb.sheets]
+    if temp_sheet_name in names:
+        temp_idx = names.index(temp_sheet_name)
+        if temp_idx > 0:
+            return output_wb.sheets[temp_idx - 1]
+
+    log_warning("Could not detect newly copied invoice sheet.")
     return None
 
 
@@ -341,7 +415,11 @@ def build_invoice_items(
         aggregated[item_label]["qty"] += safe_float(row.get("purchased_item_count", 0))
         aggregated[item_label]["price"] += safe_float(row.get("total_price", 0))
 
-    items = list(aggregated.values())
+    items = [
+        item
+        for item in aggregated.values()
+        if safe_float(item.get("qty", 0), 0.0) != 0.0 or safe_float(item.get("price", 0), 0.0) != 0.0
+    ]
     items.sort(key=lambda x: x["item_name"])
     return items
 
@@ -583,12 +661,20 @@ def process_route(route_cfg: RouteConfig, orders_df: pd.DataFrame, app: xw.App, 
 
     mapping_column = get_mapping_column(route_df, config.mapping_column_candidates)
 
-    for order_id in sorted(route_df["order_id"].dropna().unique()):
+    valid_order_ids = [
+        oid
+        for oid in route_df["order_id"].dropna().unique()
+        if safe_str(oid).lower() not in {"", "nan", "none", "null"}
+    ]
+
+    for order_id in sorted(valid_order_ids):
         order_data = route_df[route_df["order_id"] == order_id]
         normalized_order_id = safe_str(order_id)
 
-        invoice_template_ws.api.Copy(Before=output_wb.sheets["TempSheet"].api)
-        new_ws = output_wb.sheets[0]
+        new_ws = copy_invoice_sheet(invoice_template_ws, output_wb, "TempSheet")
+        if new_ws is None:
+            log_warning(f"Skipping order '{normalized_order_id}' because template copy failed.")
+            continue
         new_ws.name = make_unique_sheet_name(normalized_order_id, existing_names)
 
         write_header_data(new_ws, order_data, normalized_order_id)
@@ -635,6 +721,7 @@ def main() -> None:
 
     orders_df = pd.read_excel(config.orders_file)
     orders_df = normalize_columns(orders_df)
+    orders_df = apply_column_aliases(orders_df, COLUMN_ALIASES)
     orders_df = ensure_columns(orders_df, REQUIRED_COLUMNS)
     orders_df = parse_datetime_columns(
         orders_df, ["estimated_delivery_date", "order_date", "order_time"]
