@@ -58,6 +58,11 @@ class ScriptConfig:
     area_column: str = "route"
     order_id_column: str = "order_id"
     delivery_date_column: str = "estimated_delivery_date"
+    split_by_section: bool = True
+    section_column_candidates: List[str] = field(
+        default_factory=lambda: ["section", "section_name", "business_unit", "category"]
+    )
+    target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS"])
 
     # Header fields (from first row of each order)
     retailer_column_candidates: List[str] = field(default_factory=lambda: ["retailer_name", "customer_name", "customer"])
@@ -154,6 +159,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "polygon_name": ["area", "zone", "region"],
     "sales_agent": ["salesman", "sales_rep"],
     "route_agent": ["driver"],
+    "section": ["section_name", "business_unit", "category", "division"],
     "sku_name": ["item_name", "product_name", "item", "description"],
     "sku_code": ["sku", "product_code", "sku_id"],
 }
@@ -180,6 +186,7 @@ REQUIRED_COLUMNS_DEFAULTS: Dict[str, object] = {
 
 OPTIONAL_COLUMNS_DEFAULTS: Dict[str, object] = {
     "sku_code": "",
+    "section": "",
 }
 
 
@@ -228,6 +235,17 @@ def safe_str(value: object, default: str = "") -> str:
     if s.lower() in {"nan", "none", "null", "nat"}:
         return default
     return s
+
+
+def normalize_section_name(value: object) -> str:
+    text = safe_str(value, "").strip().upper()
+    if not text:
+        return ""
+    if "PEPSI" in text:
+        return "PEPSI"
+    if "LAYS" in text or "LAY'S" in text:
+        return "LAYS"
+    return text
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -321,6 +339,13 @@ def choose_template_file(area_value: str, config: ScriptConfig) -> str:
     _ = area_value
     # Always use the same invoice template file for all areas.
     return resolve_template_path(config.default_template_file)
+
+
+def find_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
 
 
 def get_sheet_if_exists(workbook: xw.Book, sheet_name: str) -> Optional[xw.Sheet]:
@@ -730,23 +755,60 @@ def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: Sc
         template_wb.close()
         return None
 
-    raw_order_ids = area_df[config.order_id_column].dropna().unique().tolist()
-    order_ids = [oid for oid in raw_order_ids if safe_str(oid, "").lower() not in {"", "nan", "none", "null"}]
-    if not order_ids:
+    section_col = find_existing_column(area_df, config.section_column_candidates)
+    if config.split_by_section and section_col:
+        area_df = area_df.copy()
+        area_df["_section_group"] = area_df[section_col].apply(normalize_section_name)
+        target_set = {safe_str(s, "").upper() for s in config.target_sections if safe_str(s, "")}
+        if target_set:
+            area_df = area_df[area_df["_section_group"].isin(target_set)].copy()
+
+    if area_df.empty:
+        log_info(f"No rows found in requested sections for area '{area_value}'.")
+        output_wb.close()
+        template_wb.close()
+        return None
+
+    group_keys: List[tuple] = []
+    if config.split_by_section and "_section_group" in area_df.columns:
+        grouped = area_df[[config.order_id_column, "_section_group"]].dropna().drop_duplicates()
+        for _, row in grouped.iterrows():
+            oid = safe_str(row.get(config.order_id_column, ""), "")
+            sec = safe_str(row.get("_section_group", ""), "")
+            if oid and sec:
+                group_keys.append((oid, sec))
+    else:
+        raw_order_ids = area_df[config.order_id_column].dropna().unique().tolist()
+        for oid in raw_order_ids:
+            order_str = safe_str(oid, "")
+            if order_str and order_str.lower() not in {"nan", "none", "null"}:
+                group_keys.append((order_str, ""))
+
+    if not group_keys:
         log_info(f"No valid order IDs in area '{area_value}'.")
         output_wb.close()
         template_wb.close()
         return None
 
-    for order_id in sorted(order_ids):
-        order_str = safe_str(order_id, "")
-        order_df = area_df[area_df[config.order_id_column] == order_id]
+    for order_str, section_name in sorted(group_keys, key=lambda x: (x[0], x[1])):
+        if config.split_by_section and "_section_group" in area_df.columns:
+            order_df = area_df[
+                (area_df[config.order_id_column] == order_str) & (area_df["_section_group"] == section_name)
+            ]
+        else:
+            order_df = area_df[area_df[config.order_id_column] == order_str]
+        if order_df.empty:
+            continue
 
         new_ws = copy_invoice_sheet(template_ws, output_wb, "TempSheet")
         if new_ws is None:
             log_warning(f"Could not copy invoice sheet for order '{order_str}'.")
             continue
-        new_ws.name = make_unique_sheet_name(order_str, existing_sheet_names)
+        if section_name:
+            sheet_base = f"{section_name}_{order_str}"
+        else:
+            sheet_base = order_str
+        new_ws.name = make_unique_sheet_name(sheet_base, existing_sheet_names)
 
         write_header(new_ws, order_df, order_str, config)
 
