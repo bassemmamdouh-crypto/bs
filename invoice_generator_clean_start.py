@@ -17,8 +17,13 @@ ORDERS_FILE = r"E:\Marbah Products\Marbah Invoices script\orders_data.xlsx"
 DEFAULT_TEMPLATE_FILE = r"E:\Marbah Products\Marbah Invoices script\invoice_templet.xlsx"
 OUTPUT_ROOT = r"E:\Marbah Products\Marbah Invoices script"
 
-# Use one template for all invoices (no area-specific templates).
-AREA_TEMPLATE_MAP: Dict[str, str] = {}
+# One invoice template for all areas (mapped explicitly).
+AREA_TEMPLATE_MAP = {
+    "EL MANSOUR": r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx",
+    "AMRIA": r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx",
+    "EL GAMAA": r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx",
+    "OTAYFIA & ALAWY": r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx",
+}
 TEMPLATE_FILENAME_CANDIDATES = [
     "invoice_templet.xlsx",
     "invoice_template.xlsx",
@@ -60,9 +65,10 @@ class ScriptConfig:
     delivery_date_column: str = "estimated_delivery_date"
     split_by_section: bool = True
     section_column_candidates: List[str] = field(
-        default_factory=lambda: ["section", "section_name", "business_unit", "category"]
+        default_factory=lambda: ["section", "section_name", "business_unit", "category", "brand_section", "brand"]
     )
     target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS"])
+    other_section_name: str = "OTHER"
 
     # Header fields (from first row of each order)
     retailer_column_candidates: List[str] = field(default_factory=lambda: ["retailer_name", "customer_name", "customer"])
@@ -237,15 +243,15 @@ def safe_str(value: object, default: str = "") -> str:
     return s
 
 
-def normalize_section_name(value: object) -> str:
+def normalize_section_name(value: object, config: ScriptConfig) -> str:
     text = safe_str(value, "").strip().upper()
     if not text:
-        return ""
+        return config.other_section_name
     if "PEPSI" in text:
         return "PEPSI"
     if "LAYS" in text or "LAY'S" in text:
         return "LAYS"
-    return text
+    return config.other_section_name
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -336,9 +342,9 @@ def resolve_template_path(template_path: str) -> str:
 
 
 def choose_template_file(area_value: str, config: ScriptConfig) -> str:
-    _ = area_value
-    # Always use the same invoice template file for all areas.
-    return resolve_template_path(config.default_template_file)
+    key = safe_str(area_value, "").upper()
+    template = config.area_template_map.get(key, config.default_template_file)
+    return resolve_template_path(template)
 
 
 def find_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -758,10 +764,7 @@ def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: Sc
     section_col = find_existing_column(area_df, config.section_column_candidates)
     if config.split_by_section and section_col:
         area_df = area_df.copy()
-        area_df["_section_group"] = area_df[section_col].apply(normalize_section_name)
-        target_set = {safe_str(s, "").upper() for s in config.target_sections if safe_str(s, "")}
-        if target_set:
-            area_df = area_df[area_df["_section_group"].isin(target_set)].copy()
+        area_df["_section_group"] = area_df[section_col].apply(lambda x: normalize_section_name(x, config))
 
     if area_df.empty:
         log_info(f"No rows found in requested sections for area '{area_value}'.")
