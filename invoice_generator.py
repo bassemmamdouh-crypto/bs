@@ -512,11 +512,11 @@ def make_unique_sheet_name(base_name: str, existing_names: set) -> str:
 
 def adjust_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig) -> int:
     """
-    Adjust line section size to exactly match required_count:
+    Adjust line section safely for required_count:
     - insert rows before footer if items exceed template capacity
-    - delete empty template rows before footer if items are fewer
+    - do NOT delete rows when items are fewer (keep footer formatting intact)
 
-    Returns signed row shift applied to footer rows.
+    Returns positive row shift applied to footer rows.
     """
     base_capacity = config.line_end_row - config.line_start_row + 1
     target_count = max(0, required_count)
@@ -533,19 +533,8 @@ def adjust_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig
                 break
         return inserted
 
-    if requested_shift < 0:
-        delete_count = abs(requested_shift)
-        delete_start_row = config.line_start_row + target_count
-        deleted = 0
-        for _ in range(delete_count):
-            try:
-                ws.api.Rows(delete_start_row).Delete()
-                deleted += 1
-            except Exception as exc:
-                log_warning(f"Unable to delete empty invoice row before footer: {exc}")
-                break
-        return -deleted
-
+    # Keep template rows as-is when fewer lines are needed, so footer styles/formulas
+    # remain in their original positions and formatting is preserved.
     return 0
 
 
