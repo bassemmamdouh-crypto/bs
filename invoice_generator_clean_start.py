@@ -107,7 +107,18 @@ class ScriptConfig:
     offer_item_price_candidates: List[str] = field(
         default_factory=lambda: ["offer_item_price", "offer_item_amount", "promo_amount"]
     )
-    gift_qty_columns: List[str] = field(default_factory=lambda: ["second_run_gift", "doritos_gift"])
+    gift_qty_columns: List[str] = field(
+        default_factory=lambda: [
+            "second_run_gift",
+            "doritos_gift",
+            "pepsi_gift",
+            "pepsi_gift_qty",
+            "pepsi_offer_gift",
+            "pepsi_offer_qty",
+            "gift_qty",
+            "free_qty",
+        ]
+    )
     discount_amount_columns: List[str] = field(
         default_factory=lambda: ["discount_amount", "offer_discount_amount", "promo_discount", "order_discount"]
     )
@@ -243,13 +254,54 @@ def safe_str(value: object, default: str = "") -> str:
     return s
 
 
+def normalize_column_key(name: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", safe_str(name, "").lower())
+
+
+def resolve_candidate_columns(df: pd.DataFrame, candidates: List[str]) -> List[str]:
+    existing_cols = [str(c) for c in df.columns]
+    normalized_to_col: Dict[str, str] = {}
+    for col in existing_cols:
+        key = normalize_column_key(col)
+        if key and key not in normalized_to_col:
+            normalized_to_col[key] = col
+
+    resolved: List[str] = []
+    seen = set()
+
+    # Exact normalized matching.
+    for cand in candidates:
+        key = normalize_column_key(cand)
+        matched = normalized_to_col.get(key)
+        if matched and matched not in seen:
+            seen.add(matched)
+            resolved.append(matched)
+
+    # Fuzzy fallback by containment.
+    for cand in candidates:
+        cand_key = normalize_column_key(cand)
+        if not cand_key:
+            continue
+        for col in existing_cols:
+            col_key = normalize_column_key(col)
+            if cand_key in col_key and col not in seen:
+                seen.add(col)
+                resolved.append(col)
+
+    return resolved
+
+
 def normalize_section_name(value: object, config: ScriptConfig) -> str:
     text = safe_str(value, "").strip().upper()
     if not text:
         return config.other_section_name
+    if "PEPSICO" in text:
+        return "PEPSI"
     if "PEPSI" in text:
         return "PEPSI"
-    if "LAYS" in text or "LAY'S" in text:
+    if "LAYS" in text or "LAY'S" in text or "LAYS" in text:
+        return "LAYS"
+    if "CHIPSY" in text:
         return "LAYS"
     return config.other_section_name
 
@@ -299,9 +351,15 @@ def first_row_value(order_df: pd.DataFrame, candidates: List[str], default: obje
     if order_df.empty:
         return default
     row = order_df.iloc[0]
+    normalized_index = {normalize_column_key(c): c for c in order_df.columns}
     for col in candidates:
         if col in order_df.columns:
             val = row.get(col, default)
+            if safe_str(val, "") != "":
+                return val
+        normalized_col = normalized_index.get(normalize_column_key(col))
+        if normalized_col:
+            val = row.get(normalized_col, default)
             if safe_str(val, "") != "":
                 return val
     return default
@@ -351,6 +409,11 @@ def find_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[st
     for col in candidates:
         if col in df.columns:
             return col
+    normalized_index = {normalize_column_key(c): c for c in df.columns}
+    for col in candidates:
+        normalized_col = normalized_index.get(normalize_column_key(col))
+        if normalized_col:
+            return normalized_col
     return None
 
 
@@ -531,9 +594,15 @@ def sku_sort_key(item: Dict[str, object]) -> tuple:
 
 
 def row_first_value(row: pd.Series, candidates: List[str], default: object = "") -> object:
+    normalized_index = {normalize_column_key(c): c for c in row.index}
     for col in candidates:
         if col in row.index:
             value = row.get(col, default)
+            if safe_str(value, "") != "":
+                return value
+        normalized_col = normalized_index.get(normalize_column_key(col))
+        if normalized_col:
+            value = row.get(normalized_col, default)
             if safe_str(value, "") != "":
                 return value
     return default
