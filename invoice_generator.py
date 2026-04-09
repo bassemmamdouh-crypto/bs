@@ -696,7 +696,12 @@ def quantity_by_sku(order_df: pd.DataFrame, config: ScriptConfig) -> Dict[str, f
     return result
 
 
-def apply_offer_rules(order_df: pd.DataFrame, subtotal: float, config: ScriptConfig) -> Dict[str, object]:
+def apply_offer_rules(
+    order_df: pd.DataFrame,
+    subtotal: float,
+    config: ScriptConfig,
+    bundle_offer_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, object]:
     offer_lines: List[Dict[str, object]] = []
     discount_total = 0.0
     sku_qty_map = quantity_by_sku(order_df, config)
@@ -743,13 +748,17 @@ def apply_offer_rules(order_df: pd.DataFrame, subtotal: float, config: ScriptCon
     # B) Fixed bundle offer:
     # Sum quantities of specific SKUs, then floor(total / divisor) as gift qty.
     if config.bundle_offer_active and config.bundle_offer_divisor > 0:
+        bundle_source_df = bundle_offer_df if bundle_offer_df is not None else order_df
+        bundle_sku_qty_map = quantity_by_sku(bundle_source_df, config)
         source_skus = {
             normalize_sku(sku)
             for sku in config.bundle_offer_source_skus
             if normalize_sku(sku)
         }
-        combo_qty_total = sum(qty for sku, qty in sku_qty_map.items() if normalize_sku(sku) in source_skus)
-        combo_gift_qty = math.floor(combo_qty_total / config.bundle_offer_divisor)
+        combo_qty_total = sum(qty for sku, qty in bundle_sku_qty_map.items() if normalize_sku(sku) in source_skus)
+        combo_gift_qty = 0
+        if combo_qty_total > config.bundle_offer_divisor:
+            combo_gift_qty = math.floor(combo_qty_total / config.bundle_offer_divisor)
         if combo_gift_qty > 0:
             gift_line_name = safe_str(config.bundle_offer_gift_name, "Gift Item")
             gift_sku = normalize_sku(config.bundle_offer_gift_sku)
@@ -907,11 +916,12 @@ def render_invoice_sheet(
     source_df: pd.DataFrame,
     header_order_id: str,
     config: ScriptConfig,
+    bundle_offer_df: Optional[pd.DataFrame] = None,
 ) -> None:
     write_header(ws, source_df, header_order_id, config)
     base_lines = build_base_items(source_df, config)
     subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in base_lines)
-    offer_result = apply_offer_rules(source_df, subtotal, config)
+    offer_result = apply_offer_rules(source_df, subtotal, config, bundle_offer_df=bundle_offer_df)
 
     final_lines = list(base_lines)
     if config.include_offer_lines:
@@ -1012,6 +1022,8 @@ def process_area_order_workbooks(
         return []
 
     area_df = prepare_area_sections(area_df, config)
+    area_df["_order_key"] = area_df[config.order_id_column].apply(lambda x: safe_str(x, ""))
+    area_df = area_df[area_df["_order_key"] != ""].copy()
     target_sections = get_target_sections(config)
     area_ctx = area_output_context(area_df, area_value, config)
     latest_delivery_date = area_ctx["latest_delivery_date"]
@@ -1030,16 +1042,6 @@ def process_area_order_workbooks(
             section_df = area_df[area_df["_section_group"] == section_name].copy()
             if section_df.empty:
                 log_info(f"Skipping workbook for section '{section_name}' in area '{area_value}' (no rows).")
-                continue
-
-            # Build explicit order groups from normalized order_id values.
-            section_df["_order_key"] = section_df[config.order_id_column].apply(lambda x: safe_str(x, ""))
-            section_df = section_df[section_df["_order_key"] != ""].copy()
-            if section_df.empty:
-                log_warning(
-                    f"Skipping workbook for section '{section_name}' in area '{area_value}' "
-                    f"because all rows have empty order IDs."
-                )
                 continue
 
             output_wb = app.books.add()
@@ -1062,6 +1064,7 @@ def process_area_order_workbooks(
                     order_df = section_df[section_df["_order_key"] == order_str]
                     if order_df.empty:
                         continue
+                    full_order_df = area_df[area_df["_order_key"] == order_str]
 
                     new_ws = copy_invoice_sheet(template_ws, output_wb, "TempSheet")
                     if new_ws is None:
@@ -1071,7 +1074,7 @@ def process_area_order_workbooks(
                         continue
 
                     new_ws.name = make_unique_sheet_name(order_str, existing_sheet_names)
-                    render_invoice_sheet(new_ws, order_df, order_str, config)
+                    render_invoice_sheet(new_ws, order_df, order_str, config, bundle_offer_df=full_order_df)
                     created_count += 1
 
                 if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
