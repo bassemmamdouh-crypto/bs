@@ -67,7 +67,7 @@ class ScriptConfig:
     section_column_candidates: List[str] = field(
         default_factory=lambda: ["section", "section_name", "business_unit", "category", "brand_section", "brand"]
     )
-    target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS"])
+    target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS", "MARAII"])
     other_section_name: str = "OTHER"
     generation_mode: str = "per_order_section_workbooks"
     # summary_by_section: one workbook per area with two summary sheets (PEPSI/LAYS)
@@ -328,6 +328,16 @@ def normalize_section_name(value: object, config: ScriptConfig) -> str:
         return "LAYS"
     if "CHIPSY" in text:
         return "LAYS"
+    if (
+        "MARAII" in text
+        or "MARAII" in text
+        or "MARAI" in text
+        or "ALMARAI" in text
+        or "AL MARAI" in text
+        or "AL MARAII" in text
+        or "المراعي" in text
+    ):
+        return "MARAII"
     return config.other_section_name
 
 
@@ -342,7 +352,7 @@ def get_target_sections(config: ScriptConfig) -> List[str]:
             seen_sections.add(normalized)
             target_sections.append(normalized)
     if not target_sections:
-        return ["PEPSI", "LAYS"]
+        return ["PEPSI", "LAYS", "MARAII"]
     return target_sections
 
 
@@ -1009,7 +1019,7 @@ def process_area_order_workbooks(
     config: ScriptConfig,
 ) -> List[str]:
     """
-    Create up to two workbooks per area (LAYS + PEPSI, if each section exists).
+    Create one workbook per target section per area (if section rows exist).
     Each workbook contains one invoice sheet per order_id for its section.
     """
     template_file = choose_template_file(area_value, config)
