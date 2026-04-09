@@ -69,6 +69,11 @@ class ScriptConfig:
     )
     target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS"])
     other_section_name: str = "OTHER"
+    generation_mode: str = "per_order_section_workbooks"
+    # summary_by_section: one workbook per area with two summary sheets (PEPSI/LAYS)
+    # per_order_section_workbooks: up to two workbooks per area (PEPSI and LAYS),
+    # each workbook contains one invoice sheet per order.
+    create_empty_summary_sections: bool = True
 
     # Header fields (from first row of each order)
     retailer_column_candidates: List[str] = field(default_factory=lambda: ["retailer_name", "customer_name", "customer"])
@@ -304,6 +309,21 @@ def normalize_section_name(value: object, config: ScriptConfig) -> str:
     if "CHIPSY" in text:
         return "LAYS"
     return config.other_section_name
+
+
+def get_target_sections(config: ScriptConfig) -> List[str]:
+    target_sections: List[str] = []
+    seen_sections = set()
+    for sec in config.target_sections:
+        normalized = normalize_section_name(sec, config)
+        if normalized == config.other_section_name:
+            continue
+        if normalized not in seen_sections:
+            seen_sections.add(normalized)
+            target_sections.append(normalized)
+    if not target_sections:
+        return ["PEPSI", "LAYS"]
+    return target_sections
 
 
 def safe_float(value: object, default: float = 0.0) -> float:
@@ -812,10 +832,55 @@ def write_totals(
     ws.range((net_total_row, 5)).value = net_total
 
 
-def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: ScriptConfig) -> Optional[str]:
+def prepare_area_sections(area_df: pd.DataFrame, config: ScriptConfig) -> pd.DataFrame:
+    prepared = area_df.copy()
+    section_col = find_existing_column(prepared, config.section_column_candidates)
+    if config.split_by_section and section_col:
+        prepared["_section_group"] = prepared[section_col].apply(lambda x: normalize_section_name(x, config))
+    else:
+        prepared["_section_group"] = config.other_section_name
+    return prepared
+
+
+def area_output_context(area_df: pd.DataFrame, area_value: str, config: ScriptConfig) -> Dict[str, object]:
+    latest_delivery_date = pd.to_datetime(area_df[config.delivery_date_column], errors="coerce").max()
+    if pd.isna(latest_delivery_date):
+        latest_delivery_date = datetime.today()
+    month_folder = latest_delivery_date.strftime("%Y-%m")
+    safe_area = re.sub(r'[<>:"/\\|?*]+', "_", safe_str(area_value, "Unknown-Area"))
+    output_dir = Path(config.output_root) / month_folder
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return {
+        "latest_delivery_date": latest_delivery_date,
+        "output_dir": output_dir,
+        "safe_area": safe_area,
+    }
+
+
+def render_invoice_sheet(
+    ws: xw.Sheet,
+    source_df: pd.DataFrame,
+    header_order_id: str,
+    config: ScriptConfig,
+) -> None:
+    write_header(ws, source_df, header_order_id, config)
+    base_lines = build_base_items(source_df, config)
+    subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in base_lines)
+    offer_result = apply_offer_rules(source_df, subtotal, config)
+
+    final_lines = list(base_lines)
+    if config.include_offer_lines:
+        final_lines.extend(offer_result["offer_lines"])
+
+    row_shift = adjust_line_capacity(ws, len(final_lines), config)
+    fill_invoice_lines(ws, final_lines, config, row_shift)
+    write_totals(ws, final_lines, safe_float(offer_result["discount_total"], 0.0), config, row_shift)
+
+
+def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, config: ScriptConfig) -> Optional[str]:
     """
-    Build one workbook per area, with exactly one sheet per target section.
-    By default this creates two sheets: PEPSI and LAYS.
+    Keep the summary behavior:
+    one workbook per area with one summary sheet per target section.
     """
     template_file = choose_template_file(area_value, config)
     if not os.path.exists(template_file):
@@ -840,28 +905,13 @@ def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: Sc
         template_wb.close()
         return None
 
-    area_df = area_df.copy()
-    section_col = find_existing_column(area_df, config.section_column_candidates)
-    if config.split_by_section and section_col:
-        area_df["_section_group"] = area_df[section_col].apply(lambda x: normalize_section_name(x, config))
-    else:
-        area_df["_section_group"] = config.other_section_name
-
-    target_sections: List[str] = []
-    seen_sections = set()
-    for sec in config.target_sections:
-        normalized = normalize_section_name(sec, config)
-        if normalized == config.other_section_name:
-            continue
-        if normalized not in seen_sections:
-            seen_sections.add(normalized)
-            target_sections.append(normalized)
-
-    if not target_sections:
-        target_sections = ["PEPSI", "LAYS"]
+    area_df = prepare_area_sections(area_df, config)
+    target_sections = get_target_sections(config)
 
     for section_name in target_sections:
         section_df = area_df[area_df["_section_group"] == section_name].copy()
+        if section_df.empty and not config.create_empty_summary_sections:
+            continue
 
         new_ws = copy_invoice_sheet(template_ws, output_wb, "TempSheet")
         if new_ws is None:
@@ -872,44 +922,131 @@ def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: Sc
         new_ws.name = make_unique_sheet_name(sheet_base, existing_sheet_names)
 
         header_source_df = section_df if not section_df.empty else area_df
-        write_header(new_ws, header_source_df, f"{section_name} SUMMARY", config)
-
         if section_df.empty:
-            final_lines: List[Dict[str, object]] = []
-            discount_total = 0.0
+            write_header(new_ws, header_source_df, f"{section_name} SUMMARY", config)
+            row_shift = adjust_line_capacity(new_ws, 0, config)
+            fill_invoice_lines(new_ws, [], config, row_shift)
+            write_totals(new_ws, [], 0.0, config, row_shift)
             log_info(f"No rows found for section '{section_name}' in area '{area_value}'. Added empty sheet.")
         else:
-            base_lines = build_base_items(section_df, config)
-            subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in base_lines)
-            offer_result = apply_offer_rules(section_df, subtotal, config)
-
-            final_lines = list(base_lines)
-            if config.include_offer_lines:
-                final_lines.extend(offer_result["offer_lines"])
-            discount_total = safe_float(offer_result["discount_total"], 0.0)
-
-        row_shift = adjust_line_capacity(new_ws, len(final_lines), config)
-        fill_invoice_lines(new_ws, final_lines, config, row_shift)
-        write_totals(new_ws, final_lines, discount_total, config, row_shift)
+            render_invoice_sheet(new_ws, section_df, f"{section_name} SUMMARY", config)
 
     if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
         output_wb.sheets["TempSheet"].delete()
 
-    latest_delivery_date = pd.to_datetime(area_df[config.delivery_date_column], errors="coerce").max()
-    if pd.isna(latest_delivery_date):
-        latest_delivery_date = datetime.today()
-    month_folder = latest_delivery_date.strftime("%Y-%m")
-    safe_area = re.sub(r'[<>:"/\\|?*]+', "_", safe_str(area_value, "Unknown-Area"))
-    day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}")
-
-    output_dir = Path(config.output_root) / month_folder
-    output_dir.mkdir(parents=True, exist_ok=True)
+    area_ctx = area_output_context(area_df, area_value, config)
+    latest_delivery_date = area_ctx["latest_delivery_date"]
+    output_dir = area_ctx["output_dir"]
+    safe_area = area_ctx["safe_area"]
+    day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}_SUMMARY")
     output_path = output_dir / f"{day_file}.xlsx"
     output_wb.save(str(output_path))
 
     output_wb.close()
     template_wb.close()
     return str(output_path)
+
+
+def process_area_order_workbooks(
+    area_value: str,
+    area_df: pd.DataFrame,
+    app: xw.App,
+    config: ScriptConfig,
+) -> List[str]:
+    """
+    Create up to two workbooks per area (PEPSI + LAYS, if each section exists).
+    Each workbook contains one invoice sheet per order for its section.
+    """
+    template_file = choose_template_file(area_value, config)
+    if not os.path.exists(template_file):
+        log_warning(f"Template file missing for area '{area_value}': {template_file}")
+        return []
+
+    if area_df.empty:
+        log_info(f"No rows found in area '{area_value}'.")
+        return []
+
+    area_df = prepare_area_sections(area_df, config)
+    target_sections = get_target_sections(config)
+    area_ctx = area_output_context(area_df, area_value, config)
+    latest_delivery_date = area_ctx["latest_delivery_date"]
+    output_dir = area_ctx["output_dir"]
+    safe_area = area_ctx["safe_area"]
+    saved_paths: List[str] = []
+
+    template_wb = app.books.open(template_file)
+    try:
+        template_ws = get_template_invoice_sheet(template_wb, config.invoice_sheet_candidates)
+        if template_ws is None:
+            log_warning(f"No invoice sheet found in template: {template_file}")
+            return []
+
+        for section_name in target_sections:
+            section_df = area_df[area_df["_section_group"] == section_name].copy()
+            if section_df.empty:
+                log_info(f"Skipping workbook for section '{section_name}' in area '{area_value}' (no rows).")
+                continue
+
+            output_wb = app.books.add()
+            output_wb.sheets[0].name = "TempSheet"
+            existing_sheet_names = set()
+            created_count = 0
+
+            try:
+                raw_order_ids = section_df[config.order_id_column].dropna().unique().tolist()
+                order_ids = [safe_str(oid, "") for oid in raw_order_ids]
+                valid_order_ids = [oid for oid in order_ids if oid and oid.lower() not in {"nan", "none", "null"}]
+
+                for order_str in sorted(valid_order_ids):
+                    order_df = section_df[section_df[config.order_id_column] == order_str]
+                    if order_df.empty:
+                        continue
+
+                    new_ws = copy_invoice_sheet(template_ws, output_wb, "TempSheet")
+                    if new_ws is None:
+                        log_warning(
+                            f"Could not copy invoice sheet for area '{area_value}' section '{section_name}' order '{order_str}'."
+                        )
+                        continue
+
+                    new_ws.name = make_unique_sheet_name(order_str, existing_sheet_names)
+                    render_invoice_sheet(new_ws, order_df, order_str, config)
+                    created_count += 1
+
+                if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
+                    output_wb.sheets["TempSheet"].delete()
+
+                if created_count == 0:
+                    output_wb.close()
+                    continue
+
+                day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}_{section_name}")
+                output_path = output_dir / f"{day_file}.xlsx"
+                output_wb.save(str(output_path))
+                saved_paths.append(str(output_path))
+                output_wb.close()
+            except Exception:
+                try:
+                    output_wb.close()
+                except Exception:
+                    pass
+                raise
+    finally:
+        template_wb.close()
+
+    return saved_paths
+
+
+def process_area(area_value: str, area_df: pd.DataFrame, app: xw.App, config: ScriptConfig) -> List[str]:
+    mode = safe_str(config.generation_mode, "per_order_section_workbooks").lower()
+    if mode == "summary_by_section":
+        saved = process_area_summary(area_value, area_df, app, config)
+        return [saved] if saved else []
+    if mode == "per_order_section_workbooks":
+        return process_area_order_workbooks(area_value, area_df, app, config)
+
+    log_warning(f"Unknown generation_mode '{config.generation_mode}'. Falling back to per_order_section_workbooks.")
+    return process_area_order_workbooks(area_value, area_df, app, config)
 
 
 def main() -> None:
@@ -946,7 +1083,7 @@ def main() -> None:
                 continue
             saved = process_area(area, area_df, app, config)
             if saved:
-                generated_files.append(saved)
+                generated_files.extend(saved)
     finally:
         app.quit()
 
