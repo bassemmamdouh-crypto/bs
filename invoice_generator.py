@@ -954,8 +954,8 @@ def process_area_order_workbooks(
     config: ScriptConfig,
 ) -> List[str]:
     """
-    Create up to two workbooks per area (PEPSI + LAYS, if each section exists).
-    Each workbook contains one invoice sheet per order for its section.
+    Create up to two workbooks per area (LAYS + PEPSI, if each section exists).
+    Each workbook contains one invoice sheet per order_id for its section.
     """
     template_file = choose_template_file(area_value, config)
     if not os.path.exists(template_file):
@@ -987,18 +987,34 @@ def process_area_order_workbooks(
                 log_info(f"Skipping workbook for section '{section_name}' in area '{area_value}' (no rows).")
                 continue
 
+            # Build explicit order groups from normalized order_id values.
+            section_df["_order_key"] = section_df[config.order_id_column].apply(lambda x: safe_str(x, ""))
+            section_df = section_df[section_df["_order_key"] != ""].copy()
+            if section_df.empty:
+                log_warning(
+                    f"Skipping workbook for section '{section_name}' in area '{area_value}' "
+                    f"because all rows have empty order IDs."
+                )
+                continue
+
             output_wb = app.books.add()
             output_wb.sheets[0].name = "TempSheet"
             existing_sheet_names = set()
             created_count = 0
 
             try:
-                raw_order_ids = section_df[config.order_id_column].dropna().unique().tolist()
-                order_ids = [safe_str(oid, "") for oid in raw_order_ids]
-                valid_order_ids = [oid for oid in order_ids if oid and oid.lower() not in {"nan", "none", "null"}]
+                raw_order_ids = section_df["_order_key"].dropna().unique().tolist()
+                valid_order_ids = [
+                    oid for oid in [safe_str(oid, "") for oid in raw_order_ids] if oid and oid.lower() not in {"nan", "none", "null"}
+                ]
+
+                log_info(
+                    f"Area '{area_value}' section '{section_name}': "
+                    f"{len(valid_order_ids)} order invoice sheet(s) will be created."
+                )
 
                 for order_str in sorted(valid_order_ids):
-                    order_df = section_df[section_df[config.order_id_column] == order_str]
+                    order_df = section_df[section_df["_order_key"] == order_str]
                     if order_df.empty:
                         continue
 
@@ -1020,7 +1036,7 @@ def process_area_order_workbooks(
                     output_wb.close()
                     continue
 
-                day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}_{section_name}")
+                day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}_{section_name}_ORDERS")
                 output_path = output_dir / f"{day_file}.xlsx"
                 output_wb.save(str(output_path))
                 saved_paths.append(str(output_path))
