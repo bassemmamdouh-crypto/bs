@@ -130,6 +130,15 @@ class ScriptConfig:
     discount_percent_columns: List[str] = field(
         default_factory=lambda: ["discount_percent", "offer_discount_percent", "promo_discount_percent"]
     )
+    # Fixed invoice-level gift offer:
+    # sum qty for selected SKUs, divide by 6, floor result => gift qty of SKU 273.
+    bundle_offer_active: bool = True
+    bundle_offer_source_skus: List[str] = field(
+        default_factory=lambda: ["200", "201", "202", "203", "204", "205", "206", "207", "221"]
+    )
+    bundle_offer_divisor: float = 6.0
+    bundle_offer_gift_sku: str = "273"
+    bundle_offer_gift_name: str = "عصير يومي برتقال 200 مل * 36"
 
     # Invoice table + footer layout
     line_start_row: int = 16
@@ -257,6 +266,17 @@ def safe_str(value: object, default: str = "") -> str:
     if s.lower() in {"nan", "none", "null", "nat"}:
         return default
     return s
+
+
+def normalize_sku(value: object) -> str:
+    sku = safe_str(value, "")
+    if not sku:
+        return ""
+    sku = sku.strip()
+    # Common Excel import shape for numeric IDs (e.g. 200.0).
+    if re.fullmatch(r"\d+\.0+", sku):
+        sku = sku.split(".", 1)[0]
+    return sku
 
 
 def normalize_column_key(name: object) -> str:
@@ -668,7 +688,7 @@ def build_base_items(order_df: pd.DataFrame, config: ScriptConfig) -> List[Dict[
 def quantity_by_sku(order_df: pd.DataFrame, config: ScriptConfig) -> Dict[str, float]:
     result: Dict[str, float] = {}
     for _, row in order_df.iterrows():
-        sku = safe_str(row_first_value(row, config.sku_code_column_candidates, ""), "")
+        sku = normalize_sku(row_first_value(row, config.sku_code_column_candidates, ""))
         if not sku:
             continue
         qty = safe_float(row_first_value(row, config.qty_column_candidates, 0), 0.0)
@@ -679,6 +699,7 @@ def quantity_by_sku(order_df: pd.DataFrame, config: ScriptConfig) -> Dict[str, f
 def apply_offer_rules(order_df: pd.DataFrame, subtotal: float, config: ScriptConfig) -> Dict[str, object]:
     offer_lines: List[Dict[str, object]] = []
     discount_total = 0.0
+    sku_qty_map = quantity_by_sku(order_df, config)
 
     # A) Offer/gift columns in dataframe (safe if missing)
     for gift_col in config.gift_qty_columns:
@@ -719,14 +740,38 @@ def apply_offer_rules(order_df: pd.DataFrame, subtotal: float, config: ScriptCon
     if discount_percent:
         discount_total += subtotal * (discount_percent / 100.0)
 
-    # B) Configured rule-engine offers
-    sku_qty_map = quantity_by_sku(order_df, config)
+    # B) Fixed bundle offer:
+    # Sum quantities of specific SKUs, then floor(total / divisor) as gift qty.
+    if config.bundle_offer_active and config.bundle_offer_divisor > 0:
+        source_skus = {
+            normalize_sku(sku)
+            for sku in config.bundle_offer_source_skus
+            if normalize_sku(sku)
+        }
+        combo_qty_total = sum(qty for sku, qty in sku_qty_map.items() if normalize_sku(sku) in source_skus)
+        combo_gift_qty = math.floor(combo_qty_total / config.bundle_offer_divisor)
+        if combo_gift_qty > 0:
+            gift_line_name = safe_str(config.bundle_offer_gift_name, "Gift Item")
+            gift_sku = normalize_sku(config.bundle_offer_gift_sku)
+            if gift_sku:
+                gift_line_name = f"SKU {gift_sku} - {gift_line_name}"
+            offer_lines.append(
+                {
+                    "item_name": gift_line_name,
+                    "qty": 0.0,
+                    "unit": "",
+                    "gift_qty": float(combo_gift_qty),
+                    "net_amount": 0.0,
+                }
+            )
+
+    # C) Configured rule-engine offers
     for rule in config.offer_rules:
         if not rule.active:
             continue
 
         if rule.rule_type == "buy_qty_get_free_same_sku":
-            buy_sku = safe_str(rule.buy_sku, "")
+            buy_sku = normalize_sku(rule.buy_sku)
             if not buy_sku or rule.buy_qty <= 0 or rule.gift_qty <= 0:
                 continue
             bought = sku_qty_map.get(buy_sku, 0.0)
@@ -745,8 +790,8 @@ def apply_offer_rules(order_df: pd.DataFrame, subtotal: float, config: ScriptCon
                 )
 
         elif rule.rule_type == "buy_sku_get_other_sku_free":
-            buy_sku = safe_str(rule.buy_sku, "")
-            gift_sku = safe_str(rule.gift_sku, "")
+            buy_sku = normalize_sku(rule.buy_sku)
+            gift_sku = normalize_sku(rule.gift_sku)
             if not buy_sku or not gift_sku or rule.buy_qty <= 0 or rule.gift_qty <= 0:
                 continue
             bought = sku_qty_map.get(buy_sku, 0.0)
