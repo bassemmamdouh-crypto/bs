@@ -1,6 +1,7 @@
 import pandas as pd
 from math import radians, cos, sin, asin, sqrt
 from typing import List, Tuple, Optional
+import re
 
 # =============================
 # SETTINGS
@@ -34,6 +35,18 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlon = lon2 - lon1
     a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
     return 6371 * 2 * asin(sqrt(a))
+
+
+def canonical_route_key(route_value: str) -> str:
+    # If a route value encodes connected polygons (e.g. "A > B > C"),
+    # use a canonical grouped key so planning stays inside that connected group.
+    text = str(route_value).strip().lower()
+    if text == "":
+        return "no_route"
+    parts = [p.strip() for p in re.split(r"\s*(?:->|>|,|;|\||/)\s*", text) if p.strip()]
+    if not parts:
+        return "no_route"
+    return "|".join(sorted(set(parts)))
 
 
 def min_distance_to_run(orders: pd.DataFrame, candidate_idx: int, run_indices: List[int]) -> float:
@@ -205,17 +218,13 @@ def add_from_specific_route(
 # =============================
 def build_runs(df_sc: pd.DataFrame, capacity: float, sc_name: str, start_run_id: int):
     orders = (
-        df_sc.groupby("order_id", as_index=False)
+        df_sc.groupby(["order_id", "route", "route_key", "latitude", "longitude"], as_index=False)
         .agg(
             quantity=("quantity", "sum"),
-            latitude=("latitude", "first"),
-            longitude=("longitude", "first"),
-            route=("route", "first"),
         )
         .reset_index(drop=True)
     )
 
-    orders["route_key"] = orders["route"].astype(str).str.strip().str.lower().replace({"": "no_route"})
     orders["assigned"] = False
     orders["run_id"] = pd.NA
     orders["stop_sequence"] = pd.NA
@@ -306,6 +315,7 @@ def main():
     # Normalize key columns.
     df["supply_chain"] = df["supply_chain"].astype(str).str.lower().str.strip()
     df["route"] = df["route"].astype(str).str.strip()
+    df["route_key"] = df["route"].map(canonical_route_key)
     df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
@@ -337,9 +347,15 @@ def main():
         raise ValueError("❌ No runs generated — check supply_chain and quantity values.")
 
     final_orders = pd.concat(all_orders, ignore_index=True)
-    final_orders = final_orders[["order_id", "run_id", "stop_sequence"]]
+    final_orders = final_orders[
+        ["order_id", "supply_chain", "route_key", "latitude", "longitude", "run_id", "stop_sequence"]
+    ]
 
-    detailed_df = df.merge(final_orders, on="order_id", how="left")
+    detailed_df = df.merge(
+        final_orders,
+        on=["order_id", "supply_chain", "route_key", "latitude", "longitude"],
+        how="left",
+    )
     runs_df = pd.DataFrame(all_runs)
 
     # =============================
