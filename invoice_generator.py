@@ -798,7 +798,37 @@ def apply_offer_rules(
                 }
             )
 
-    # C) Configured rule-engine offers
+    # C) BUY 1 GET 1 SAME SKU (180,181,182)
+    same_sku_offer = {"180", "181", "182"}
+    sku_gift_map: Dict[str, float] = {}
+
+    for _, row in order_df.iterrows():
+        sku = normalize_sku(row_first_value(row, config.sku_code_column_candidates, ""))
+        if sku in same_sku_offer:
+            qty = safe_float(row_first_value(row, config.qty_column_candidates, 0), 0.0)
+            sku_gift_map[sku] = sku_gift_map.get(sku, 0.0) + qty
+
+    for sku, total_qty in sku_gift_map.items():
+        if total_qty <= 0:
+            continue
+        sku_rows = order_df[
+            order_df.apply(
+                lambda r: normalize_sku(row_first_value(r, config.sku_code_column_candidates, "")) == sku,
+                axis=1,
+            )
+        ]
+        gift_name = infer_line_item_name(sku_rows.iloc[0], config) if not sku_rows.empty else f"SKU {sku}"
+        offer_lines.append(
+            {
+                "item_name": gift_name,
+                "qty": 0.0,
+                "unit": "",
+                "gift_qty": total_qty,
+                "net_amount": 0.0,
+            }
+        )
+
+    # D) Configured rule-engine offers
     for rule in config.offer_rules:
         if not rule.active:
             continue
