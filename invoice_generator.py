@@ -268,15 +268,29 @@ def safe_str(value: object, default: str = "") -> str:
     return s
 
 
+def normalize_identifier(value: object, default: str = "") -> str:
+    """
+    Normalize ID-like values coming from Excel so numeric IDs do not keep trailing .0.
+    Examples: 123.0 -> "123", "00123" -> "00123", "A-12" -> "A-12"
+    """
+    text = safe_str(value, default)
+    if not text:
+        return default
+
+    # Normalize Arabic digits commonly found in mixed datasets.
+    arabic_digits = "٠١٢٣٤٥٦٧٨٩"
+    for i, d in enumerate(arabic_digits):
+        text = text.replace(d, str(i))
+
+    text = text.replace(",", "").strip()
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        text = text.split(".", 1)[0]
+
+    return text
+
+
 def normalize_sku(value: object) -> str:
-    sku = safe_str(value, "")
-    if not sku:
-        return ""
-    sku = sku.strip()
-    # Common Excel import shape for numeric IDs (e.g. 200.0).
-    if re.fullmatch(r"\d+\.0+", sku):
-        sku = sku.split(".", 1)[0]
-    return sku
+    return normalize_identifier(value, "")
 
 
 def normalize_column_key(name: object) -> str:
@@ -1021,7 +1035,7 @@ def process_area_order_workbooks(
         return []
 
     area_df = prepare_area_sections(area_df, config)
-    area_df["_order_key"] = area_df[config.order_id_column].apply(lambda x: safe_str(x, ""))
+    area_df["_order_key"] = area_df[config.order_id_column].apply(lambda x: normalize_identifier(x, ""))
     area_df = area_df[area_df["_order_key"] != ""].copy()
     target_sections = get_target_sections(config)
     area_ctx = area_output_context(area_df, area_value, config)
@@ -1051,7 +1065,9 @@ def process_area_order_workbooks(
             try:
                 raw_order_ids = section_df["_order_key"].dropna().unique().tolist()
                 valid_order_ids = [
-                    oid for oid in [safe_str(oid, "") for oid in raw_order_ids] if oid and oid.lower() not in {"nan", "none", "null"}
+                    oid
+                    for oid in [normalize_identifier(oid, "") for oid in raw_order_ids]
+                    if oid and oid.lower() not in {"nan", "none", "null"}
                 ]
 
                 log_info(
@@ -1126,7 +1142,7 @@ def main() -> None:
     for dt_col in [config.delivery_date_column, "order_date", "order_time"]:
         if dt_col in orders_df.columns:
             orders_df[dt_col] = pd.to_datetime(orders_df[dt_col], errors="coerce")
-    orders_df[config.order_id_column] = orders_df[config.order_id_column].apply(safe_str)
+    orders_df[config.order_id_column] = orders_df[config.order_id_column].apply(lambda x: normalize_identifier(x, ""))
     orders_df[config.area_column] = orders_df[config.area_column].apply(safe_str)
 
     non_empty_areas = [a for a in orders_df[config.area_column].dropna().unique() if safe_str(a, "")]
