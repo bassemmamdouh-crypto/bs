@@ -15,6 +15,14 @@ SUPPLY_CHAINS = {
 # Prefer filling runs as much as possible, but keep route logic first.
 TARGET_UTILIZATION = 0.90
 
+# Compact-cluster controls (same route only) to reduce fuel burn.
+SEED_NEIGHBOR_RADIUS_KM = 1.5
+INITIAL_MAX_NEXT_STOP_KM = 1.5
+INITIAL_MAX_FROM_SEED_KM = 2.5
+RELAX_DISTANCE_STEP_KM = 0.5
+MAX_NEXT_STOP_KM = 3.5
+MAX_FROM_SEED_KM = 5.0
+
 
 # =============================
 # DISTANCE
@@ -82,15 +90,30 @@ def choose_seed_route(orders: pd.DataFrame) -> Optional[str]:
 
 
 def choose_seed_order_idx(orders: pd.DataFrame, route_key: str, capacity_left: float) -> Optional[int]:
-    candidates = orders[
+    route_unassigned = orders[
         (~orders["assigned"])
         & (orders["route_key"] == route_key)
-        & (orders["quantity"] <= capacity_left)
     ].copy()
+    candidates = route_unassigned[route_unassigned["quantity"] <= capacity_left].copy()
+
     if candidates.empty:
         return None
-    # Start with biggest order in the route to maximize run utilization.
-    return int(candidates.sort_values("quantity", ascending=False).index[0])
+
+    # Seed from a dense local pocket first (better ground-level route compactness).
+    def local_qty_score(idx: int) -> float:
+        center = route_unassigned.loc[idx]
+        dists = route_unassigned.apply(
+            lambda row: haversine(
+                center["latitude"], center["longitude"], row["latitude"], row["longitude"]
+            ),
+            axis=1,
+        )
+        return float(route_unassigned.loc[dists <= SEED_NEIGHBOR_RADIUS_KM, "quantity"].sum())
+
+    candidates["local_qty_score"] = candidates.index.map(local_qty_score)
+    return int(
+        candidates.sort_values(["local_qty_score", "quantity"], ascending=[False, False]).index[0]
+    )
 
 
 def add_from_specific_route(
@@ -98,10 +121,19 @@ def add_from_specific_route(
     route_key: str,
     capacity_left: float,
     run_indices: List[int],
+    capacity: float,
 ) -> Tuple[List[int], float]:
     added_indices: List[int] = []
+    seed_idx = run_indices[0]
+    current_idx = run_indices[-1]
+    max_next_stop_km = INITIAL_MAX_NEXT_STOP_KM
+    max_from_seed_km = INITIAL_MAX_FROM_SEED_KM
 
     while capacity_left > 0:
+        current_utilization = ((capacity - capacity_left) / capacity) if capacity else 1
+        if current_utilization >= TARGET_UTILIZATION:
+            break
+
         candidates = orders[
             (~orders["assigned"])
             & (orders["route_key"] == route_key)
@@ -112,16 +144,56 @@ def add_from_specific_route(
         if candidates.empty:
             break
 
-        # Pick the nearest retailer to any already planned stop in this run.
+        current_lat = float(orders.loc[current_idx, "latitude"])
+        current_lon = float(orders.loc[current_idx, "longitude"])
+        seed_lat = float(orders.loc[seed_idx, "latitude"])
+        seed_lon = float(orders.loc[seed_idx, "longitude"])
+
+        # Compact run logic:
+        # - short next leg from current stop
+        # - bounded spread from the seed stop
+        # - still aware of nearest distance to whole run
+        candidates["leg_km"] = candidates.apply(
+            lambda row: haversine(current_lat, current_lon, row["latitude"], row["longitude"]),
+            axis=1,
+        )
+        candidates["distance_to_seed"] = candidates.apply(
+            lambda row: haversine(seed_lat, seed_lon, row["latitude"], row["longitude"]),
+            axis=1,
+        )
         candidates["distance_to_run"] = candidates.index.map(
             lambda idx: min_distance_to_run(orders, idx, run_indices)
         )
+
+        feasible = candidates[
+            (candidates["leg_km"] <= max_next_stop_km)
+            & (candidates["distance_to_seed"] <= max_from_seed_km)
+        ].copy()
+
+        if feasible.empty:
+            # If current stop has no good neighbor, allow nearest to any stop in the same run.
+            feasible = candidates[
+                (candidates["distance_to_run"] <= max_next_stop_km)
+                & (candidates["distance_to_seed"] <= max_from_seed_km)
+            ].copy()
+
+        if feasible.empty:
+            can_relax = (max_next_stop_km < MAX_NEXT_STOP_KM) or (max_from_seed_km < MAX_FROM_SEED_KM)
+            if can_relax:
+                max_next_stop_km = min(MAX_NEXT_STOP_KM, max_next_stop_km + RELAX_DISTANCE_STEP_KM)
+                max_from_seed_km = min(MAX_FROM_SEED_KM, max_from_seed_km + RELAX_DISTANCE_STEP_KM)
+                continue
+            break
+
         next_idx = int(
-            candidates.sort_values(["distance_to_run", "quantity"], ascending=[True, False]).index[0]
+            feasible.sort_values(
+                ["leg_km", "distance_to_run", "quantity"], ascending=[True, True, False]
+            ).index[0]
         )
         row = orders.loc[next_idx]
         added_indices.append(next_idx)
         run_indices.append(next_idx)
+        current_idx = next_idx
         capacity_left -= float(row["quantity"])
 
     return added_indices, capacity_left
@@ -182,6 +254,7 @@ def build_runs(df_sc: pd.DataFrame, capacity: float, sc_name: str, start_run_id:
             route_key=seed_route,
             capacity_left=capacity_left,
             run_indices=run_indices,
+            capacity=capacity,
         )
 
         if not run_indices:
