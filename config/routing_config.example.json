@@ -1,0 +1,42 @@
+{
+  "sheet_name": "orders",
+  "columns": {
+    "order_id": "order_id",
+    "retailer_id": "retailer_id",
+    "retailer_name": "retailer_name",
+    "latitude": "latitude",
+    "longitude": "longitude",
+    "product": "product_name",
+    "quantity": "quantity",
+    "supply_chain": "supply_chain"
+  },
+  "routing": {
+    "default_vehicle_capacity": 1000,
+    "capacity_by_supply_chain": {
+      "COLD_CHAIN": 600,
+      "DRY": 1200
+    },
+    "allow_cross_polygon_fill": true,
+    "max_cross_fill_distance_km": 15
+  },
+  "polygons": [
+    {
+      "id": "NORTH_ZONE",
+      "points": [
+        [40.7600, -74.0500],
+        [40.7600, -73.9000],
+        [40.8600, -73.9000],
+        [40.8600, -74.0500]
+      ]
+    },
+    {
+      "id": "SOUTH_ZONE",
+      "points": [
+        [40.6500, -74.0500],
+        [40.6500, -73.9000],
+        [40.7599, -73.9000],
+        [40.7599, -74.0500]
+      ]
+    }
+  ]
+}
