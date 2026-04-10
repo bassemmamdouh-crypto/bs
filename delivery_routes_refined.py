@@ -16,12 +16,13 @@ SUPPLY_CHAINS = {
 TARGET_UTILIZATION = 0.90
 
 # Compact-cluster controls (same route only) to reduce fuel burn.
-SEED_NEIGHBOR_RADIUS_KM = 1.5
-INITIAL_MAX_NEXT_STOP_KM = 1.5
-INITIAL_MAX_FROM_SEED_KM = 2.5
-RELAX_DISTANCE_STEP_KM = 0.5
-MAX_NEXT_STOP_KM = 3.5
-MAX_FROM_SEED_KM = 5.0
+# Aggressive mode: tighter clusters, fewer long jumps.
+SEED_NEIGHBOR_RADIUS_KM = 1.0
+INITIAL_MAX_NEXT_STOP_KM = 1.0
+INITIAL_MAX_FROM_SEED_KM = 2.0
+RELAX_DISTANCE_STEP_KM = 0.4
+MAX_NEXT_STOP_KM = 2.5
+MAX_FROM_SEED_KM = 3.5
 
 
 # =============================
