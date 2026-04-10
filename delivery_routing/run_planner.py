@@ -384,7 +384,6 @@ def build_outputs(
                     {
                         "order_key": order_key,
                         "run_id": run_id,
-                        "supply_chain": supply_chain,
                         "stop_sequence": stop_sequence,
                         "vehicle_capacity": capacity,
                         "used_capacity": round(used_capacity, 3),
@@ -395,12 +394,6 @@ def build_outputs(
                         "run_order_count": len(run["order_ids"]),
                         "run_polygon_count": len(run_polygons),
                         "order_demand": float(order_row["demand"]),
-                        "order_id": order_row["order_id"],
-                        "retailer_id": order_row["retailer_id"],
-                        "retailer_name": order_row["retailer_name"],
-                        "latitude": float(order_row["latitude"]),
-                        "longitude": float(order_row["longitude"]),
-                        "polygon_id": str(order_row["polygon_id"]),
                     }
                 )
 
