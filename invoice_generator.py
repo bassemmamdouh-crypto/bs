@@ -137,17 +137,17 @@ class ScriptConfig:
         default_factory=lambda: ["200", "201", "202", "203", "204", "205", "206", "207", "221"]
     )
     bundle_offer_divisor: float = 6.0
-    bundle_offer_gift_sku: str = "273"
+    bundle_offer_gift_sku: str = ""
     bundle_offer_gift_name: str = "عصير يومي برتقال 200 مل * 36"
 
     # Invoice table + footer layout
     line_start_row: int = 16
-    line_end_row: int = 153
-    totals_row: int = 154
-    subtotal_row: int = 155
-    discount_row: int = 156
-    adjustment_row: int = 157
-    net_total_row: int = 158
+    line_end_row: int = 291
+    totals_row: int = 292
+    subtotal_row: int = 293
+    discount_row: int = 294
+    adjustment_row: int = 295
+    net_total_row: int = 296
 
     # Enable/disable offer lines (gifts and explicit offer items)
     include_offer_lines: bool = True
@@ -526,11 +526,11 @@ def make_unique_sheet_name(base_name: str, existing_names: set) -> str:
 
 def adjust_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig) -> int:
     """
-    Adjust line section safely for required_count:
+    Adjust line section size to match required_count:
     - insert rows before footer if items exceed template capacity
-    - do NOT delete rows when items are fewer (keep footer formatting intact)
+    - delete unused line rows before footer if items are fewer
 
-    Returns positive row shift applied to footer rows.
+    Returns signed row shift applied to footer rows.
     """
     base_capacity = config.line_end_row - config.line_start_row + 1
     target_count = max(0, required_count)
@@ -547,8 +547,19 @@ def adjust_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig
                 break
         return inserted
 
-    # Keep template rows as-is when fewer lines are needed, so footer styles/formulas
-    # remain in their original positions and formatting is preserved.
+    if requested_shift < 0:
+        delete_count = abs(requested_shift)
+        delete_start_row = config.line_start_row + target_count
+        deleted = 0
+        for _ in range(delete_count):
+            try:
+                ws.api.Rows(delete_start_row).Delete()
+                deleted += 1
+            except Exception as exc:
+                log_warning(f"Unable to delete empty invoice row before footer: {exc}")
+                break
+        return -deleted
+
     return 0
 
 
