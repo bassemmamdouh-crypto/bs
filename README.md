@@ -62,6 +62,43 @@ python3 delivery_routing/run_planner.py \
 Optional:
 
 - `--sheet SHEET_NAME` to override the configured input sheet.
+- `--settings path/to/run_planner_settings.json` to load input/config/output from a JSON file.
+
+## Jupyter / Notebook mode (no CLI args required)
+
+If your notebook and script are in the same folder, you can avoid argument issues by
+using a settings file.
+
+1) Copy `delivery_routing/run_planner_settings.example.json` to:
+
+`delivery_routing/run_planner_settings.json`
+
+2) Edit values, for example:
+
+```json
+{
+  "input": "E:/Marbah Products/Other Scripts/Delivery Plan/orders_in_delivery.xlsx",
+  "config": "E:/Marbah Products/Other Scripts/Delivery Plan/config/routing_config.example.json",
+  "output": "E:/Marbah Products/Other Scripts/Delivery Plan/routing_output.xlsx",
+  "sheet": null
+}
+```
+
+3) Run from notebook:
+
+```python
+%run delivery_routing/run_planner.py
+```
+
+Or explicitly pass settings path:
+
+```python
+%run delivery_routing/run_planner.py --settings "E:/Marbah Products/Other Scripts/Delivery Plan/delivery_routing/run_planner_settings.json"
+```
+
+Notes:
+- In your previous command, config path missed a slash: `configrouting...` should be `config/routing...`.
+- Prefer `/` in notebook paths on Windows to avoid escaping issues.
 
 ## Output sheets
 

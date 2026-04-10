@@ -1,0 +1,6 @@
+{
+  "input": "E:/Marbah Products/Other Scripts/Delivery Plan/orders_in_delivery.xlsx",
+  "config": "E:/Marbah Products/Other Scripts/Delivery Plan/config/routing_config.example.json",
+  "output": "E:/Marbah Products/Other Scripts/Delivery Plan/routing_output.xlsx",
+  "sheet": null
+}

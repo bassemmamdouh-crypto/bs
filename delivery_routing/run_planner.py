@@ -15,6 +15,7 @@ import argparse
 import json
 import math
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
@@ -426,27 +427,82 @@ def load_config(path: Path) -> Dict[str, Any]:
         return json.load(fp)
 
 
+def _load_settings_file(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as fp:
+        data = json.load(fp)
+    if not isinstance(data, dict):
+        raise ValueError(f"Settings file must contain a JSON object: {path}")
+    return data
+
+
+def _resolve_runtime_paths(args: argparse.Namespace) -> Dict[str, Any]:
+    runtime = {
+        "input": args.input,
+        "config": args.config,
+        "output": args.output,
+        "sheet": args.sheet,
+    }
+    required_keys = ("input", "config", "output")
+    if all(runtime[key] for key in required_keys):
+        return runtime
+
+    default_settings_path = Path(__file__).resolve().parent / "run_planner_settings.json"
+    settings_path = Path(args.settings) if args.settings else default_settings_path
+    settings = _load_settings_file(settings_path)
+
+    for key in ("input", "config", "output", "sheet"):
+        if runtime.get(key) is None and settings.get(key) is not None:
+            runtime[key] = settings[key]
+
+    missing = [key for key in required_keys if not runtime.get(key)]
+    if missing:
+        raise ValueError(
+            "Missing required runtime values: "
+            f"{', '.join(missing)}. "
+            "Provide --input/--config/--output directly, or create "
+            f"{settings_path} with those keys."
+        )
+    return runtime
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate delivery run sheet and vehicle load summary from Excel orders."
     )
-    parser.add_argument("--input", required=True, help="Input Excel file path.")
-    parser.add_argument("--config", required=True, help="JSON config file path.")
-    parser.add_argument("--output", required=True, help="Output Excel file path.")
+    parser.add_argument("--input", required=False, help="Input Excel file path.")
+    parser.add_argument("--config", required=False, help="JSON config file path.")
+    parser.add_argument("--output", required=False, help="Output Excel file path.")
     parser.add_argument(
         "--sheet",
         default=None,
         help="Optional input sheet name override. If not provided, uses config sheet_name or first sheet.",
     )
+    parser.add_argument(
+        "--settings",
+        default=None,
+        help=(
+            "Optional JSON file with input/config/output/sheet values. "
+            "If --input/--config/--output are omitted, this file is used. "
+            "Default path: delivery_routing/run_planner_settings.json"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
-    config = load_config(Path(args.config))
+    try:
+        args = parse_args()
+        runtime = _resolve_runtime_paths(args)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    config = load_config(Path(runtime["config"]))
 
     columns = ColumnMap.from_config(config.get("columns", {}))
-    sheet_name = args.sheet if args.sheet is not None else config.get("sheet_name", 0)
+    sheet_name = runtime["sheet"] if runtime["sheet"] is not None else config.get("sheet_name", 0)
     polygons = config.get("polygons", [])
     routing_cfg = config.get("routing", {})
 
@@ -463,7 +519,7 @@ def main() -> None:
     if max_cross_fill_distance_km is not None:
         max_cross_fill_distance_km = float(max_cross_fill_distance_km)
 
-    orders_raw = pd.read_excel(args.input, sheet_name=sheet_name)
+    orders_raw = pd.read_excel(runtime["input"], sheet_name=sheet_name)
     run_sheet, load_summary = build_outputs(
         orders_raw=orders_raw,
         columns=columns,
@@ -474,7 +530,7 @@ def main() -> None:
         max_cross_fill_distance_km=max_cross_fill_distance_km,
     )
 
-    output_path = Path(args.output)
+    output_path = Path(runtime["output"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         run_sheet.to_excel(writer, sheet_name="run_sheet", index=False)
