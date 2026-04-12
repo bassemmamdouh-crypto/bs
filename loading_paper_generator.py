@@ -1,0 +1,433 @@
+import math
+import os
+import re
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import xlwings as xw
+
+
+# =============================
+# SETTINGS (EDIT THIS SECTION)
+# =============================
+ORDERS_FILE = r"E:\Marbah Products\Marbah Invoices script\orders_data.xlsx"
+LOADING_TEMPLATE_FILE = r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx"
+OUTPUT_ROOT = r"E:\Marbah Products\Marbah Invoices script"
+
+
+@dataclass
+class LoadingPaperConfig:
+    orders_file: str = ORDERS_FILE
+    template_file: str = LOADING_TEMPLATE_FILE
+    output_root: str = OUTPUT_ROOT
+
+    loading_sheet_candidates: Tuple[str, ...] = ("Loading paper", "loading paper", "loading")
+
+    # Source columns
+    route_agent_candidates: Tuple[str, ...] = ("route_agent", "driver")
+    run_candidates: Tuple[str, ...] = ("run", "trip", "run_name")
+    delivery_date_candidates: Tuple[str, ...] = ("estimated_delivery_date", "delivery_date")
+    brand_candidates: Tuple[str, ...] = (
+        "brand",
+        "brand_name",
+        "section",
+        "section_name",
+        "business_unit",
+        "category",
+    )
+    product_name_candidates: Tuple[str, ...] = (
+        "sku_name",
+        "item_name",
+        "product_name",
+        "product_name_ar",
+        "item",
+        "description",
+    )
+    qty_candidates: Tuple[str, ...] = ("purchased_item_count", "qty", "quantity", "item_qty")
+
+    # Template layout
+    start_row: int = 4
+    end_row: int = 139
+    summary_anchor_row: int = 141
+    left_name_col: int = 2
+    left_qty_col: int = 3
+    right_name_col: int = 5
+    right_qty_col: int = 6
+
+    # Optional header cells in loading sheet
+    route_agent_cell: str = "B2"
+    run_cell: str = "E2"
+    date_cell: str = "B3"
+    total_qty_cell: str = "C143"
+
+    include_brand_subtotal_row: bool = True
+
+
+COLUMN_ALIASES: Dict[str, List[str]] = {
+    "route_agent": ["driver"],
+    "run": ["trip", "run_name"],
+    "estimated_delivery_date": ["delivery_date"],
+    "brand": ["section", "section_name", "business_unit", "category"],
+    "sku_name": ["item_name", "product_name", "product_name_ar", "item", "description"],
+    "purchased_item_count": ["qty", "quantity", "item_qty"],
+}
+
+
+def log_info(msg: str) -> None:
+    print(f"INFO: {msg}")
+
+
+def log_warning(msg: str) -> None:
+    print(f"WARNING: {msg}")
+
+
+def safe_str(value: object, default: str = "") -> str:
+    if pd.isna(value):
+        return default
+    s = str(value).strip()
+    if s.lower() in {"nan", "none", "null", "nat"}:
+        return default
+    return s
+
+
+def safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        x = str(value).strip()
+        arabic_digits = "٠١٢٣٤٥٦٧٨٩"
+        for i, d in enumerate(arabic_digits):
+            x = x.replace(d, str(i))
+        x = x.replace(",", "")
+        x = re.sub(r"[^0-9.\-]", "", x)
+        if x in {"", ".", "-", "-.", ".-"}:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+
+def normalize_identifier(value: object, default: str = "") -> str:
+    text = safe_str(value, default)
+    if not text:
+        return default
+    text = text.replace(",", "").strip()
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return text
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [safe_str(c, "").lower() for c in df.columns]
+    return df
+
+
+def apply_column_aliases(df: pd.DataFrame, aliases: Dict[str, List[str]]) -> pd.DataFrame:
+    rename_map: Dict[str, str] = {}
+    existing = set(df.columns)
+    for target, candidates in aliases.items():
+        if target in existing:
+            continue
+        for candidate in candidates:
+            candidate_norm = safe_str(candidate, "").lower()
+            if candidate_norm in existing:
+                rename_map[candidate_norm] = target
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def find_existing_column(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def get_sheet_if_exists(workbook: xw.Book, sheet_name: str) -> Optional[xw.Sheet]:
+    try:
+        return workbook.sheets[sheet_name]
+    except Exception:
+        return None
+
+
+def get_loading_sheet(workbook: xw.Book, candidates: Tuple[str, ...]) -> Optional[xw.Sheet]:
+    for name in candidates:
+        ws = get_sheet_if_exists(workbook, name)
+        if ws is not None:
+            return ws
+    if workbook.sheets.count > 0:
+        log_warning(f"Loading sheet not found by name. Using first sheet '{workbook.sheets[0].name}'.")
+        return workbook.sheets[0]
+    return None
+
+
+def copy_sheet(template_ws: xw.Sheet, output_wb: xw.Book, temp_sheet_name: str) -> Optional[xw.Sheet]:
+    before = [s.name for s in output_wb.sheets]
+    template_ws.api.Copy(Before=output_wb.sheets[temp_sheet_name].api)
+    for sheet in output_wb.sheets:
+        if sheet.name not in before:
+            return sheet
+    return None
+
+
+def make_unique_sheet_name(base_name: str, existing_names: set) -> str:
+    clean = re.sub(r"[\[\]\*\/\\\?\:]", "", safe_str(base_name, "LOAD"))[:25]
+    candidate = f"LOAD_{clean}" if clean else "LOAD"
+    i = 1
+    while candidate in existing_names:
+        candidate = f"LOAD_{clean}_{i}"[:31]
+        i += 1
+    existing_names.add(candidate)
+    return candidate[:31]
+
+
+def adjust_loading_capacity(ws: xw.Sheet, required_rows: int, config: LoadingPaperConfig) -> int:
+    base_capacity = config.end_row - config.start_row + 1
+    requested_shift = max(0, required_rows) - base_capacity
+    inserted = 0
+    if requested_shift > 0:
+        for _ in range(requested_shift):
+            try:
+                ws.api.Rows(config.summary_anchor_row).Insert()
+                inserted += 1
+            except Exception as exc:
+                log_warning(f"Unable to insert extra loading rows before summary: {exc}")
+                break
+    return inserted
+
+
+def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tuple[List[Dict[str, object]], float]:
+    rows: List[Dict[str, object]] = []
+    if group_df.empty:
+        return rows, 0.0
+
+    grouped = (
+        group_df.groupby(["_brand", "_product"], dropna=False)["_qty"]
+        .sum()
+        .reset_index()
+        .sort_values(["_brand", "_product"])
+    )
+    grand_total = float(grouped["_qty"].sum())
+
+    for brand_name, brand_df in grouped.groupby("_brand", sort=True):
+        brand_clean = safe_str(brand_name, "OTHER")
+        brand_total = float(brand_df["_qty"].sum())
+        rows.append({"kind": "brand", "name": brand_clean, "qty": brand_total})
+
+        for _, rec in brand_df.iterrows():
+            prod = safe_str(rec["_product"], "Unnamed Item")
+            qty = safe_float(rec["_qty"], 0.0)
+            rows.append({"kind": "item", "name": prod, "qty": qty})
+
+        if config.include_brand_subtotal_row:
+            rows.append({"kind": "subtotal", "name": f"اجمالي {brand_clean}", "qty": brand_total})
+
+    return rows, grand_total
+
+
+def style_loading_row(ws: xw.Sheet, row_no: int, name_col: int, qty_col: int, row_kind: str) -> None:
+    name_cell = ws.range((row_no, name_col))
+    qty_cell = ws.range((row_no, qty_col))
+    row_range = ws.range((row_no, name_col), (row_no, qty_col))
+    row_range.api.Font.Name = "Calibri"
+    row_range.api.Font.Size = 10
+
+    if row_kind == "brand":
+        row_range.api.Font.Bold = True
+        row_range.color = (47, 117, 181)
+        row_range.api.Font.Color = 0xFFFFFF
+    elif row_kind == "subtotal":
+        row_range.api.Font.Bold = True
+        row_range.color = (217, 217, 217)
+    else:
+        row_range.api.Font.Bold = False
+        row_range.color = None
+
+    name_cell.api.HorizontalAlignment = -4152  # xlRight
+    qty_cell.api.HorizontalAlignment = -4108  # xlCenter
+    qty_cell.number_format = "#,##0"
+
+
+def clear_loading_column_block(ws: xw.Sheet, start_row: int, end_row: int, name_col: int, qty_col: int) -> None:
+    ws.range((start_row, name_col), (end_row, qty_col)).value = None
+    ws.range((start_row, name_col), (end_row, qty_col)).color = None
+    ws.range((start_row, name_col), (end_row, qty_col)).api.Font.Bold = False
+    ws.range((start_row, name_col), (end_row, qty_col)).api.Font.Color = 0
+
+
+def write_loading_column(
+    ws: xw.Sheet,
+    rows: List[Dict[str, object]],
+    start_row: int,
+    end_row: int,
+    name_col: int,
+    qty_col: int,
+) -> None:
+    clear_loading_column_block(ws, start_row, end_row, name_col, qty_col)
+    for idx, row in enumerate(rows):
+        row_no = start_row + idx
+        if row_no > end_row:
+            break
+        ws.range((row_no, name_col)).value = row["name"]
+        ws.range((row_no, qty_col)).value = safe_float(row["qty"], 0.0)
+        style_loading_row(ws, row_no, name_col, qty_col, safe_str(row.get("kind", "item"), "item"))
+
+
+def split_rows_two_columns(rows: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    left_count = math.ceil(len(rows) / 2)
+    return rows[:left_count], rows[left_count:]
+
+
+def write_loading_sheet(
+    ws: xw.Sheet,
+    route_agent: str,
+    run_name: str,
+    group_df: pd.DataFrame,
+    config: LoadingPaperConfig,
+) -> None:
+    rows, grand_total = build_brand_rows(group_df, config)
+    left_rows, right_rows = split_rows_two_columns(rows)
+    required_rows = max(len(left_rows), len(right_rows))
+
+    inserted = adjust_loading_capacity(ws, required_rows, config)
+    end_row = config.end_row + inserted
+
+    write_loading_column(
+        ws,
+        left_rows,
+        config.start_row,
+        end_row,
+        config.left_name_col,
+        config.left_qty_col,
+    )
+    write_loading_column(
+        ws,
+        right_rows,
+        config.start_row,
+        end_row,
+        config.right_name_col,
+        config.right_qty_col,
+    )
+
+    # Optional header metadata
+    max_date = pd.to_datetime(group_df["_delivery_date"], errors="coerce").max()
+    ws[config.route_agent_cell].value = route_agent
+    ws[config.run_cell].value = run_name
+    ws[config.date_cell].value = max_date.to_pydatetime() if pd.notna(max_date) else ""
+    ws[config.date_cell].number_format = "yyyy-mm-dd"
+    ws[config.total_qty_cell].value = grand_total
+    ws[config.total_qty_cell].number_format = "#,##0"
+
+
+def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
+    if not os.path.exists(config.orders_file):
+        raise FileNotFoundError(f"Orders file not found: {config.orders_file}")
+
+    df = pd.read_excel(config.orders_file)
+    df = normalize_columns(df)
+    df = apply_column_aliases(df, COLUMN_ALIASES)
+
+    route_col = find_existing_column(df, config.route_agent_candidates)
+    run_col = find_existing_column(df, config.run_candidates)
+    delivery_col = find_existing_column(df, config.delivery_date_candidates)
+    brand_col = find_existing_column(df, config.brand_candidates)
+    product_col = find_existing_column(df, config.product_name_candidates)
+    qty_col = find_existing_column(df, config.qty_candidates)
+
+    if route_col is None or run_col is None or product_col is None or qty_col is None:
+        raise ValueError(
+            "Missing required columns for loading paper generation. "
+            "Need route_agent/driver, run/trip, product name, and quantity."
+        )
+
+    out = df.copy()
+    out["_route_agent"] = out[route_col].apply(lambda x: safe_str(x, "UNKNOWN-AGENT"))
+    out["_run"] = out[run_col].apply(lambda x: normalize_identifier(x, "UNKNOWN-RUN"))
+    out["_product"] = out[product_col].apply(lambda x: safe_str(x, "Unnamed Item"))
+    out["_qty"] = out[qty_col].apply(lambda x: safe_float(x, 0.0))
+    out["_brand"] = (
+        out[brand_col].apply(lambda x: safe_str(x, "OTHER"))
+        if brand_col is not None
+        else out["_product"].apply(lambda x: safe_str(x.split(" ")[0], "OTHER"))
+    )
+    if delivery_col is not None:
+        out["_delivery_date"] = pd.to_datetime(out[delivery_col], errors="coerce")
+    else:
+        out["_delivery_date"] = pd.NaT
+
+    out = out[(out["_route_agent"] != "") & (out["_run"] != "")]
+    out = out[out["_qty"] != 0]
+    return out
+
+
+def generate_loading_papers() -> None:
+    config = LoadingPaperConfig()
+    df = load_orders_dataframe(config)
+    if df.empty:
+        log_info("No rows available to generate loading papers.")
+        return
+
+    if not os.path.exists(config.template_file):
+        raise FileNotFoundError(f"Template file not found: {config.template_file}")
+
+    app = xw.App(visible=False)
+    app.display_alerts = False
+    app.screen_updating = False
+
+    template_wb = None
+    output_wb = None
+    try:
+        template_wb = app.books.open(config.template_file)
+        template_ws = get_loading_sheet(template_wb, config.loading_sheet_candidates)
+        if template_ws is None:
+            raise ValueError("Loading sheet not found in template workbook.")
+
+        output_wb = app.books.add()
+        output_wb.sheets[0].name = "TempSheet"
+        existing_sheet_names = set()
+
+        grouped = df.groupby(["_route_agent", "_run"], sort=True)
+        for (route_agent, run_name), group_df in grouped:
+            new_ws = copy_sheet(template_ws, output_wb, "TempSheet")
+            if new_ws is None:
+                log_warning(f"Could not create loading sheet for route '{route_agent}' run '{run_name}'.")
+                continue
+
+            sheet_base = f"{route_agent}_{run_name}"
+            new_ws.name = make_unique_sheet_name(sheet_base, existing_sheet_names)
+            write_loading_sheet(new_ws, route_agent, run_name, group_df, config)
+
+        if "TempSheet" in [s.name for s in output_wb.sheets]:
+            output_wb.sheets["TempSheet"].delete()
+
+        latest_date = pd.to_datetime(df["_delivery_date"], errors="coerce").max()
+        if pd.isna(latest_date):
+            latest_date = datetime.today()
+        month_folder = latest_date.strftime("%Y-%m")
+        output_dir = Path(config.output_root) / month_folder
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / latest_date.strftime("%d-%m-%Y_LOADING_PAPER.xlsx")
+
+        output_wb.save(str(output_path))
+        log_info(f"Loading paper workbook generated: {output_path}")
+    finally:
+        if output_wb is not None:
+            try:
+                output_wb.close()
+            except Exception:
+                pass
+        if template_wb is not None:
+            try:
+                template_wb.close()
+            except Exception:
+                pass
+        app.quit()
+
+
+if __name__ == "__main__":
+    generate_loading_papers()
