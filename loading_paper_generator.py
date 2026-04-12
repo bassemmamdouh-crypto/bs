@@ -1,7 +1,7 @@
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,6 +16,21 @@ import xlwings as xw
 ORDERS_FILE = r"E:\Marbah Products\Marbah Invoices script\orders_data.xlsx"
 LOADING_TEMPLATE_FILE = r"E:\Marbah Products\Marbah Invoices script\invoice_template.xlsx"
 OUTPUT_ROOT = r"E:\Marbah Products\Marbah Invoices script"
+
+
+@dataclass
+class OfferRule:
+    name: str
+    rule_type: str
+    active: bool = True
+    buy_sku: str = ""
+    buy_qty: float = 0.0
+    gift_sku: str = ""
+    gift_name: str = ""
+    gift_qty: float = 0.0
+    min_subtotal: float = 0.0
+    discount_amount: float = 0.0
+    discount_percent: float = 0.0
 
 
 @dataclass
@@ -73,6 +88,26 @@ class LoadingPaperConfig:
     bundle_offer_gift_size: str = "200 مل"
     same_sku_offer_skus: Tuple[str, ...] = ("180", "181", "182")
     offer_fallback_brand: str = "offers"
+    offer_rules: List[OfferRule] = field(
+        default_factory=lambda: [
+            OfferRule(
+                name="Buy10Get1-SKU180",
+                rule_type="buy_qty_get_free_same_sku",
+                active=False,
+                buy_sku="180",
+                buy_qty=10,
+                gift_qty=1,
+                gift_name="Offer Gift SKU 180",
+            ),
+            OfferRule(
+                name="Subtotal-5pct-over-1000",
+                rule_type="order_subtotal_discount_pct",
+                active=False,
+                min_subtotal=1000,
+                discount_percent=5,
+            ),
+        ]
+    )
 
     # Template layout
     start_row: int = 3
@@ -227,6 +262,13 @@ def aggregate_order_level_numeric(order_df: pd.DataFrame, column_name: str) -> f
 
 def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfig) -> List[Dict[str, object]]:
     offer_rows: List[Dict[str, object]] = []
+    sku_qty_map: Dict[str, float] = {}
+    for _, row in order_df.iterrows():
+        sku = normalize_sku(row.get("_sku", ""))
+        if not sku:
+            continue
+        qty = safe_float(row.get("_qty", 0), 0.0)
+        sku_qty_map[sku] = sku_qty_map.get(sku, 0.0) + qty
 
     # A) Gift quantity columns from source sheet.
     for gift_col in config.gift_qty_columns:
@@ -259,11 +301,6 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
 
     # C) Fixed bundle offer (same as invoice script logic).
     if config.bundle_offer_active and config.bundle_offer_divisor > 0:
-        sku_qty_map = (
-            order_df.groupby("_sku", dropna=False)["_qty"]
-            .sum()
-            .to_dict()
-        )
         source_skus = {
             normalize_sku(sku)
             for sku in config.bundle_offer_source_skus
@@ -274,7 +311,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
             if normalize_sku(sku) in source_skus
         )
         combo_gift_qty = 0
-        if combo_qty_total > config.bundle_offer_divisor:
+        if combo_qty_total >= config.bundle_offer_divisor:
             combo_gift_qty = math.floor(combo_qty_total / config.bundle_offer_divisor)
         if combo_gift_qty > 0:
             gift_name = safe_str(config.bundle_offer_gift_name, "Gift Item")
@@ -302,7 +339,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
     # D) BUY 1 GET 1 SAME SKU (same as invoice script logic).
     same_sku_offer = {normalize_sku(sku) for sku in config.same_sku_offer_skus if normalize_sku(sku)}
     for sku in sorted(same_sku_offer):
-        sku_rows = order_df[order_df["_sku"] == sku]
+        sku_rows = order_df[order_df["_sku"].apply(normalize_sku) == sku]
         if sku_rows.empty:
             continue
         total_qty = safe_float(sku_rows["_qty"].sum(), 0.0)
@@ -319,7 +356,89 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
             }
         )
 
-    return offer_rows
+    # E) Configured rule-engine offers (gift quantity only for loading paper).
+    for rule in config.offer_rules:
+        if not rule.active:
+            continue
+
+        if rule.rule_type == "buy_qty_get_free_same_sku":
+            buy_sku = normalize_sku(rule.buy_sku)
+            if not buy_sku or rule.buy_qty <= 0 or rule.gift_qty <= 0:
+                continue
+            bought = sku_qty_map.get(buy_sku, 0.0)
+            multiplier = math.floor(bought / rule.buy_qty)
+            if multiplier > 0:
+                gift_qty = multiplier * rule.gift_qty
+                buy_rows = order_df[order_df["_sku"].apply(normalize_sku) == buy_sku]
+                fallback_name = safe_str(rule.gift_name, "") or f"Offer Gift SKU {buy_sku}"
+                inferred_name = (
+                    safe_str(buy_rows.iloc[0].get("_product", fallback_name), fallback_name)
+                    if not buy_rows.empty
+                    else fallback_name
+                )
+                inferred_brand = (
+                    safe_str(buy_rows.iloc[0].get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand)
+                    if not buy_rows.empty
+                    else config.offer_fallback_brand
+                )
+                inferred_size = safe_str(buy_rows.iloc[0].get("_size_raw", ""), "") if not buy_rows.empty else ""
+                offer_rows.append(
+                    {
+                        "_product": inferred_name,
+                        "_qty": gift_qty,
+                        "_brand_raw": inferred_brand,
+                        "_size_raw": inferred_size,
+                        "_sku": buy_sku,
+                    }
+                )
+
+        elif rule.rule_type == "buy_sku_get_other_sku_free":
+            buy_sku = normalize_sku(rule.buy_sku)
+            gift_sku = normalize_sku(rule.gift_sku)
+            if not buy_sku or not gift_sku or rule.buy_qty <= 0 or rule.gift_qty <= 0:
+                continue
+            bought = sku_qty_map.get(buy_sku, 0.0)
+            multiplier = math.floor(bought / rule.buy_qty)
+            if multiplier > 0:
+                gift_qty = multiplier * rule.gift_qty
+                gift_rows = order_df[order_df["_sku"].apply(normalize_sku) == gift_sku]
+                fallback_name = safe_str(rule.gift_name, "") or f"Offer Gift SKU {gift_sku}"
+                inferred_name = (
+                    safe_str(gift_rows.iloc[0].get("_product", fallback_name), fallback_name)
+                    if not gift_rows.empty
+                    else fallback_name
+                )
+                inferred_brand = (
+                    safe_str(gift_rows.iloc[0].get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand)
+                    if not gift_rows.empty
+                    else config.offer_fallback_brand
+                )
+                inferred_size = safe_str(gift_rows.iloc[0].get("_size_raw", ""), "") if not gift_rows.empty else ""
+                offer_rows.append(
+                    {
+                        "_product": inferred_name,
+                        "_qty": gift_qty,
+                        "_brand_raw": inferred_brand,
+                        "_size_raw": inferred_size,
+                        "_sku": gift_sku,
+                    }
+                )
+
+    # Merge duplicate offer lines by product name (same behavior as invoices).
+    merged: Dict[str, Dict[str, object]] = {}
+    for line in offer_rows:
+        name = safe_str(line.get("_product", "Offer"), "Offer")
+        if name not in merged:
+            merged[name] = {
+                "_product": name,
+                "_qty": 0.0,
+                "_brand_raw": safe_str(line.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
+                "_size_raw": safe_str(line.get("_size_raw", ""), ""),
+                "_sku": normalize_sku(line.get("_sku", "")),
+            }
+        merged[name]["_qty"] = safe_float(merged[name]["_qty"], 0.0) + safe_float(line.get("_qty", 0), 0.0)
+
+    return sorted(list(merged.values()), key=lambda x: safe_str(x["_product"], ""))
 
 
 def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.DataFrame:
