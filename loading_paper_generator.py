@@ -38,6 +38,13 @@ class LoadingPaperConfig:
         "business_unit",
         "category",
     )
+    size_candidates: Tuple[str, ...] = (
+        "size",
+        "pack_size",
+        "sku_size",
+        "item_size",
+        "variant_size",
+    )
     product_name_candidates: Tuple[str, ...] = (
         "sku_name",
         "item_name",
@@ -63,7 +70,7 @@ class LoadingPaperConfig:
     date_cell: str = "B3"
     total_qty_cell: str = "C143"
 
-    include_brand_subtotal_row: bool = True
+    include_brand_subtotal_row: bool = False
 
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
@@ -71,6 +78,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "run": ["trip", "run_name"],
     "estimated_delivery_date": ["delivery_date"],
     "brand": ["section", "section_name", "business_unit", "category"],
+    "size": ["pack_size", "sku_size", "item_size", "variant_size"],
     "sku_name": ["item_name", "product_name", "product_name_ar", "item", "description"],
     "purchased_item_count": ["qty", "quantity", "item_qty"],
 }
@@ -231,25 +239,27 @@ def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tupl
         return rows, 0.0
 
     grouped = (
-        group_df.groupby(["_brand", "_product"], dropna=False)["_qty"]
+        group_df.groupby(["_brand", "_size", "_product"], dropna=False)["_qty"]
         .sum()
         .reset_index()
-        .sort_values(["_brand", "_product"])
+        .sort_values(["_brand", "_size", "_product"])
     )
     grand_total = float(grouped["_qty"].sum())
 
-    for brand_name, brand_df in grouped.groupby("_brand", sort=True):
+    for (brand_name, size_name), section_df in grouped.groupby(["_brand", "_size"], sort=True):
         brand_clean = safe_str(brand_name, "OTHER")
-        brand_total = float(brand_df["_qty"].sum())
-        rows.append({"kind": "brand", "name": brand_clean, "qty": brand_total})
+        size_clean = safe_str(size_name, "").strip()
+        section_label = f"{brand_clean} - {size_clean}" if size_clean else brand_clean
+        section_total = float(section_df["_qty"].sum())
+        rows.append({"kind": "brand", "name": section_label, "qty": section_total})
 
-        for _, rec in brand_df.iterrows():
+        for _, rec in section_df.iterrows():
             prod = safe_str(rec["_product"], "Unnamed Item")
             qty = safe_float(rec["_qty"], 0.0)
             rows.append({"kind": "item", "name": prod, "qty": qty})
 
         if config.include_brand_subtotal_row:
-            rows.append({"kind": "subtotal", "name": f"اجمالي {brand_clean}", "qty": brand_total})
+            rows.append({"kind": "subtotal", "name": f"اجمالي {section_label}", "qty": section_total})
 
     return rows, grand_total
 
@@ -390,6 +400,7 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
     run_col = find_existing_column(df, config.run_candidates)
     delivery_col = find_existing_column(df, config.delivery_date_candidates)
     brand_col = find_existing_column(df, config.brand_candidates)
+    size_col = find_existing_column(df, config.size_candidates)
     product_col = find_existing_column(df, config.product_name_candidates)
     qty_col = find_existing_column(df, config.qty_candidates)
 
@@ -409,6 +420,7 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
         if brand_col is not None
         else out["_product"].apply(lambda x: safe_str(x.split(" ")[0], "OTHER"))
     )
+    out["_size"] = out[size_col].apply(lambda x: safe_str(x, "")) if size_col is not None else ""
     if delivery_col is not None:
         out["_delivery_date"] = pd.to_datetime(out[delivery_col], errors="coerce")
     else:
