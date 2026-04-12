@@ -123,7 +123,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "route_agent": ["driver"],
     "run": ["trip", "run_name"],
     "estimated_delivery_date": ["delivery_date"],
-    "brand": ["brand_name", "section", "section_name", "business_unit", "category"],
+    "brand_name": ["brand"],
     "size": ["pack_size", "sku_size", "item_size", "variant_size"],
     "sku_name": ["item_name", "product_name", "product_name_ar", "item", "description"],
     "purchased_item_count": ["qty", "quantity", "item_qty"],
