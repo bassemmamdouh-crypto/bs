@@ -87,7 +87,8 @@ class LoadingPaperConfig:
     bundle_offer_gift_brand: str = "youmy juice"
     bundle_offer_gift_size: str = "200 مل"
     same_sku_offer_skus: Tuple[str, ...] = ("180", "181", "182")
-    offer_fallback_brand: str = "offers"
+    offer_fallback_brand: str = "عروض"
+    offer_group_order: int = 10000
     offer_rules: List[OfferRule] = field(
         default_factory=lambda: [
             OfferRule(
@@ -316,13 +317,11 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
         if combo_gift_qty > 0:
             gift_name = safe_str(config.bundle_offer_gift_name, "Gift Item")
             gift_sku = normalize_sku(config.bundle_offer_gift_sku)
-            gift_brand = safe_str(config.bundle_offer_gift_brand, config.offer_fallback_brand)
             gift_size = safe_str(config.bundle_offer_gift_size, "")
             if gift_sku:
                 sku_rows = order_df[order_df["_sku"] == gift_sku]
                 if not sku_rows.empty:
                     gift_name = safe_str(sku_rows.iloc[0].get("_product", gift_name), gift_name)
-                    gift_brand = safe_str(sku_rows.iloc[0].get("_brand_raw", gift_brand), gift_brand)
                     gift_size = safe_str(sku_rows.iloc[0].get("_size_raw", gift_size), gift_size)
                 else:
                     gift_name = f"SKU {gift_sku} - {gift_name}"
@@ -330,7 +329,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
                 {
                     "_product": gift_name,
                     "_qty": float(combo_gift_qty),
-                    "_brand_raw": gift_brand,
+                    "_brand_raw": config.offer_fallback_brand,
                     "_size_raw": gift_size,
                     "_sku": gift_sku,
                 }
@@ -350,7 +349,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
             {
                 "_product": safe_str(first.get("_product", f"SKU {sku}"), f"SKU {sku}"),
                 "_qty": total_qty,
-                "_brand_raw": safe_str(first.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
+                "_brand_raw": config.offer_fallback_brand,
                 "_size_raw": safe_str(first.get("_size_raw", ""), ""),
                 "_sku": sku,
             }
@@ -386,7 +385,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
                     {
                         "_product": inferred_name,
                         "_qty": gift_qty,
-                        "_brand_raw": inferred_brand,
+                        "_brand_raw": config.offer_fallback_brand,
                         "_size_raw": inferred_size,
                         "_sku": buy_sku,
                     }
@@ -418,7 +417,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
                     {
                         "_product": inferred_name,
                         "_qty": gift_qty,
-                        "_brand_raw": inferred_brand,
+                        "_brand_raw": config.offer_fallback_brand,
                         "_size_raw": inferred_size,
                         "_sku": gift_sku,
                     }
@@ -822,6 +821,8 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
         normalize_brand_for_order(key): rank
         for key, rank in (config.brand_order or {}).items()
     }
+    # Keep offers in one dedicated group sorted after all product brands.
+    brand_rank_map[normalize_brand_for_order(config.offer_fallback_brand)] = config.offer_group_order
     size_rank_map = {
         normalize_size_for_order(key): rank
         for key, rank in (config.size_order or {}).items()
