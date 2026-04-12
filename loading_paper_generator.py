@@ -56,8 +56,8 @@ class LoadingPaperConfig:
     qty_candidates: Tuple[str, ...] = ("purchased_item_count", "qty", "quantity", "item_qty")
 
     # Template layout
-    start_row: int = 4
-    end_row: int = 139
+    start_row: int = 3
+    end_row: int = 140
     summary_anchor_row: int = 141
     left_name_col: int = 1
     left_qty_col: int = 3
@@ -67,7 +67,7 @@ class LoadingPaperConfig:
     # Optional header cells in loading sheet
     route_agent_cell: str = "B2"
     run_cell: str = "E2"
-    date_cell: str = "B3"
+    date_cell: str = "A2"
     total_qty_cell: str = "C143"
 
     include_brand_subtotal_row: bool = False
@@ -326,22 +326,35 @@ def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tupl
     )
     grand_total = float(grouped["_qty"].sum())
 
-    for (brand_name, size_name), section_df in grouped.groupby(
-        ["_brand_display", "_size_display"], sort=False
+    for (brand_name, _brand_order), brand_df in grouped.groupby(
+        ["_brand_display", "_brand_order"], sort=False
     ):
         brand_clean = safe_str(brand_name, "OTHER")
-        size_clean = safe_str(size_name, "").strip()
-        section_label = f"{brand_clean} - {size_clean}" if size_clean else brand_clean
-        section_total = float(section_df["_qty"].sum())
-        rows.append({"kind": "brand", "name": section_label, "qty": section_total})
+        brand_total = float(brand_df["_qty"].sum())
+        # Brand separator row.
+        rows.append({"kind": "brand_separator", "name": brand_clean, "qty": brand_total})
 
-        for _, rec in section_df.iterrows():
-            prod = safe_str(rec["_product"], "Unnamed Item")
-            qty = safe_float(rec["_qty"], 0.0)
-            rows.append({"kind": "item", "name": prod, "qty": qty})
+        for (size_name, _size_order), section_df in brand_df.groupby(
+            ["_size_display", "_size_order"], sort=False
+        ):
+            size_clean = safe_str(size_name, "").strip()
+            section_label = f"{brand_clean} - {size_clean}" if size_clean else brand_clean
+            section_total = float(section_df["_qty"].sum())
+            rows.append({"kind": "size_separator", "name": section_label, "qty": section_total})
 
-        if config.include_brand_subtotal_row:
-            rows.append({"kind": "subtotal", "name": f"اجمالي {section_label}", "qty": section_total})
+            for _, rec in section_df.iterrows():
+                prod = safe_str(rec["_product"], "Unnamed Item")
+                qty = safe_float(rec["_qty"], 0.0)
+                rows.append({"kind": "item", "name": prod, "qty": qty})
+
+            if config.include_brand_subtotal_row:
+                rows.append({"kind": "subtotal", "name": f"اجمالي {section_label}", "qty": section_total})
+
+        # Empty row between brands.
+        rows.append({"kind": "brand_gap", "name": "", "qty": None})
+
+    if rows and safe_str(rows[-1].get("kind", ""), "") == "brand_gap":
+        rows.pop()
 
     return rows, grand_total
 
@@ -353,10 +366,16 @@ def style_loading_row(ws: xw.Sheet, row_no: int, name_col: int, qty_col: int, ro
     row_range.api.Font.Name = "Calibri"
     row_range.api.Font.Size = 10
 
-    if row_kind == "brand":
+    if row_kind == "brand_separator":
         row_range.api.Font.Bold = True
         row_range.color = (47, 117, 181)
         row_range.api.Font.Color = 0xFFFFFF
+    elif row_kind == "size_separator":
+        row_range.api.Font.Bold = True
+        row_range.color = (198, 224, 180)
+    elif row_kind == "brand_gap":
+        row_range.api.Font.Bold = False
+        row_range.color = None
     elif row_kind == "subtotal":
         row_range.api.Font.Bold = True
         row_range.color = (217, 217, 217)
@@ -400,9 +419,13 @@ def write_loading_column(
         row_no = start_row + idx
         if row_no > end_row:
             break
+        row_kind = safe_str(row.get("kind", "item"), "item")
         ws.range((row_no, name_col)).value = row["name"]
-        ws.range((row_no, qty_col)).value = safe_float(row["qty"], 0.0)
-        style_loading_row(ws, row_no, name_col, qty_col, safe_str(row.get("kind", "item"), "item"))
+        if row_kind == "brand_gap":
+            ws.range((row_no, qty_col)).value = ""
+        else:
+            ws.range((row_no, qty_col)).value = safe_float(row["qty"], 0.0)
+        style_loading_row(ws, row_no, name_col, qty_col, row_kind)
 
 
 def split_rows_two_columns(rows: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
