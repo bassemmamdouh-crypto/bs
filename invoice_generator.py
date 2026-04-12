@@ -984,6 +984,8 @@ def add_workbook_summary_sheet(
     invoice_count: int,
     total_qty: float,
     total_prices: float,
+    max_estimated_delivery_date: object,
+    offer_breakdown: Dict[str, float],
 ) -> None:
     existing_names = {sheet.name for sheet in workbook.sheets}
     base_name = "SUMMARY"
@@ -1002,6 +1004,22 @@ def add_workbook_summary_sheet(
     summary_ws["B3"].value = float(total_qty)
     summary_ws["A4"].value = "total prices of the invoices in the sheet"
     summary_ws["B4"].value = float(total_prices)
+    summary_ws["A5"].value = "max estimated delivery date"
+    summary_ws["B5"].value = safe_date_str(max_estimated_delivery_date, "")
+    summary_ws["A6"].value = "total amount of gifts in the invoices (offers)"
+    summary_ws["B6"].value = float(sum(safe_float(v, 0.0) for v in offer_breakdown.values()))
+
+    summary_ws["A8"].value = "offer name"
+    summary_ws["B8"].value = "total gift qty"
+    offer_row = 9
+    if offer_breakdown:
+        for offer_name in sorted(offer_breakdown.keys(), key=lambda x: safe_str(x, "")):
+            summary_ws.range((offer_row, 1)).value = offer_name
+            summary_ws.range((offer_row, 2)).value = safe_float(offer_breakdown.get(offer_name, 0.0), 0.0)
+            offer_row += 1
+    else:
+        summary_ws["A9"].value = "No offer gifts"
+        summary_ws["B9"].value = 0.0
 
 
 def render_invoice_sheet(
@@ -1010,7 +1028,7 @@ def render_invoice_sheet(
     header_order_id: str,
     config: ScriptConfig,
     bundle_offer_df: Optional[pd.DataFrame] = None,
-) -> Dict[str, float]:
+) -> Dict[str, object]:
     write_header(ws, source_df, header_order_id, config)
     base_lines = build_base_items(source_df, config)
     subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in base_lines)
@@ -1025,10 +1043,19 @@ def render_invoice_sheet(
     row_shift = adjust_line_capacity(ws, len(final_lines), config)
     fill_invoice_lines(ws, final_lines, config, row_shift)
     write_totals(ws, final_lines, discount_total, config, row_shift)
+    offer_breakdown: Dict[str, float] = {}
+    for offer_line in offer_result["offer_lines"]:
+        offer_name = safe_str(offer_line.get("item_name", "Offer"), "Offer")
+        gift_qty = safe_float(offer_line.get("gift_qty", 0.0), 0.0)
+        if gift_qty <= 0:
+            continue
+        offer_breakdown[offer_name] = offer_breakdown.get(offer_name, 0.0) + gift_qty
+
     return {
         "invoice_count": 1.0,
         "total_qty": totals["total_qty"],
         "total_prices": totals["subtotal"],
+        "offer_breakdown": offer_breakdown,
     }
 
 
@@ -1065,6 +1092,7 @@ def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, co
     summary_invoice_count = 0
     summary_total_qty = 0.0
     summary_total_prices = 0.0
+    summary_offer_breakdown: Dict[str, float] = {}
 
     for section_name in target_sections:
         section_df = area_df[area_df["_section_group"] == section_name].copy()
@@ -1091,10 +1119,22 @@ def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, co
             summary_invoice_count += int(metrics["invoice_count"])
             summary_total_qty += metrics["total_qty"]
             summary_total_prices += metrics["total_prices"]
+            for offer_name, gift_qty in metrics["offer_breakdown"].items():
+                summary_offer_breakdown[offer_name] = (
+                    summary_offer_breakdown.get(offer_name, 0.0) + safe_float(gift_qty, 0.0)
+                )
 
     if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
         output_wb.sheets["TempSheet"].delete()
-    add_workbook_summary_sheet(output_wb, summary_invoice_count, summary_total_qty, summary_total_prices)
+    max_delivery_date = pd.to_datetime(area_df[config.delivery_date_column], errors="coerce").max()
+    add_workbook_summary_sheet(
+        output_wb,
+        summary_invoice_count,
+        summary_total_qty,
+        summary_total_prices,
+        max_delivery_date,
+        summary_offer_breakdown,
+    )
 
     area_ctx = area_output_context(area_df, area_value, config)
     latest_delivery_date = area_ctx["latest_delivery_date"]
@@ -1157,6 +1197,7 @@ def process_area_order_workbooks(
             created_count = 0
             section_total_qty = 0.0
             section_total_prices = 0.0
+            section_offer_breakdown: Dict[str, float] = {}
 
             try:
                 raw_order_ids = section_df["_order_key"].dropna().unique().tolist()
@@ -1189,6 +1230,10 @@ def process_area_order_workbooks(
                     created_count += 1
                     section_total_qty += metrics["total_qty"]
                     section_total_prices += metrics["total_prices"]
+                    for offer_name, gift_qty in metrics["offer_breakdown"].items():
+                        section_offer_breakdown[offer_name] = (
+                            section_offer_breakdown.get(offer_name, 0.0) + safe_float(gift_qty, 0.0)
+                        )
 
                 if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
                     output_wb.sheets["TempSheet"].delete()
@@ -1197,7 +1242,15 @@ def process_area_order_workbooks(
                     output_wb.close()
                     continue
 
-                add_workbook_summary_sheet(output_wb, created_count, section_total_qty, section_total_prices)
+                max_delivery_date = pd.to_datetime(section_df[config.delivery_date_column], errors="coerce").max()
+                add_workbook_summary_sheet(
+                    output_wb,
+                    created_count,
+                    section_total_qty,
+                    section_total_prices,
+                    max_delivery_date,
+                    section_offer_breakdown,
+                )
                 day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}_{section_name}_ORDERS")
                 output_path = output_dir / f"{day_file}.xlsx"
                 output_wb.save(str(output_path))
