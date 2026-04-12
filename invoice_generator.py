@@ -914,6 +914,19 @@ def fill_invoice_lines(ws: xw.Sheet, lines: List[Dict[str, object]], config: Scr
         ws.range((row_no, 6)).value = safe_float(line.get("net_amount", 0), 0.0)
 
 
+def compute_invoice_totals(lines: List[Dict[str, object]], discount_amount: float) -> Dict[str, float]:
+    total_qty = sum(safe_float(line.get("qty", 0), 0.0) + safe_float(line.get("gift_qty", 0), 0.0) for line in lines)
+    subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in lines)
+    discount = max(0.0, safe_float(discount_amount, 0.0))
+    net_total = subtotal - discount
+    return {
+        "total_qty": total_qty,
+        "subtotal": subtotal,
+        "discount": discount,
+        "net_total": net_total,
+    }
+
+
 def write_totals(
     ws: xw.Sheet,
     lines: List[Dict[str, object]],
@@ -927,10 +940,11 @@ def write_totals(
     adjustment_row = config.adjustment_row + row_shift
     net_total_row = config.net_total_row + row_shift
 
-    total_qty = sum(safe_float(line.get("qty", 0), 0.0) + safe_float(line.get("gift_qty", 0), 0.0) for line in lines)
-    subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in lines)
-    discount = max(0.0, safe_float(discount_amount, 0.0))
-    net_total = subtotal - discount
+    totals = compute_invoice_totals(lines, discount_amount)
+    total_qty = totals["total_qty"]
+    subtotal = totals["subtotal"]
+    discount = totals["discount"]
+    net_total = totals["net_total"]
 
     ws.range((totals_row, 3)).value = total_qty
     ws.range((totals_row, 6)).value = subtotal
@@ -965,13 +979,38 @@ def area_output_context(area_df: pd.DataFrame, area_value: str, config: ScriptCo
     }
 
 
+def add_workbook_summary_sheet(
+    workbook: xw.Book,
+    invoice_count: int,
+    total_qty: float,
+    total_prices: float,
+) -> None:
+    existing_names = {sheet.name for sheet in workbook.sheets}
+    base_name = "SUMMARY"
+    sheet_name = base_name
+    suffix = 1
+    while sheet_name in existing_names:
+        sheet_name = f"{base_name}_{suffix}"[:31]
+        suffix += 1
+
+    summary_ws = workbook.sheets.add(name=sheet_name, after=workbook.sheets[-1])
+    summary_ws["A1"].value = "Metric"
+    summary_ws["B1"].value = "Value"
+    summary_ws["A2"].value = "# of invoices in the sheet"
+    summary_ws["B2"].value = int(invoice_count)
+    summary_ws["A3"].value = "# of total quantities in all invoices"
+    summary_ws["B3"].value = float(total_qty)
+    summary_ws["A4"].value = "total prices of the invoices in the sheet"
+    summary_ws["B4"].value = float(total_prices)
+
+
 def render_invoice_sheet(
     ws: xw.Sheet,
     source_df: pd.DataFrame,
     header_order_id: str,
     config: ScriptConfig,
     bundle_offer_df: Optional[pd.DataFrame] = None,
-) -> None:
+) -> Dict[str, float]:
     write_header(ws, source_df, header_order_id, config)
     base_lines = build_base_items(source_df, config)
     subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in base_lines)
@@ -981,9 +1020,16 @@ def render_invoice_sheet(
     if config.include_offer_lines:
         final_lines.extend(offer_result["offer_lines"])
 
+    discount_total = safe_float(offer_result["discount_total"], 0.0)
+    totals = compute_invoice_totals(final_lines, discount_total)
     row_shift = adjust_line_capacity(ws, len(final_lines), config)
     fill_invoice_lines(ws, final_lines, config, row_shift)
-    write_totals(ws, final_lines, safe_float(offer_result["discount_total"], 0.0), config, row_shift)
+    write_totals(ws, final_lines, discount_total, config, row_shift)
+    return {
+        "invoice_count": 1.0,
+        "total_qty": totals["total_qty"],
+        "total_prices": totals["subtotal"],
+    }
 
 
 def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, config: ScriptConfig) -> Optional[str]:
@@ -1016,6 +1062,9 @@ def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, co
 
     area_df = prepare_area_sections(area_df, config)
     target_sections = get_target_sections(config)
+    summary_invoice_count = 0
+    summary_total_qty = 0.0
+    summary_total_prices = 0.0
 
     for section_name in target_sections:
         section_df = area_df[area_df["_section_group"] == section_name].copy()
@@ -1038,10 +1087,14 @@ def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, co
             write_totals(new_ws, [], 0.0, config, row_shift)
             log_info(f"No rows found for section '{section_name}' in area '{area_value}'. Added empty sheet.")
         else:
-            render_invoice_sheet(new_ws, section_df, f"{section_name} SUMMARY", config)
+            metrics = render_invoice_sheet(new_ws, section_df, f"{section_name} SUMMARY", config)
+            summary_invoice_count += int(metrics["invoice_count"])
+            summary_total_qty += metrics["total_qty"]
+            summary_total_prices += metrics["total_prices"]
 
     if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
         output_wb.sheets["TempSheet"].delete()
+    add_workbook_summary_sheet(output_wb, summary_invoice_count, summary_total_qty, summary_total_prices)
 
     area_ctx = area_output_context(area_df, area_value, config)
     latest_delivery_date = area_ctx["latest_delivery_date"]
@@ -1102,6 +1155,8 @@ def process_area_order_workbooks(
             output_wb.sheets[0].name = "TempSheet"
             existing_sheet_names = set()
             created_count = 0
+            section_total_qty = 0.0
+            section_total_prices = 0.0
 
             try:
                 raw_order_ids = section_df["_order_key"].dropna().unique().tolist()
@@ -1130,8 +1185,10 @@ def process_area_order_workbooks(
                         continue
 
                     new_ws.name = make_unique_sheet_name(order_str, existing_sheet_names)
-                    render_invoice_sheet(new_ws, order_df, order_str, config, bundle_offer_df=full_order_df)
+                    metrics = render_invoice_sheet(new_ws, order_df, order_str, config, bundle_offer_df=full_order_df)
                     created_count += 1
+                    section_total_qty += metrics["total_qty"]
+                    section_total_prices += metrics["total_prices"]
 
                 if "TempSheet" in [sheet.name for sheet in output_wb.sheets]:
                     output_wb.sheets["TempSheet"].delete()
@@ -1140,6 +1197,7 @@ def process_area_order_workbooks(
                     output_wb.close()
                     continue
 
+                add_workbook_summary_sheet(output_wb, created_count, section_total_qty, section_total_prices)
                 day_file = latest_delivery_date.strftime(f"%d-%m-%Y_{safe_area}_{section_name}_ORDERS")
                 output_path = output_dir / f"{day_file}.xlsx"
                 output_wb.save(str(output_path))
