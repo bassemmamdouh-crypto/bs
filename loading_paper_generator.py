@@ -30,14 +30,7 @@ class LoadingPaperConfig:
     route_agent_candidates: Tuple[str, ...] = ("route_agent", "driver")
     run_candidates: Tuple[str, ...] = ("run", "trip", "run_name")
     delivery_date_candidates: Tuple[str, ...] = ("estimated_delivery_date", "delivery_date")
-    brand_candidates: Tuple[str, ...] = (
-        "brand_name",
-        "brand",
-        "section",
-        "section_name",
-        "business_unit",
-        "category",
-    )
+    brand_candidates: Tuple[str, ...] = ("brand_name",)
     size_candidates: Tuple[str, ...] = (
         "size",
         "pack_size",
