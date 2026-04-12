@@ -1021,6 +1021,50 @@ def add_workbook_summary_sheet(
         summary_ws["A9"].value = "No offer gifts"
         summary_ws["B9"].value = 0.0
 
+    # Visual formatting to make the sheet readable as a table.
+    summary_ws.range("A:B").autofit()
+    if safe_float(summary_ws.range("A:A").column_width, 0.0) < 34:
+        summary_ws.range("A:A").column_width = 34
+    if safe_float(summary_ws.range("B:B").column_width, 0.0) < 18:
+        summary_ws.range("B:B").column_width = 18
+
+    # Global font defaults for summary table.
+    summary_ws.range("A:B").api.Font.Name = "Calibri"
+    summary_ws.range("A:B").api.Font.Size = 11
+
+    # Main header style.
+    summary_ws.range("A1:B1").color = (47, 84, 150)
+    summary_ws.range("A1:B1").api.Font.Color = 16777215
+    summary_ws.range("A1:B1").api.Font.Bold = True
+    summary_ws.range("A1:B1").api.HorizontalAlignment = -4108  # Center
+
+    # Metric labels and values styles.
+    summary_ws.range("A2:A6").api.Font.Bold = True
+    summary_ws.range("A2:A6").api.HorizontalAlignment = -4152  # Right
+    summary_ws.range("B2:B6").api.HorizontalAlignment = -4108  # Center
+    summary_ws["B2"].number_format = "0"
+    summary_ws["B3"].number_format = "#,##0.00"
+    summary_ws["B4"].number_format = "#,##0.00"
+    summary_ws["B5"].number_format = "yyyy-mm-dd"
+    summary_ws["B6"].number_format = "#,##0.00"
+
+    # Offers table header style.
+    summary_ws.range("A8:B8").color = (217, 217, 217)
+    summary_ws.range("A8:B8").api.Font.Bold = True
+    summary_ws.range("A8:B8").api.HorizontalAlignment = -4108  # Center
+
+    # Offer rows formatting.
+    last_offer_row = max(9, offer_row - 1)
+    summary_ws.range((9, 1), (last_offer_row, 1)).api.HorizontalAlignment = -4152  # Right
+    summary_ws.range((9, 2), (last_offer_row, 2)).api.HorizontalAlignment = -4108  # Center
+    summary_ws.range((9, 2), (last_offer_row, 2)).number_format = "#,##0.00"
+
+    # Apply borders to both tables.
+    summary_ws.range("A1:B6").api.Borders.LineStyle = 1
+    summary_ws.range("A1:B6").api.Borders.Weight = 2
+    summary_ws.range((8, 1), (last_offer_row, 2)).api.Borders.LineStyle = 1
+    summary_ws.range((8, 1), (last_offer_row, 2)).api.Borders.Weight = 2
+
 
 def render_invoice_sheet(
     ws: xw.Sheet,
