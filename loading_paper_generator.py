@@ -31,8 +31,8 @@ class LoadingPaperConfig:
     run_candidates: Tuple[str, ...] = ("run", "trip", "run_name")
     delivery_date_candidates: Tuple[str, ...] = ("estimated_delivery_date", "delivery_date")
     brand_candidates: Tuple[str, ...] = (
-        "brand",
         "brand_name",
+        "brand",
         "section",
         "section_name",
         "business_unit",
@@ -123,7 +123,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "route_agent": ["driver"],
     "run": ["trip", "run_name"],
     "estimated_delivery_date": ["delivery_date"],
-    "brand": ["section", "section_name", "business_unit", "category"],
+    "brand": ["brand_name", "section", "section_name", "business_unit", "category"],
     "size": ["pack_size", "sku_size", "item_size", "variant_size"],
     "sku_name": ["item_name", "product_name", "product_name_ar", "item", "description"],
     "purchased_item_count": ["qty", "quantity", "item_qty"],
@@ -310,10 +310,10 @@ def adjust_loading_capacity(ws: xw.Sheet, required_rows: int, config: LoadingPap
     return 0
 
 
-def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tuple[List[Dict[str, object]], float]:
-    rows: List[Dict[str, object]] = []
+def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tuple[List[List[Dict[str, object]]], float]:
+    brand_blocks: List[List[Dict[str, object]]] = []
     if group_df.empty:
-        return rows, 0.0
+        return brand_blocks, 0.0
 
     grouped = (
         group_df.groupby(
@@ -329,10 +329,11 @@ def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tupl
     for (brand_name, _brand_order), brand_df in grouped.groupby(
         ["_brand_display", "_brand_order"], sort=False
     ):
+        brand_rows: List[Dict[str, object]] = []
         brand_clean = safe_str(brand_name, "OTHER")
         brand_total = float(brand_df["_qty"].sum())
         # Brand separator row.
-        rows.append({"kind": "brand_separator", "name": brand_clean, "qty": brand_total})
+        brand_rows.append({"kind": "brand_separator", "name": brand_clean, "qty": brand_total})
 
         for (size_name, _size_order), section_df in brand_df.groupby(
             ["_size_display", "_size_order"], sort=False
@@ -340,23 +341,19 @@ def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tupl
             size_clean = safe_str(size_name, "").strip()
             section_label = f"{brand_clean} - {size_clean}" if size_clean else brand_clean
             section_total = float(section_df["_qty"].sum())
-            rows.append({"kind": "size_separator", "name": section_label, "qty": section_total})
+            brand_rows.append({"kind": "size_separator", "name": section_label, "qty": section_total})
 
             for _, rec in section_df.iterrows():
                 prod = safe_str(rec["_product"], "Unnamed Item")
                 qty = safe_float(rec["_qty"], 0.0)
-                rows.append({"kind": "item", "name": prod, "qty": qty})
+                brand_rows.append({"kind": "item", "name": prod, "qty": qty})
 
             if config.include_brand_subtotal_row:
-                rows.append({"kind": "subtotal", "name": f"اجمالي {section_label}", "qty": section_total})
+                brand_rows.append({"kind": "subtotal", "name": f"اجمالي {section_label}", "qty": section_total})
 
-        # Empty row between brands.
-        rows.append({"kind": "brand_gap", "name": "", "qty": None})
+        brand_blocks.append(brand_rows)
 
-    if rows and safe_str(rows[-1].get("kind", ""), "") == "brand_gap":
-        rows.pop()
-
-    return rows, grand_total
+    return brand_blocks, grand_total
 
 
 def style_loading_row(ws: xw.Sheet, row_no: int, name_col: int, qty_col: int, row_kind: str) -> None:
@@ -428,9 +425,35 @@ def write_loading_column(
         style_loading_row(ws, row_no, name_col, qty_col, row_kind)
 
 
-def split_rows_two_columns(rows: List[Dict[str, object]]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    left_count = math.ceil(len(rows) / 2)
-    return rows[:left_count], rows[left_count:]
+def split_brand_blocks_two_columns(
+    brand_blocks: List[List[Dict[str, object]]],
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """
+    Split rows into left/right columns without breaking a brand block.
+    A brand block (brand separator + all its size sections/items) stays in one column.
+    """
+    left_rows: List[Dict[str, object]] = []
+    right_rows: List[Dict[str, object]] = []
+    left_len = 0
+    right_len = 0
+
+    for block in brand_blocks:
+        # Add one visual gap row before each block except first block per column.
+        left_cost = len(block) + (1 if left_len > 0 else 0)
+        right_cost = len(block) + (1 if right_len > 0 else 0)
+
+        if left_len <= right_len:
+            if left_len > 0:
+                left_rows.append({"kind": "brand_gap", "name": "", "qty": None})
+            left_rows.extend(block)
+            left_len += left_cost
+        else:
+            if right_len > 0:
+                right_rows.append({"kind": "brand_gap", "name": "", "qty": None})
+            right_rows.extend(block)
+            right_len += right_cost
+
+    return left_rows, right_rows
 
 
 def shift_cell_ref_if_below_anchor(cell_ref: str, row_shift: int, anchor_row: int) -> str:
@@ -455,8 +478,8 @@ def write_loading_sheet(
     group_df: pd.DataFrame,
     config: LoadingPaperConfig,
 ) -> None:
-    rows, grand_total = build_brand_rows(group_df, config)
-    left_rows, right_rows = split_rows_two_columns(rows)
+    brand_blocks, grand_total = build_brand_rows(group_df, config)
+    left_rows, right_rows = split_brand_blocks_two_columns(brand_blocks)
     required_rows = max(len(left_rows), len(right_rows))
 
     row_shift = adjust_loading_capacity(ws, required_rows, config)
