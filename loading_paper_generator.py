@@ -168,30 +168,8 @@ def normalize_identifier(value: object, default: str = "") -> str:
 
 
 def normalize_brand_for_order(brand_value: object) -> str:
-    brand_raw = safe_str(brand_value, "").lower().strip()
-    if "lays max" in brand_raw:
-        return "lays max"
-    if "lays" in brand_raw or "chipsy" in brand_raw:
-        return "lays"
-    if "crunchy" in brand_raw:
-        return "crunchy"
-    if "cheetos" in brand_raw:
-        return "cheetos"
-    if "doritos" in brand_raw:
-        return "doritos"
-    if "alyoum" in brand_raw or "اليوم" in brand_raw:
-        return "alyoum"
-    if "pasta" in brand_raw:
-        return "pasta"
-    if "nodules" in brand_raw or "noodles" in brand_raw:
-        return "nodules"
-    if "pepsi" in brand_raw:
-        return "pepsi"
-    if "youmy" in brand_raw or "يومي" in brand_raw:
-        return "youmy juice"
-    if "aquafina" in brand_raw:
-        return "aquafina"
-    return brand_raw
+    # Grouping should follow brand_name values directly.
+    return safe_str(brand_value, "").lower().strip()
 
 
 def normalize_size_for_order(size_value: object) -> str:
