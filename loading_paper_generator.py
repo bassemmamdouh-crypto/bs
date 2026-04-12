@@ -429,29 +429,26 @@ def split_brand_blocks_two_columns(
     brand_blocks: List[List[Dict[str, object]]],
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """
-    Split rows into left/right columns without breaking a brand block.
-    A brand block (brand separator + all its size sections/items) stays in one column.
+    Split brand groups into left/right columns without breaking a brand block.
+    Each brand block (brand separator + all size sections/items) stays intact
+    in one column, and groups are split by count.
     """
     left_rows: List[Dict[str, object]] = []
     right_rows: List[Dict[str, object]] = []
-    left_len = 0
-    right_len = 0
 
-    for block in brand_blocks:
-        # Add one visual gap row before each block except first block per column.
-        left_cost = len(block) + (1 if left_len > 0 else 0)
-        right_cost = len(block) + (1 if right_len > 0 else 0)
+    split_idx = math.ceil(len(brand_blocks) / 2)
+    left_blocks = brand_blocks[:split_idx]
+    right_blocks = brand_blocks[split_idx:]
 
-        if left_len <= right_len:
-            if left_len > 0:
-                left_rows.append({"kind": "brand_gap", "name": "", "qty": None})
-            left_rows.extend(block)
-            left_len += left_cost
-        else:
-            if right_len > 0:
-                right_rows.append({"kind": "brand_gap", "name": "", "qty": None})
-            right_rows.extend(block)
-            right_len += right_cost
+    for idx, block in enumerate(left_blocks):
+        if idx > 0:
+            left_rows.append({"kind": "brand_gap", "name": "", "qty": None})
+        left_rows.extend(block)
+
+    for idx, block in enumerate(right_blocks):
+        if idx > 0:
+            right_rows.append({"kind": "brand_gap", "name": "", "qty": None})
+        right_rows.extend(block)
 
     return left_rows, right_rows
 
