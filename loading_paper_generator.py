@@ -52,9 +52,9 @@ class LoadingPaperConfig:
     start_row: int = 4
     end_row: int = 139
     summary_anchor_row: int = 141
-    left_name_col: int = 2
+    left_name_col: int = 1
     left_qty_col: int = 3
-    right_name_col: int = 5
+    right_name_col: int = 4
     right_qty_col: int = 6
 
     # Optional header cells in loading sheet
@@ -187,10 +187,19 @@ def make_unique_sheet_name(base_name: str, existing_names: set) -> str:
 
 
 def adjust_loading_capacity(ws: xw.Sheet, required_rows: int, config: LoadingPaperConfig) -> int:
+    """
+    Resize loading lines area to required row count.
+    - Insert rows before summary anchor if required rows exceed template capacity.
+    - Delete unused rows before summary anchor if required rows are fewer.
+
+    Returns signed row shift applied to rows below anchor.
+    """
     base_capacity = config.end_row - config.start_row + 1
-    requested_shift = max(0, required_rows) - base_capacity
-    inserted = 0
+    target = max(0, required_rows)
+    requested_shift = target - base_capacity
+
     if requested_shift > 0:
+        inserted = 0
         for _ in range(requested_shift):
             try:
                 ws.api.Rows(config.summary_anchor_row).Insert()
@@ -198,7 +207,22 @@ def adjust_loading_capacity(ws: xw.Sheet, required_rows: int, config: LoadingPap
             except Exception as exc:
                 log_warning(f"Unable to insert extra loading rows before summary: {exc}")
                 break
-    return inserted
+        return inserted
+
+    if requested_shift < 0:
+        delete_count = abs(requested_shift)
+        delete_start_row = config.start_row + target
+        deleted = 0
+        for _ in range(delete_count):
+            try:
+                ws.api.Rows(delete_start_row).Delete()
+                deleted += 1
+            except Exception as exc:
+                log_warning(f"Unable to delete unused loading row before summary: {exc}")
+                break
+        return -deleted
+
+    return 0
 
 
 def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tuple[List[Dict[str, object]], float]:
@@ -260,6 +284,17 @@ def clear_loading_column_block(ws: xw.Sheet, start_row: int, end_row: int, name_
     ws.range((start_row, name_col), (end_row, qty_col)).api.Font.Color = 0
 
 
+def clear_loading_data_area(ws: xw.Sheet, start_row: int, end_row: int) -> None:
+    """
+    Remove all existing data in template lines area (A:F).
+    Keeps workbook structure and formulas outside the lines area.
+    """
+    ws.range((start_row, 1), (end_row, 6)).value = None
+    ws.range((start_row, 1), (end_row, 6)).color = None
+    ws.range((start_row, 1), (end_row, 6)).api.Font.Bold = False
+    ws.range((start_row, 1), (end_row, 6)).api.Font.Color = 0
+
+
 def write_loading_column(
     ws: xw.Sheet,
     rows: List[Dict[str, object]],
@@ -283,6 +318,21 @@ def split_rows_two_columns(rows: List[Dict[str, object]]) -> Tuple[List[Dict[str
     return rows[:left_count], rows[left_count:]
 
 
+def shift_cell_ref_if_below_anchor(cell_ref: str, row_shift: int, anchor_row: int) -> str:
+    """
+    Shift a cell reference row by row_shift if its row is >= anchor_row.
+    Example: C143 with row_shift=-10, anchor 141 => C133
+    """
+    match = re.fullmatch(r"([A-Za-z]+)(\d+)", safe_str(cell_ref, ""))
+    if not match:
+        return cell_ref
+    col_letters = match.group(1)
+    row_no = int(match.group(2))
+    if row_no >= anchor_row:
+        row_no = max(1, row_no + row_shift)
+    return f"{col_letters}{row_no}"
+
+
 def write_loading_sheet(
     ws: xw.Sheet,
     route_agent: str,
@@ -294,8 +344,11 @@ def write_loading_sheet(
     left_rows, right_rows = split_rows_two_columns(rows)
     required_rows = max(len(left_rows), len(right_rows))
 
-    inserted = adjust_loading_capacity(ws, required_rows, config)
-    end_row = config.end_row + inserted
+    row_shift = adjust_loading_capacity(ws, required_rows, config)
+    end_row = config.end_row + row_shift
+
+    # Remove all existing template data in A:F lines area before writing new rows.
+    clear_loading_data_area(ws, config.start_row, end_row)
 
     write_loading_column(
         ws,
@@ -320,8 +373,9 @@ def write_loading_sheet(
     ws[config.run_cell].value = run_name
     ws[config.date_cell].value = max_date.to_pydatetime() if pd.notna(max_date) else ""
     ws[config.date_cell].number_format = "yyyy-mm-dd"
-    ws[config.total_qty_cell].value = grand_total
-    ws[config.total_qty_cell].number_format = "#,##0"
+    total_qty_cell = shift_cell_ref_if_below_anchor(config.total_qty_cell, row_shift, config.summary_anchor_row)
+    ws[total_qty_cell].value = grand_total
+    ws[total_qty_cell].number_format = "#,##0"
 
 
 def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
