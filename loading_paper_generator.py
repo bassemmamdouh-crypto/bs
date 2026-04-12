@@ -168,12 +168,16 @@ def normalize_identifier(value: object, default: str = "") -> str:
 
 
 def normalize_brand_for_order(brand_value: object) -> str:
-    # Grouping should follow brand_name values directly.
-    return safe_str(brand_value, "").lower().strip()
+    # Keep brand_name-driven grouping, but normalize formatting for reliable ordering.
+    text = safe_str(brand_value, "").lower().strip()
+    text = text.replace("’", "'")
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace("'", "")
+    return text
 
 
 def normalize_size_for_order(size_value: object) -> str:
-    return safe_str(size_value, "").replace("  ", " ").strip()
+    return re.sub(r"\s+", " ", safe_str(size_value, "")).strip()
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -506,6 +510,15 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
             "Need route_agent/driver, run/trip, product name, and quantity."
         )
 
+    brand_rank_map = {
+        normalize_brand_for_order(key): rank
+        for key, rank in (config.brand_order or {}).items()
+    }
+    size_rank_map = {
+        normalize_size_for_order(key): rank
+        for key, rank in (config.size_order or {}).items()
+    }
+
     out = df.copy()
     out["_route_agent"] = out[route_col].apply(lambda x: safe_str(x, "UNKNOWN-AGENT"))
     out["_run"] = out[run_col].apply(lambda x: normalize_identifier(x, "UNKNOWN-RUN"))
@@ -521,8 +534,8 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
     out["_size_key"] = out["_size_raw"].apply(normalize_size_for_order)
     out["_brand_display"] = out["_brand_raw"].apply(lambda x: safe_str(x, "OTHER"))
     out["_size_display"] = out["_size_raw"].apply(lambda x: safe_str(x, "").replace("  ", " ").strip())
-    out["_brand_order"] = out["_brand_key"].apply(lambda x: config.brand_order.get(safe_str(x, ""), 999))
-    out["_size_order"] = out["_size_key"].apply(lambda x: config.size_order.get(safe_str(x, ""), 999))
+    out["_brand_order"] = out["_brand_key"].apply(lambda x: brand_rank_map.get(safe_str(x, ""), 999))
+    out["_size_order"] = out["_size_key"].apply(lambda x: size_rank_map.get(safe_str(x, ""), 999))
     if delivery_col is not None:
         out["_delivery_date"] = pd.to_datetime(out[delivery_col], errors="coerce")
     else:
