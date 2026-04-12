@@ -72,6 +72,52 @@ class LoadingPaperConfig:
 
     include_brand_subtotal_row: bool = False
 
+    brand_order: Dict[str, int] = None
+    size_order: Dict[str, int] = None
+
+    def __post_init__(self) -> None:
+        if self.brand_order is None:
+            self.brand_order = {
+                "lays": 1,
+                "lays max": 2,
+                "crunchy": 3,
+                "cheetos": 4,
+                "doritos": 5,
+                "alyoum": 6,
+                "pasta": 7,
+                "nodules": 8,
+                "pepsi": 9,
+                "youmy juice": 10,
+                "aquafina": 11,
+            }
+        if self.size_order is None:
+            self.size_order = {
+                "صغير": 1,
+                "وسط": 2,
+                "كبير": 3,
+                "ميكا": 4,
+                "70 غم": 5,
+                "50غم": 6,
+                "54 غم": 7,
+                "45 غم": 8,
+                "400 غم": 9,
+                "200 غم": 10,
+                "1.6 كغم": 11,
+                "185 مل": 12,
+                "750 مل": 13,
+                "330 مل": 14,
+                "1.25 لتر": 15,
+                "1.75 لتر": 16,
+                "250 مل": 17,
+                "300 مل": 18,
+                "250مل": 19,
+                "200 مل": 20,
+                "1 لتر": 21,
+                "180 مل": 22,
+                "1.5 لتر": 23,
+                "500 مل": 24,
+            }
+
 
 COLUMN_ALIASES: Dict[str, List[str]] = {
     "route_agent": ["driver"],
@@ -126,6 +172,37 @@ def normalize_identifier(value: object, default: str = "") -> str:
     if re.fullmatch(r"[+-]?\d+\.0+", text):
         return text.split(".", 1)[0]
     return text
+
+
+def normalize_brand_for_order(brand_value: object) -> str:
+    brand_raw = safe_str(brand_value, "").lower().strip()
+    if "lays max" in brand_raw:
+        return "lays max"
+    if "lays" in brand_raw or "chipsy" in brand_raw:
+        return "lays"
+    if "crunchy" in brand_raw:
+        return "crunchy"
+    if "cheetos" in brand_raw:
+        return "cheetos"
+    if "doritos" in brand_raw:
+        return "doritos"
+    if "alyoum" in brand_raw or "اليوم" in brand_raw:
+        return "alyoum"
+    if "pasta" in brand_raw:
+        return "pasta"
+    if "nodules" in brand_raw or "noodles" in brand_raw:
+        return "nodules"
+    if "pepsi" in brand_raw:
+        return "pepsi"
+    if "youmy" in brand_raw or "يومي" in brand_raw:
+        return "youmy juice"
+    if "aquafina" in brand_raw:
+        return "aquafina"
+    return brand_raw
+
+
+def normalize_size_for_order(size_value: object) -> str:
+    return safe_str(size_value, "").replace("  ", " ").strip()
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -239,14 +316,19 @@ def build_brand_rows(group_df: pd.DataFrame, config: LoadingPaperConfig) -> Tupl
         return rows, 0.0
 
     grouped = (
-        group_df.groupby(["_brand", "_size", "_product"], dropna=False)["_qty"]
+        group_df.groupby(
+            ["_brand_display", "_size_display", "_brand_order", "_size_order", "_product"],
+            dropna=False,
+        )["_qty"]
         .sum()
         .reset_index()
-        .sort_values(["_brand", "_size", "_product"])
+        .sort_values(["_brand_order", "_size_order", "_product"], kind="stable")
     )
     grand_total = float(grouped["_qty"].sum())
 
-    for (brand_name, size_name), section_df in grouped.groupby(["_brand", "_size"], sort=True):
+    for (brand_name, size_name), section_df in grouped.groupby(
+        ["_brand_display", "_size_display"], sort=False
+    ):
         brand_clean = safe_str(brand_name, "OTHER")
         size_clean = safe_str(size_name, "").strip()
         section_label = f"{brand_clean} - {size_clean}" if size_clean else brand_clean
@@ -415,12 +497,18 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
     out["_run"] = out[run_col].apply(lambda x: normalize_identifier(x, "UNKNOWN-RUN"))
     out["_product"] = out[product_col].apply(lambda x: safe_str(x, "Unnamed Item"))
     out["_qty"] = out[qty_col].apply(lambda x: safe_float(x, 0.0))
-    out["_brand"] = (
+    out["_brand_raw"] = (
         out[brand_col].apply(lambda x: safe_str(x, "OTHER"))
         if brand_col is not None
         else out["_product"].apply(lambda x: safe_str(x.split(" ")[0], "OTHER"))
     )
-    out["_size"] = out[size_col].apply(lambda x: safe_str(x, "")) if size_col is not None else ""
+    out["_size_raw"] = out[size_col].apply(lambda x: safe_str(x, "")) if size_col is not None else ""
+    out["_brand_key"] = out["_brand_raw"].apply(normalize_brand_for_order)
+    out["_size_key"] = out["_size_raw"].apply(normalize_size_for_order)
+    out["_brand_display"] = out["_brand_raw"].apply(lambda x: safe_str(x, "OTHER"))
+    out["_size_display"] = out["_size_raw"].apply(lambda x: safe_str(x, "").replace("  ", " ").strip())
+    out["_brand_order"] = out["_brand_key"].apply(lambda x: config.brand_order.get(safe_str(x, ""), 999))
+    out["_size_order"] = out["_size_key"].apply(lambda x: config.size_order.get(safe_str(x, ""), 999))
     if delivery_col is not None:
         out["_delivery_date"] = pd.to_datetime(out[delivery_col], errors="coerce")
     else:
