@@ -1,5 +1,4 @@
 from io import StringIO
-import json
 import logging
 
 import pandas as pd
@@ -12,6 +11,22 @@ logger = logging.getLogger(__name__)
 IRAQ_METABASE_BASE_URL = "https://bi.marbah.info/api"
 IRAQ_METABASE_USERNAME = "YOUR_IRAQ_METABASE_USERNAME"
 IRAQ_METABASE_PASSWORD = "YOUR_IRAQ_METABASE_PASSWORD"
+
+
+def _safe_response_json(response, context):
+    """
+    Parse JSON safely and raise a clear error if the response is not JSON.
+    """
+    try:
+        return response.json()
+    except ValueError as exc:
+        content_type = response.headers.get("Content-Type", "unknown")
+        body_preview = response.text[:300].replace("\n", " ").strip()
+        raise RuntimeError(
+            f"{context} returned non-JSON response "
+            f"(status={response.status_code}, content_type={content_type}). "
+            f"Body preview: {body_preview}"
+        ) from exc
 
 
 def ret_metabase(question, use_query=False, filters=None, warehouse=None):
@@ -38,17 +53,18 @@ def ret_metabase(question, use_query=False, filters=None, warehouse=None):
     try:
         s_response = requests.post(
             f"{IRAQ_METABASE_BASE_URL}/session",
-            data=json.dumps(
-                {
-                    "username": IRAQ_METABASE_USERNAME,
-                    "password": IRAQ_METABASE_PASSWORD,
-                }
-            ),
+            json={
+                "username": IRAQ_METABASE_USERNAME,
+                "password": IRAQ_METABASE_PASSWORD,
+            },
             headers=base_headers,
         )
         s_response.raise_for_status()
 
-        session_token = s_response.json()["id"]
+        session_json = _safe_response_json(s_response, "Metabase session endpoint")
+        session_token = session_json.get("id")
+        if not session_token:
+            raise RuntimeError("Metabase session endpoint response is missing 'id'.")
         base_headers["X-Metabase-Session"] = session_token
 
         params = []
@@ -77,8 +93,13 @@ def ret_metabase(question, use_query=False, filters=None, warehouse=None):
                 headers=base_headers,
             )
             p_response.raise_for_status()
-            card = p_response.json().get("dataset_query", {})
+            card_response = _safe_response_json(p_response, "Metabase card endpoint")
+            card = card_response.get("dataset_query", {})
             query = card.get("native", {}).get("query", "").replace("\n", " ")
+            if not query:
+                raise RuntimeError(
+                    "No native SQL query was found in Metabase card dataset_query."
+                )
             return snowflake_query("iraq", query, warehouse)
 
         p_response = requests.post(
