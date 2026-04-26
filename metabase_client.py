@@ -8,7 +8,7 @@ import requests
 logger = logging.getLogger(__name__)
 
 # Iraq Metabase configuration (hardcoded as requested)
-IRAQ_METABASE_BASE_URL = "https://bi.marbah.info/api"
+IRAQ_METABASE_HOST = "https://bi.marbah.info"
 IRAQ_METABASE_USERNAME = "YOUR_IRAQ_METABASE_USERNAME"
 IRAQ_METABASE_PASSWORD = "YOUR_IRAQ_METABASE_PASSWORD"
 
@@ -27,6 +27,44 @@ def _safe_response_json(response, context):
             f"(status={response.status_code}, content_type={content_type}). "
             f"Body preview: {body_preview}"
         ) from exc
+
+
+def _session_with_fallback_paths(base_headers):
+    """
+    Authenticate against Iraq Metabase trying common API path variants.
+    """
+    payload = {
+        "username": IRAQ_METABASE_USERNAME,
+        "password": IRAQ_METABASE_PASSWORD,
+    }
+
+    # Some deployments are served under /api, others under /metabase/api.
+    session_paths = ("/api/session", "/metabase/api/session")
+    last_error = None
+
+    for session_path in session_paths:
+        session_url = f"{IRAQ_METABASE_HOST}{session_path}"
+        response = requests.post(session_url, json=payload, headers=base_headers)
+
+        try:
+            response.raise_for_status()
+            session_json = _safe_response_json(response, f"Metabase session endpoint ({session_url})")
+            session_token = session_json.get("id")
+            if not session_token:
+                raise RuntimeError(
+                    f"Metabase session response from {session_url} is missing 'id': {session_json}"
+                )
+
+            api_base_url = session_url.rsplit("/session", 1)[0]
+            return api_base_url, session_token
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    raise RuntimeError(
+        "Failed to authenticate with Iraq Metabase on known API paths "
+        f"for host {IRAQ_METABASE_HOST}."
+    ) from last_error
 
 
 def ret_metabase(question, use_query=False, filters=None, warehouse=None):
@@ -51,20 +89,7 @@ def ret_metabase(question, use_query=False, filters=None, warehouse=None):
     base_headers = {"Content-Type": "application/json"}
 
     try:
-        s_response = requests.post(
-            f"{IRAQ_METABASE_BASE_URL}/session",
-            json={
-                "username": IRAQ_METABASE_USERNAME,
-                "password": IRAQ_METABASE_PASSWORD,
-            },
-            headers=base_headers,
-        )
-        s_response.raise_for_status()
-
-        session_json = _safe_response_json(s_response, "Metabase session endpoint")
-        session_token = session_json.get("id")
-        if not session_token:
-            raise RuntimeError("Metabase session endpoint response is missing 'id'.")
+        api_base_url, session_token = _session_with_fallback_paths(base_headers)
         base_headers["X-Metabase-Session"] = session_token
 
         params = []
@@ -89,7 +114,7 @@ def ret_metabase(question, use_query=False, filters=None, warehouse=None):
 
         if use_query:
             p_response = requests.get(
-                f"{IRAQ_METABASE_BASE_URL}/card/{question_id}",
+                f"{api_base_url}/card/{question_id}",
                 headers=base_headers,
             )
             p_response.raise_for_status()
@@ -103,7 +128,7 @@ def ret_metabase(question, use_query=False, filters=None, warehouse=None):
             return snowflake_query("iraq", query, warehouse)
 
         p_response = requests.post(
-            f"{IRAQ_METABASE_BASE_URL}/card/{question_id}/query/csv",
+            f"{api_base_url}/card/{question_id}/query/csv",
             json={"parameters": params},
             headers=base_headers,
         )
