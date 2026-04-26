@@ -38,33 +38,53 @@ def _session_with_fallback_paths(base_headers):
         "password": IRAQ_METABASE_PASSWORD,
     }
 
-    # Some deployments are served under /api, others under /metabase/api.
-    session_paths = ("/api/session", "/metabase/api/session")
-    last_error = None
+    # Common reverse-proxy prefixes for Metabase API.
+    candidate_api_bases = (
+        f"{IRAQ_METABASE_HOST}/api",
+        f"{IRAQ_METABASE_HOST}/metabase/api",
+        f"{IRAQ_METABASE_HOST}/analytics/api",
+        f"{IRAQ_METABASE_HOST}/bi/api",
+        f"{IRAQ_METABASE_HOST}/mb/api",
+    )
 
-    for session_path in session_paths:
-        session_url = f"{IRAQ_METABASE_HOST}{session_path}"
-        response = requests.post(session_url, json=payload, headers=base_headers)
-
+    attempt_errors = []
+    for api_base_url in candidate_api_bases:
+        session_url = f"{api_base_url}/session"
         try:
+            response = requests.post(
+                session_url,
+                json=payload,
+                headers=base_headers,
+                timeout=30,
+            )
             response.raise_for_status()
-            session_json = _safe_response_json(response, f"Metabase session endpoint ({session_url})")
+            session_json = _safe_response_json(
+                response, f"Metabase session endpoint ({session_url})"
+            )
             session_token = session_json.get("id")
             if not session_token:
                 raise RuntimeError(
                     f"Metabase session response from {session_url} is missing 'id': {session_json}"
                 )
-
-            api_base_url = session_url.rsplit("/session", 1)[0]
             return api_base_url, session_token
         except Exception as exc:
-            last_error = exc
-            continue
+            content_type = "unknown"
+            status_code = "unknown"
+            body_preview = ""
+            if "response" in locals() and response is not None:
+                content_type = response.headers.get("Content-Type", "unknown")
+                status_code = response.status_code
+                body_preview = response.text[:120].replace("\n", " ").strip()
+            attempt_errors.append(
+                f"{session_url} -> status={status_code}, content_type={content_type}, "
+                f"error={exc}, body_preview={body_preview}"
+            )
 
+    attempts_summary = " | ".join(attempt_errors)
     raise RuntimeError(
-        "Failed to authenticate with Iraq Metabase on known API paths "
-        f"for host {IRAQ_METABASE_HOST}."
-    ) from last_error
+        "Failed to authenticate with Iraq Metabase across known API paths. "
+        f"Host={IRAQ_METABASE_HOST}. Attempts: {attempts_summary}"
+    )
 
 
 def ret_metabase(question, use_query=False, filters=None, warehouse=None):
