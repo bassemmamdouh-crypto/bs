@@ -26,47 +26,51 @@ def build_input_sheet(wb):
     ws = wb.active
     ws.title = "Input_Data"
     headers = [
-        "Product_ID",
-        "Product_Name",
-        "Category",
-        "Purchased_Qty_M1",
-        "Purchased_Qty_M2",
-        "Purchased_Qty_M3",
-        "Purchased_Qty_M4",
-        "Purchased_Qty_M5",
-        "Purchased_Qty_M6",
-        "Contribution_%_of_Total_Sales",
+        "clean_product_name",
+        "category",
+        "product_id",
+        "purchased_item_count",
+        "purchased_qty_m1",
+        "purchased_qty_m2",
+        "purchased_qty_m3",
+        "purchased_qty_m4",
+        "cont_from_total",
+        "stock",
+        "reserved_stock",
+        "available_stock",
     ]
     ws.append(headers)
     style_header(ws, ws[1])
 
     sample_rows = [
-        ["P-1001", "Sparkling Water 330ml", "Beverages", 440, 470, 510, 525, 560, 610, 0.091],
-        ["P-1002", "Premium Coffee Beans", "Beverages", 210, 205, 198, 183, 176, 169, 0.044],
-        ["P-2001", "Dry Fruit Mix 200g", "Snacks", 98, 95, 87, 75, 64, 55, 0.021],
-        ["P-2002", "Sea Salt Crackers", "Snacks", 520, 548, 561, 575, 590, 615, 0.102],
-        ["P-3001", "Aloe Vera Gel 250ml", "Personal Care", 41, 39, 35, 30, 24, 19, 0.013],
+        ["Sparkling Water 330ml", "beverages", "P-1001", 5210, 520, 560, 610, 640, 0.091, 1400, 220, 1180],
+        ["Premium Coffee Beans 1kg", "beverages", "P-1002", 3930, 215, 201, 184, 175, 0.044, 520, 55, 465],
+        ["Dry Fruit Mix 200g", "snacks", "P-2001", 880, 64, 58, 52, 45, 0.021, 980, 75, 905],
+        ["Sea Salt Crackers", "snacks", "P-2002", 6420, 590, 615, 640, 672, 0.102, 1700, 260, 1440],
+        ["Aloe Vera Gel 250ml", "personal care", "P-3001", 710, 24, 21, 18, 15, 0.013, 760, 105, 655],
     ]
     for row in sample_rows:
         ws.append(row)
 
     for row in range(2, MAX_ROWS):
-        ws[f"J{row}"].number_format = "0.00%"
+        ws[f"I{row}"].number_format = "0.00%"
 
     ws.freeze_panes = "A2"
     set_widths(
         ws,
         {
-            1: 14,
-            2: 30,
-            3: 20,
-            4: 18,
-            5: 18,
-            6: 18,
-            7: 18,
-            8: 18,
-            9: 18,
-            10: 28,
+            1: 32,
+            2: 20,
+            3: 14,
+            4: 20,
+            5: 16,
+            6: 16,
+            7: 16,
+            8: 16,
+            9: 16,
+            10: 12,
+            11: 14,
+            12: 15,
         },
     )
 
@@ -74,15 +78,23 @@ def build_input_sheet(wb):
 def build_scoring_sheet(wb):
     ws = wb.create_sheet("Scoring_Model")
     headers = [
-        "Product_ID",
-        "Product_Name",
-        "Category",
-        "Total_Qty_6M",
-        "Avg_Monthly_Qty",
+        "product_id",
+        "clean_product_name",
+        "category",
+        "purchased_item_count",
+        "sold_qty_last_4m",
+        "avg_monthly_qty_4m",
         "Movement_Percentile",
-        "Contribution_%",
+        "Slow_Mover_Score",
+        "cont_from_total",
         "Contribution_Percentile",
-        "Unmoved_Score",
+        "stock",
+        "reserved_stock",
+        "available_stock",
+        "available_stock_calc",
+        "stock_data_check",
+        "stock_coverage_months",
+        "Stock_Pressure_Percentile",
         "Bundle_Priority_Score",
         "Movement_Band",
         "Bundle_Value_Cluster",
@@ -96,87 +108,118 @@ def build_scoring_sheet(wb):
     style_header(ws, ws[1])
 
     for row in range(2, MAX_ROWS):
-        ws[f"A{row}"] = f"=Input_Data!A{row}"
-        ws[f"B{row}"] = f"=Input_Data!B{row}"
-        ws[f"C{row}"] = f"=Input_Data!C{row}"
-        ws[f"D{row}"] = f'=IF(A{row}="","",SUM(Input_Data!D{row}:I{row}))'
-        ws[f"E{row}"] = f'=IF(D{row}="","",D{row}/6)'
-        ws[f"F{row}"] = (
-            f'=IF(D{row}="","",IF(COUNTA($D$2:$D$300)<=1,0,PERCENTRANK.INC($D$2:$D$300,D{row})))'
+        ws[f"A{row}"] = f"=Input_Data!C{row}"
+        ws[f"B{row}"] = f"=Input_Data!A{row}"
+        ws[f"C{row}"] = f"=Input_Data!B{row}"
+        ws[f"D{row}"] = f"=Input_Data!D{row}"
+        ws[f"E{row}"] = f'=IF(A{row}="","",SUM(Input_Data!E{row}:H{row}))'
+        ws[f"F{row}"] = f'=IF(E{row}="","",E{row}/4)'
+        ws[f"G{row}"] = (
+            f'=IF(E{row}="","",IF(COUNTA($E$2:$E$300)<=1,0,PERCENTRANK.INC($E$2:$E$300,E{row})))'
         )
-        ws[f"G{row}"] = f"=Input_Data!J{row}"
         ws[f"H{row}"] = (
-            f'=IF(G{row}="","",IF(COUNTA($G$2:$G$300)<=1,0,PERCENTRANK.INC($G$2:$G$300,G{row})))'
+            f'=IF(G{row}="","",1-G{row})'
         )
-        ws[f"I{row}"] = f'=IF(F{row}="","",1-F{row})'
-        ws[f"J{row}"] = f'=IF(A{row}="","",0.6*I{row}+0.4*H{row})'
-        ws[f"K{row}"] = (
-            f'=IF(F{row}="","",IF(F{row}<=0.33,"Low Movement",IF(F{row}<=0.66,"Medium Movement","High Movement")))'
+        ws[f"I{row}"] = f"=Input_Data!I{row}"
+        ws[f"J{row}"] = (
+            f'=IF(I{row}="","",IF(COUNTA($I$2:$I$300)<=1,0,PERCENTRANK.INC($I$2:$I$300,I{row})))'
         )
-        ws[f"L{row}"] = (
-            f'=IF(J{row}="","",IF(J{row}>=0.67,"High Value Bundle",IF(J{row}>=0.34,"Medium Value Bundle","Low Value Bundle")))'
+        ws[f"K{row}"] = f"=Input_Data!J{row}"
+        ws[f"L{row}"] = f"=Input_Data!K{row}"
+        ws[f"M{row}"] = f"=Input_Data!L{row}"
+        ws[f"N{row}"] = f'=IF(K{row}="","",K{row}-L{row})'
+        ws[f"O{row}"] = f'=IF(A{row}="","",IF(ABS(M{row}-N{row})<=1,"OK","CHECK"))'
+        ws[f"P{row}"] = f'=IF(M{row}="","",IF(F{row}=0,99,M{row}/F{row}))'
+        ws[f"Q{row}"] = (
+            f'=IF(P{row}="","",IF(COUNTA($P$2:$P$300)<=1,0,PERCENTRANK.INC($P$2:$P$300,P{row})))'
         )
-        ws[f"M{row}"] = f'=IF(A{row}="","",IF(AND(F{row}>=0.66,H{row}>=0.66),"Yes","No"))'
-        ws[f"N{row}"] = f'=IF(A{row}="","",IF(K{row}="Low Movement","Yes","No"))'
-        ws[f"O{row}"] = (
-            f'=IF(L{row}="","",IF(L{row}="High Value Bundle",0.10,IF(L{row}="Medium Value Bundle",0.15,0.20)))'
+        ws[f"R{row}"] = f'=IF(A{row}="","",0.45*H{row}+0.35*Q{row}+0.20*J{row})'
+        ws[f"S{row}"] = (
+            f'=IF(G{row}="","",IF(G{row}<=0.33,"Low Movement",IF(G{row}<=0.66,"Medium Movement","High Movement")))'
         )
-        ws[f"P{row}"] = f'=IF(M{row}="Yes",C{row}&"|anchor","")'
-        ws[f"Q{row}"] = f'=IF(M{row}="Yes",B{row},"")'
+        ws[f"T{row}"] = (
+            f'=IF(R{row}="","",IF(R{row}>=0.67,"High Value Bundle",IF(R{row}>=0.34,"Medium Value Bundle","Low Value Bundle")))'
+        )
+        ws[f"U{row}"] = (
+            f'=IF(A{row}="","",IF(AND(G{row}>=0.70,J{row}>=0.70,M{row}>0),"Yes","No"))'
+        )
+        ws[f"V{row}"] = (
+            f'=IF(A{row}="","",IF(AND(S{row}="Low Movement",M{row}>0,P{row}>=2),"Yes","No"))'
+        )
+        ws[f"W{row}"] = (
+            f'=IF(T{row}="","",MIN(0.12,IF(T{row}="High Value Bundle",0.05,IF(T{row}="Medium Value Bundle",0.07,0.10))+IF(P{row}>=8,0.02,0)))'
+        )
+        ws[f"X{row}"] = f'=IF(U{row}="Yes",C{row}&"|anchor","")'
+        ws[f"Y{row}"] = f'=IF(U{row}="Yes",B{row},"")'
 
-        for col in ("F", "G", "H", "I", "J", "O"):
+        for col in ("G", "H", "I", "J", "Q", "R", "W"):
             ws[f"{col}{row}"].number_format = "0.00%"
 
     ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:Y300"
     set_widths(
         ws,
         {
             1: 14,
             2: 30,
             3: 20,
-            4: 14,
+            4: 20,
             5: 16,
             6: 18,
-            7: 14,
-            8: 20,
-            9: 14,
-            10: 20,
-            11: 18,
-            12: 20,
-            13: 15,
+            7: 18,
+            8: 16,
+            9: 16,
+            10: 22,
+            11: 12,
+            12: 14,
+            13: 14,
             14: 18,
-            15: 20,
-            16: 18,
-            17: 25,
+            15: 15,
+            16: 20,
+            17: 23,
+            18: 20,
+            19: 18,
+            20: 20,
+            21: 15,
+            22: 18,
+            23: 20,
+            24: 18,
+            25: 25,
         },
     )
 
     ws.conditional_formatting.add(
-        "L2:L300",
-        FormulaRule(formula=['$L2="High Value Bundle"'], fill=PatternFill("solid", fgColor="FCE4D6")),
+        "T2:T300",
+        FormulaRule(formula=['$T2="High Value Bundle"'], fill=PatternFill("solid", fgColor="FCE4D6")),
     )
     ws.conditional_formatting.add(
-        "L2:L300",
-        FormulaRule(formula=['$L2="Medium Value Bundle"'], fill=PatternFill("solid", fgColor="FFF2CC")),
+        "T2:T300",
+        FormulaRule(formula=['$T2="Medium Value Bundle"'], fill=PatternFill("solid", fgColor="FFF2CC")),
     )
     ws.conditional_formatting.add(
-        "L2:L300",
-        FormulaRule(formula=['$L2="Low Value Bundle"'], fill=PatternFill("solid", fgColor="E2F0D9")),
+        "T2:T300",
+        FormulaRule(formula=['$T2="Low Value Bundle"'], fill=PatternFill("solid", fgColor="E2F0D9")),
+    )
+    ws.conditional_formatting.add(
+        "O2:O300",
+        FormulaRule(formula=['$O2="CHECK"'], fill=PatternFill("solid", fgColor="F8CBAD")),
     )
 
 
 def build_recommendations_sheet(wb):
     ws = wb.create_sheet("Bundle_Recommendations")
     headers = [
-        "Product_ID",
-        "Candidate_Product",
-        "Category",
-        "Movement_Band",
-        "Bundle_Value_Cluster",
-        "Priority_Score",
-        "Recommended_Anchor_Product",
-        "Suggested_Discount_%",
-        "Action_Note",
+        "product_id",
+        "slow_mover_product",
+        "category",
+        "movement_band",
+        "bundle_value_cluster",
+        "priority_score",
+        "stock_coverage_months",
+        "recommended_anchor_product",
+        "suggested_discount_%",
+        "bundle_structure",
+        "action_note",
     ]
     ws.append(headers)
     style_header(ws, ws[1])
@@ -185,26 +228,29 @@ def build_recommendations_sheet(wb):
         ws[f"A{row}"] = f"=Scoring_Model!A{row}"
         ws[f"B{row}"] = f"=Scoring_Model!B{row}"
         ws[f"C{row}"] = f"=Scoring_Model!C{row}"
-        ws[f"D{row}"] = f"=Scoring_Model!K{row}"
-        ws[f"E{row}"] = f"=Scoring_Model!L{row}"
-        ws[f"F{row}"] = f"=Scoring_Model!J{row}"
-        ws[f"G{row}"] = (
-            f'=IF(D{row}<>"Low Movement","",IFERROR(XLOOKUP(C{row}&"|anchor",Scoring_Model!$P$2:$P$300,Scoring_Model!$Q$2:$Q$300,'
-            f'INDEX(Scoring_Model!$Q$2:$Q$300,MATCH("Yes",Scoring_Model!$M$2:$M$300,0))),"No anchor found"))'
+        ws[f"D{row}"] = f"=Scoring_Model!S{row}"
+        ws[f"E{row}"] = f"=Scoring_Model!T{row}"
+        ws[f"F{row}"] = f"=Scoring_Model!R{row}"
+        ws[f"G{row}"] = f"=Scoring_Model!P{row}"
+        ws[f"H{row}"] = (
+            f'=IF(Scoring_Model!V{row}<>"Yes","",IFERROR(XLOOKUP(C{row}&"|anchor",Scoring_Model!$X$2:$X$300,Scoring_Model!$Y$2:$Y$300,'
+            f'INDEX(Scoring_Model!$Y$2:$Y$300,MATCH("Yes",Scoring_Model!$U$2:$U$300,0))),"No anchor found"))'
         )
-        ws[f"H{row}"] = f"=Scoring_Model!O{row}"
-        ws[f"I{row}"] = (
-            f'=IF(A{row}="","",IF(D{row}<>"Low Movement","Stable mover - bundle optional",'
-            f'"Pair this low-movement item with the suggested anchor"))'
+        ws[f"I{row}"] = f"=Scoring_Model!W{row}"
+        ws[f"J{row}"] = (
+            f'=IF(Scoring_Model!V{row}<>"Yes","",IF(E{row}="High Value Bundle","1 anchor + 1 slow mover",IF(E{row}="Medium Value Bundle","1 anchor + 2 slow movers","1 anchor + 2 slow movers (aggressive clearout)")))'
+        )
+        ws[f"K{row}"] = (
+            f'=IF(A{row}="","",IF(Scoring_Model!V{row}<>"Yes","Not a slow-mover bundle candidate","Bundle to move slow stock with controlled discount"))'
         )
         ws[f"F{row}"].number_format = "0.00%"
-        ws[f"H{row}"].number_format = "0.00%"
+        ws[f"I{row}"].number_format = "0.00%"
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:I300"
+    ws.auto_filter.ref = "A1:K300"
     set_widths(
         ws,
-        {1: 14, 2: 30, 3: 20, 4: 18, 5: 20, 6: 14, 7: 30, 8: 18, 9: 55},
+        {1: 14, 2: 32, 3: 20, 4: 18, 5: 20, 6: 14, 7: 21, 8: 30, 9: 18, 10: 34, 11: 52},
     )
 
 
@@ -214,18 +260,26 @@ def build_logic_sheet(wb):
     ws["A1"].font = Font(bold=True, size=14)
 
     lines = [
-        "1) Fill Input_Data with the last 6 months purchased quantity and contribution% per product.",
-        "2) Movement_Percentile ranks each product by 6-month quantity sold (0 = least moved, 1 = fastest mover).",
-        "3) Unmoved_Score = 1 - Movement_Percentile so low-movement products get higher focus score.",
-        "4) Contribution_Percentile ranks products by contribution to total sales value.",
-        "5) Bundle_Priority_Score = 0.60 * Unmoved_Score + 0.40 * Contribution_Percentile.",
-        "6) Value clusters are based on Bundle_Priority_Score:",
+        "1) Input columns follow your exact dataset: clean_product_name, category, product_id, purchased_item_count, purchased_qty_m1..m4, cont_from_total, stock, reserved_stock, available_stock.",
+        "2) sold_qty_last_4m = SUM(purchased_qty_m1:purchased_qty_m4). Current month is intentionally excluded.",
+        "3) Movement_Percentile ranks sold_qty_last_4m (0 = slowest mover, 1 = fastest mover).",
+        "4) Slow_Mover_Score = 1 - Movement_Percentile (higher means slower mover, more urgent for bundling).",
+        "5) Stock coverage = available_stock / avg_monthly_qty_4m. Higher coverage means higher stock pressure.",
+        "6) Stock_Pressure_Percentile ranks stock_coverage_months to prioritize overstocked slow movers.",
+        "7) Bundle_Priority_Score = 0.45*Slow_Mover_Score + 0.35*Stock_Pressure_Percentile + 0.20*Contribution_Percentile.",
+        "8) Bundle clusters from Bundle_Priority_Score:",
         "   - High Value Bundle: score >= 0.67",
         "   - Medium Value Bundle: 0.34 <= score < 0.67",
         "   - Low Value Bundle: score < 0.34",
-        "7) Anchor_Eligible products are those with strong movement and strong contribution (>=66th percentile both).",
-        "8) Candidate_Eligible products are low-movement products; bundle them with anchor products from same category.",
-        "9) Suggested discount defaults: High=10%, Medium=15%, Low=20%. Tune by margin and stock age.",
+        "9) Anchor_Eligible = high movement + high contribution + available stock (>=70th percentile movement and contribution).",
+        "10) Candidate_Eligible = Low Movement + available stock > 0 + stock coverage >=2 months.",
+        "11) Recommended bundle design: every candidate includes one anchor product that attracts customers.",
+        "12) Suggested discount is intentionally slight to control burn:",
+        "    - High Value: 5%",
+        "    - Medium Value: 7%",
+        "    - Low Value: 10%",
+        "    - Add +2% only when stock coverage >=8 months (capped at 12%).",
+        "13) stock_data_check flags rows where available_stock does not match stock - reserved_stock.",
     ]
 
     row = 3
@@ -233,7 +287,7 @@ def build_logic_sheet(wb):
         ws[f"A{row}"] = line
         row += 1
 
-    ws.column_dimensions["A"].width = 140
+    ws.column_dimensions["A"].width = 150
 
 
 def main():
