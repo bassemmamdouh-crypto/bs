@@ -254,6 +254,52 @@ def build_recommendations_sheet(wb):
     )
 
 
+def build_all_possible_bundles_placeholder(wb):
+    ws = wb.create_sheet("All_Possible_Bundles")
+    headers = [
+        "bundle_id",
+        "bundle_size",
+        "anchor_product_id",
+        "anchor_product_name",
+        "item_2_product_id",
+        "item_2_product_name",
+        "item_3_product_id",
+        "item_3_product_name",
+        "category_mix",
+        "bundle_priority_score",
+        "suggested_discount_%",
+        "reason",
+    ]
+    ws.append(headers)
+    style_header(ws, ws[1])
+    ws["A2"] = "Run script: python3 generate_all_possible_bundles.py bundle_planning_template.xlsx"
+    ws["A3"] = "This fills all bundles with maximum 3 products (1 anchor + 1/2 slow movers)."
+    ws.merge_cells("A2:L2")
+    ws.merge_cells("A3:L3")
+    ws["A2"].font = Font(bold=True)
+    ws["A2"].alignment = Alignment(horizontal="left")
+    ws["A3"].alignment = Alignment(horizontal="left")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = "A1:L1"
+    set_widths(
+        ws,
+        {
+            1: 14,
+            2: 12,
+            3: 16,
+            4: 30,
+            5: 16,
+            6: 30,
+            7: 16,
+            8: 30,
+            9: 20,
+            10: 20,
+            11: 18,
+            12: 48,
+        },
+    )
+
+
 def build_logic_sheet(wb):
     ws = wb.create_sheet("Logic")
     ws["A1"] = "Bundle logic used in this workbook"
@@ -280,6 +326,7 @@ def build_logic_sheet(wb):
         "    - Low Value: 10%",
         "    - Add +2% only when stock coverage >=8 months (capped at 12%).",
         "13) stock_data_check flags rows where available_stock does not match stock - reserved_stock.",
+        "14) Use generate_all_possible_bundles.py to produce all bundle combinations up to 3 products.",
     ]
 
     row = 3
@@ -295,6 +342,7 @@ def main():
     build_input_sheet(wb)
     build_scoring_sheet(wb)
     build_recommendations_sheet(wb)
+    build_all_possible_bundles_placeholder(wb)
     build_logic_sheet(wb)
     wb.save(OUTPUT_FILE)
     print(f"Workbook created: {OUTPUT_FILE.resolve()}")
