@@ -21,9 +21,17 @@ TOP_N_BUNDLES = 30
 # Prefer same-category anchors when choosing the single best anchor
 SAME_CATEGORY_BONUS = 0.10
 
-# Soft penalty so candidates spread across anchors instead of all
+# Soft penalty so movers spread across anchors instead of all
 # locking onto the single strongest product
 ANCHOR_LOAD_PENALTY = 0.03
+
+# Bundle composition:
+#   exactly 1 anchor
+#   at most 1 medium mover
+#   zero or more slow movers (sheet supports up to 2 non-anchor items)
+MAX_MEDIUM_MOVERS_PER_BUNDLE = 1
+MAX_SLOW_MOVERS_PER_BUNDLE = 2
+MAX_NON_ANCHOR_ITEMS = 2
 
 
 def to_number(value, default=0.0):
@@ -297,16 +305,31 @@ def score_products(products):
         for p in sorted_anchors[:MAX_ANCHORS]
     }
 
-    # FINALIZE ELIGIBILITY
+    # FINALIZE ROLES: anchor / medium mover / slow mover
     for product in products:
 
         product["anchor_eligible"] = (
             product["product_id"] in top_anchor_ids
         )
 
-        # EVERY NON-ANCHOR PRODUCT CAN BE BUNDLED
+        if product["anchor_eligible"]:
+            mover_type = "anchor"
+
+        elif product["movement_band"] == "Low Movement":
+            mover_type = "slow_mover"
+
+        elif product["movement_band"] == "Medium Movement":
+            mover_type = "medium_mover"
+
+        else:
+            # High movers that are not selected anchors are not bundled
+            mover_type = "excluded"
+
+        product["mover_type"] = mover_type
+
+        # Only medium and slow movers can fill bundles with an anchor
         product["candidate_eligible"] = (
-            not product["anchor_eligible"]
+            mover_type in {"medium_mover", "slow_mover"}
             and product["available_stock"] > 0
         )
 
@@ -433,28 +456,230 @@ def set_widths(ws, widths):
         ].width = width
 
 
-def pair_score(candidate, anchor):
-    """Score one candidate against one anchor (higher is better)."""
+def pair_score(movers, anchor):
+    """Score a set of medium/slow movers against one anchor."""
 
-    score = (
-        0.75 * candidate["priority_score"]
-        + 0.25 * anchor["anchor_strength"]
+    if not movers:
+        return 0.0
+
+    ordered = sorted(
+        movers,
+        key=lambda p: p["priority_score"],
+        reverse=True
     )
 
-    if candidate["category"] and (
-        candidate["category"] == anchor["category"]
-    ):
+    if len(ordered) == 1:
+        score = (
+            0.75 * ordered[0]["priority_score"]
+            + 0.25 * anchor["anchor_strength"]
+        )
+    else:
+        score = (
+            0.45 * ordered[0]["priority_score"]
+            + 0.35 * ordered[1]["priority_score"]
+            + 0.20 * anchor["anchor_strength"]
+        )
+
+    same_category = all(
+        mover["category"] == anchor["category"]
+        for mover in ordered
+        if mover["category"]
+    )
+
+    if same_category:
         score += SAME_CATEGORY_BONUS
 
     return score
 
 
-def build_candidate_bundles(products):
-    """Assign each candidate product to exactly one best anchor.
+def choose_best_anchor(mover, anchors, anchor_loads):
+    """Pick one anchor for a mover (category + strength + load balance)."""
 
-    Creates one 2-product bundle per candidate. With 7 anchors and 30+
-    eligible candidates this yields 30+ bundles, and no product is paired
-    with more than one anchor.
+    best_anchor = None
+    best_adjusted = None
+
+    for anchor in anchors:
+
+        if anchor["product_id"] == mover["product_id"]:
+            continue
+
+        score = pair_score([mover], anchor)
+
+        adjusted = (
+            score
+            - ANCHOR_LOAD_PENALTY
+            * anchor_loads[anchor["product_id"]]
+        )
+
+        if best_adjusted is None or adjusted > best_adjusted:
+            best_adjusted = adjusted
+            best_anchor = anchor
+
+    return best_anchor
+
+
+def category_mix_label(anchor, movers):
+    categories = {
+        mover["category"]
+        for mover in movers
+        if mover["category"]
+    }
+
+    if not categories:
+        return "Cross Category"
+
+    if (
+        len(categories) == 1
+        and anchor["category"] in categories
+    ):
+        return "Same Category"
+
+    if len(movers) == 1:
+        return "Cross Category"
+
+    return "Mixed Category"
+
+
+def bundle_reason(movers):
+    medium_count = sum(
+        1 for m in movers if m["mover_type"] == "medium_mover"
+    )
+    slow_count = sum(
+        1 for m in movers if m["mover_type"] == "slow_mover"
+    )
+
+    if medium_count and slow_count:
+        return (
+            "One anchor + one medium mover + slow mover(s)"
+        )
+
+    if medium_count:
+        return "One anchor + one medium mover"
+
+    if slow_count == 1:
+        return "One anchor + one slow mover"
+
+    return "One anchor + slow movers"
+
+
+def make_bundle(anchor, movers):
+    """Build one bundle: 1 anchor + medium/slow movers only."""
+
+    medium_count = sum(
+        1 for m in movers if m["mover_type"] == "medium_mover"
+    )
+    slow_count = sum(
+        1 for m in movers if m["mover_type"] == "slow_mover"
+    )
+
+    if medium_count > MAX_MEDIUM_MOVERS_PER_BUNDLE:
+        raise ValueError("Bundle exceeds max medium movers")
+
+    if slow_count > MAX_SLOW_MOVERS_PER_BUNDLE:
+        raise ValueError("Bundle exceeds max slow movers")
+
+    if len(movers) > MAX_NON_ANCHOR_ITEMS:
+        raise ValueError("Bundle exceeds max non-anchor items")
+
+    # Item 2 / item 3: put medium mover first when present
+    ordered = sorted(
+        movers,
+        key=lambda m: (
+            0 if m["mover_type"] == "medium_mover" else 1,
+            -m["priority_score"],
+        ),
+    )
+
+    item_2 = ordered[0]
+    item_3 = ordered[1] if len(ordered) > 1 else None
+
+    score = pair_score(ordered, anchor)
+    discount = max(m["discount"] for m in ordered)
+
+    return {
+        "score": score,
+        "anchor_id": anchor["product_id"],
+        "candidate_ids": {m["product_id"] for m in ordered},
+        "row": [
+            1 + len(ordered),
+
+            anchor["product_id"],
+            anchor["name"],
+
+            item_2["product_id"],
+            item_2["name"],
+
+            item_3["product_id"] if item_3 else "",
+            item_3["name"] if item_3 else "",
+
+            category_mix_label(anchor, ordered),
+
+            score,
+
+            discount,
+
+            bundle_reason(ordered),
+        ],
+    }
+
+
+def pack_anchor_bundles(anchor, medium_movers, slow_movers):
+    """Pack one anchor's assigned movers into valid bundles.
+
+    Rules:
+    - exactly 1 anchor
+    - at most 1 medium mover
+    - only slow movers fill the remaining non-anchor slots
+
+    Shapes produced:
+    1. anchor + 1 medium + 1 slow  (preferred)
+    2. anchor + 1 medium
+    3. anchor + 1 slow
+    """
+
+    mediums = sorted(
+        medium_movers,
+        key=lambda p: p["priority_score"],
+        reverse=True,
+    )
+    slows = sorted(
+        slow_movers,
+        key=lambda p: p["priority_score"],
+        reverse=True,
+    )
+
+    bundles = []
+
+    # Preferred: 1 anchor + max 1 medium mover + slow mover
+    while mediums and slows:
+        bundles.append(
+            make_bundle(
+                anchor,
+                [mediums.pop(0), slows.pop(0)],
+            )
+        )
+
+    while mediums:
+        bundles.append(
+            make_bundle(anchor, [mediums.pop(0)])
+        )
+
+    while slows:
+        bundles.append(
+            make_bundle(anchor, [slows.pop(0)])
+        )
+
+    return bundles
+
+
+def build_candidate_bundles(products):
+    """Build bundles from anchors + medium/slow movers only.
+
+    Each medium/slow product is assigned to exactly one anchor, then packed
+    into bundles with:
+    - exactly 1 anchor
+    - at most 1 medium mover
+    - up to 2 slow movers (within the 3-item sheet layout)
     """
 
     anchors = [
@@ -462,9 +687,16 @@ def build_candidate_bundles(products):
         if p["anchor_eligible"]
     ]
 
-    candidates = [
+    medium_movers = [
         p for p in products
         if p["candidate_eligible"]
+        and p["mover_type"] == "medium_mover"
+    ]
+
+    slow_movers = [
+        p for p in products
+        if p["candidate_eligible"]
+        and p["mover_type"] == "slow_mover"
     ]
 
     anchors.sort(
@@ -472,91 +704,62 @@ def build_candidate_bundles(products):
         reverse=True
     )
 
-    candidates.sort(
-        key=lambda x: x["priority_score"],
-        reverse=True
-    )
-
     if not anchors:
         return []
 
-    bundles = []
+    assignments = {
+        anchor["product_id"]: {
+            "anchor": anchor,
+            "medium": [],
+            "slow": [],
+        }
+        for anchor in anchors
+    }
+
     anchor_loads = {
         anchor["product_id"]: 0
         for anchor in anchors
     }
 
-    # ==========================================
-    # ONE BUNDLE PER CANDIDATE → ONE BEST ANCHOR
-    # ==========================================
-    for candidate in candidates:
+    # Assign every medium/slow mover to exactly one best anchor
+    movers = sorted(
+        medium_movers + slow_movers,
+        key=lambda p: p["priority_score"],
+        reverse=True,
+    )
 
-        best_anchor = None
-        best_score = None
-        best_adjusted = None
+    for mover in movers:
 
-        for anchor in anchors:
-
-            if anchor["product_id"] == candidate["product_id"]:
-                continue
-
-            score = pair_score(candidate, anchor)
-
-            # Prefer stronger / same-category matches, but spread load
-            # across anchors so 7 anchors can support 30+ bundles.
-            adjusted = (
-                score
-                - ANCHOR_LOAD_PENALTY
-                * anchor_loads[anchor["product_id"]]
-            )
-
-            if (
-                best_adjusted is None
-                or adjusted > best_adjusted
-            ):
-                best_adjusted = adjusted
-                best_score = score
-                best_anchor = anchor
+        best_anchor = choose_best_anchor(
+            mover,
+            anchors,
+            anchor_loads,
+        )
 
         if best_anchor is None:
             continue
 
+        bucket = assignments[best_anchor["product_id"]]
+
+        if mover["mover_type"] == "medium_mover":
+            bucket["medium"].append(mover)
+        else:
+            bucket["slow"].append(mover)
+
         anchor_loads[best_anchor["product_id"]] += 1
 
-        category_mix = (
-            "Same Category"
-            if best_anchor["category"] == candidate["category"]
-            else "Cross Category"
-        )
+    bundles = []
 
-        bundles.append(
-            {
-                "score": best_score,
-                "anchor_id": best_anchor["product_id"],
-                "candidate_ids": {
-                    candidate["product_id"],
-                },
-                "row": [
-                    2,
+    for anchor in anchors:
 
-                    best_anchor["product_id"],
-                    best_anchor["name"],
+        bucket = assignments[anchor["product_id"]]
 
-                    candidate["product_id"],
-                    candidate["name"],
-
-                    "",
-                    "",
-
-                    category_mix,
-
-                    best_score,
-
-                    candidate["discount"],
-
-                    "Moves one medium/slow mover using one strong anchor",
-                ],
-            }
+        bundles.extend(
+            pack_anchor_bundles(
+                anchor,
+                bucket["medium"],
+                bucket["slow"],
+            )
         )
 
     return bundles
@@ -687,7 +890,7 @@ def main():
         products
     )
 
-    # ONE BEST ANCHOR PER CANDIDATE → ONE BUNDLE PER PRODUCT
+    # 1 ANCHOR + MAX 1 MEDIUM MOVER + SLOW MOVERS
     bundles = build_candidate_bundles(products)
 
     bundles.sort(
@@ -697,7 +900,7 @@ def main():
 
     top_bundles = bundles[:TOP_N_BUNDLES]
 
-    # TAB 1: ALL ASSIGNED BUNDLES (1 ANCHOR PER PRODUCT)
+    # TAB 1: ALL PACKED BUNDLES
     all_bundles_ws = ensure_sheet(
         wb,
         BUNDLE_SHEET
@@ -736,13 +939,18 @@ def main():
     )
 
     print(
-        f"Candidates: "
-        f"{sum(1 for p in products if p['candidate_eligible'])}"
+        f"Medium movers: "
+        f"{sum(1 for p in products if p.get('mover_type') == 'medium_mover' and p['candidate_eligible'])}"
+    )
+
+    print(
+        f"Slow movers: "
+        f"{sum(1 for p in products if p.get('mover_type') == 'slow_mover' and p['candidate_eligible'])}"
     )
 
     print(
         f"'{BUNDLE_SHEET}' tab: {total_bundles} bundles "
-        f"(one best anchor per product)"
+        f"(1 anchor + max 1 medium + slow movers)"
     )
 
     print(
