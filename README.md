@@ -25,6 +25,7 @@ This repository includes an Excel template to build bundle actions for slow move
      - Medium Value Bundle
      - Low Value Bundle
 4. Go to `Bundle_Recommendations`:
+   - Each candidate bundle gets a `bundle_id` (`RB-000001`, `RB-000002`, ...).
    - Focus on rows with `Low Movement`.
    - Every candidate bundle includes an anchor product to attract purchase.
    - Use slight discount guidance to control burn.

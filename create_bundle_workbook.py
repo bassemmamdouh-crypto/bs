@@ -209,6 +209,7 @@ def build_scoring_sheet(wb):
 def build_recommendations_sheet(wb):
     ws = wb.create_sheet("Bundle_Recommendations")
     headers = [
+        "bundle_id",
         "product_id",
         "slow_mover_product",
         "category",
@@ -225,32 +226,37 @@ def build_recommendations_sheet(wb):
     style_header(ws, ws[1])
 
     for row in range(2, MAX_ROWS):
-        ws[f"A{row}"] = f"=Scoring_Model!A{row}"
-        ws[f"B{row}"] = f"=Scoring_Model!B{row}"
-        ws[f"C{row}"] = f"=Scoring_Model!C{row}"
-        ws[f"D{row}"] = f"=Scoring_Model!S{row}"
-        ws[f"E{row}"] = f"=Scoring_Model!T{row}"
-        ws[f"F{row}"] = f"=Scoring_Model!R{row}"
-        ws[f"G{row}"] = f"=Scoring_Model!P{row}"
-        ws[f"H{row}"] = (
-            f'=IF(Scoring_Model!V{row}<>"Yes","",IFERROR(XLOOKUP(C{row}&"|anchor",Scoring_Model!$X$2:$X$300,Scoring_Model!$Y$2:$Y$300,'
+        # bundle_id: sequential id (RB-000001, ...) only for actual bundle candidates
+        ws[f"A{row}"] = (
+            f'=IF(Scoring_Model!V{row}<>"Yes","",'
+            f'"RB-"&TEXT(COUNTIF(Scoring_Model!$V$2:$V{row},"Yes"),"000000"))'
+        )
+        ws[f"B{row}"] = f"=Scoring_Model!A{row}"
+        ws[f"C{row}"] = f"=Scoring_Model!B{row}"
+        ws[f"D{row}"] = f"=Scoring_Model!C{row}"
+        ws[f"E{row}"] = f"=Scoring_Model!S{row}"
+        ws[f"F{row}"] = f"=Scoring_Model!T{row}"
+        ws[f"G{row}"] = f"=Scoring_Model!R{row}"
+        ws[f"H{row}"] = f"=Scoring_Model!P{row}"
+        ws[f"I{row}"] = (
+            f'=IF(Scoring_Model!V{row}<>"Yes","",IFERROR(XLOOKUP(D{row}&"|anchor",Scoring_Model!$X$2:$X$300,Scoring_Model!$Y$2:$Y$300,'
             f'INDEX(Scoring_Model!$Y$2:$Y$300,MATCH("Yes",Scoring_Model!$U$2:$U$300,0))),"No anchor found"))'
         )
-        ws[f"I{row}"] = f"=Scoring_Model!W{row}"
-        ws[f"J{row}"] = (
-            f'=IF(Scoring_Model!V{row}<>"Yes","",IF(E{row}="High Value Bundle","1 anchor + 1 slow mover",IF(E{row}="Medium Value Bundle","1 anchor + 2 slow movers","1 anchor + 2 slow movers (aggressive clearout)")))'
-        )
+        ws[f"J{row}"] = f"=Scoring_Model!W{row}"
         ws[f"K{row}"] = (
-            f'=IF(A{row}="","",IF(Scoring_Model!V{row}<>"Yes","Not a slow-mover bundle candidate","Bundle to move slow stock with controlled discount"))'
+            f'=IF(Scoring_Model!V{row}<>"Yes","",IF(F{row}="High Value Bundle","1 anchor + 1 slow mover",IF(F{row}="Medium Value Bundle","1 anchor + 2 slow movers","1 anchor + 2 slow movers (aggressive clearout)")))'
         )
-        ws[f"F{row}"].number_format = "0.00%"
-        ws[f"I{row}"].number_format = "0.00%"
+        ws[f"L{row}"] = (
+            f'=IF(B{row}="","",IF(Scoring_Model!V{row}<>"Yes","Not a slow-mover bundle candidate","Bundle to move slow stock with controlled discount"))'
+        )
+        ws[f"G{row}"].number_format = "0.00%"
+        ws[f"J{row}"].number_format = "0.00%"
 
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = "A1:K300"
+    ws.auto_filter.ref = "A1:L300"
     set_widths(
         ws,
-        {1: 14, 2: 32, 3: 20, 4: 18, 5: 20, 6: 14, 7: 21, 8: 30, 9: 18, 10: 34, 11: 52},
+        {1: 14, 2: 14, 3: 32, 4: 20, 5: 18, 6: 20, 7: 14, 8: 21, 9: 30, 10: 18, 11: 34, 12: 52},
     )
 
 
