@@ -430,8 +430,9 @@ def set_widths(ws, widths):
 def build_candidate_bundles(products):
     """Build every possible bundle (2 and 3 products) with its priority score.
 
-    Returns a list of dicts, each with a ``score``, ``product_ids``, and the row
-    payload (without the ``bundle_id``, which is assigned after ranking).
+    Returns a list of dicts, each with a ``score``, ``anchor_id``,
+    ``candidate_ids``, and the row payload (without the ``bundle_id``, which is
+    assigned after ranking).
     """
 
     anchors = [
@@ -482,8 +483,8 @@ def build_candidate_bundles(products):
             bundles.append(
                 {
                     "score": score,
-                    "product_ids": {
-                        anchor["product_id"],
+                    "anchor_id": anchor["product_id"],
+                    "candidate_ids": {
                         candidate["product_id"],
                     },
                     "row": [
@@ -548,8 +549,8 @@ def build_candidate_bundles(products):
             bundles.append(
                 {
                     "score": score,
-                    "product_ids": {
-                        anchor["product_id"],
+                    "anchor_id": anchor["product_id"],
+                    "candidate_ids": {
                         first["product_id"],
                         second["product_id"],
                     },
@@ -580,25 +581,25 @@ def build_candidate_bundles(products):
 
 
 def select_exclusive_bundles(bundles):
-    """Keep highest-scoring bundles where no product is reused across anchors.
+    """Keep highest-scoring bundles without reusing candidate products.
 
-    Bundles must already be sorted by score descending. Once a product appears
-    in a kept bundle (as anchor or candidate), it cannot appear in any later
-    bundle — so the same slow-mover is never paired with different anchors.
+    Bundles must already be sorted by score descending. Anchors may appear in
+    multiple kept bundles. Candidate / slow-mover products may appear only once,
+    so the same product is never paired with different anchors.
     """
 
     selected = []
-    used_product_ids = set()
+    used_candidate_ids = set()
 
     for bundle in bundles:
 
-        product_ids = bundle["product_ids"]
+        candidate_ids = bundle["candidate_ids"]
 
-        if product_ids & used_product_ids:
+        if candidate_ids & used_candidate_ids:
             continue
 
         selected.append(bundle)
-        used_product_ids.update(product_ids)
+        used_candidate_ids.update(candidate_ids)
 
     return selected
 
@@ -728,23 +729,21 @@ def main():
         products
     )
 
-    # BUILD EVERY POSSIBLE BUNDLE, RANK BY SCORE, THEN KEEP
-    # ONLY BUNDLES WHERE EACH PRODUCT APPEARS AT MOST ONCE
-    # (NO PRODUCT REUSED ACROSS DIFFERENT ANCHORS)
-    all_scored_bundles = build_candidate_bundles(products)
+    # BUILD EVERY POSSIBLE BUNDLE ONCE, RANKED BY PRIORITY SCORE
+    bundles = build_candidate_bundles(products)
 
-    all_scored_bundles.sort(
+    bundles.sort(
         key=lambda b: b["score"],
         reverse=True
     )
 
-    bundles = select_exclusive_bundles(
-        all_scored_bundles
-    )
+    # TOP BUNDLES: no candidate product reused across different anchors.
+    # Anchors may appear in multiple top bundles.
+    top_bundles = select_exclusive_bundles(bundles)[
+        :TOP_N_BUNDLES
+    ]
 
-    top_bundles = bundles[:TOP_N_BUNDLES]
-
-    # TAB 1: ALL EXCLUSIVE BUNDLES (NO PRODUCT REUSE)
+    # TAB 1: ALL POSSIBLE BUNDLES
     all_bundles_ws = ensure_sheet(
         wb,
         BUNDLE_SHEET
@@ -755,7 +754,7 @@ def main():
         bundles
     )
 
-    # TAB 2: TOP 15 BUNDLES
+    # TAB 2: TOP 15 BUNDLES (CANDIDATE-EXCLUSIVE)
     top_bundles_ws = ensure_sheet(
         wb,
         TOP_BUNDLE_SHEET
@@ -788,18 +787,13 @@ def main():
     )
 
     print(
-        f"Candidate combinations scored: "
-        f"{len(all_scored_bundles)}"
-    )
-
-    print(
-        f"'{BUNDLE_SHEET}' tab: {total_bundles} exclusive bundles "
-        f"(no product reused across anchors)"
+        f"'{BUNDLE_SHEET}' tab: {total_bundles} bundles"
     )
 
     print(
         f"'{TOP_BUNDLE_SHEET}' tab: {kept_bundles} bundles "
-        f"(top {TOP_N_BUNDLES} by priority score)"
+        f"(top {TOP_N_BUNDLES} by priority score; "
+        f"candidates not reused across anchors)"
     )
 
 
