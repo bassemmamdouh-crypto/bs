@@ -12,9 +12,6 @@ SCORING_SHEET = "Scoring_Model"
 BUNDLE_SHEET = "All_Possible_Bundles"
 TOP_BUNDLE_SHEET = "Top_30_Bundles"
 
-# KEEP ONLY TOP N STRONGEST PRODUCTS AS ANCHORS
-MAX_ANCHORS = 7
-
 # KEEP ONLY THE TOP N BUNDLES (BY BUNDLE PRIORITY SCORE)
 TOP_N_BUNDLES = 30
 
@@ -297,24 +294,8 @@ def score_products(products):
             }
         )
 
-    # KEEP ONLY TOP ANCHORS
-    sorted_anchors = sorted(
-        [p for p in products if p["anchor_eligible"]],
-        key=lambda x: x["anchor_strength"],
-        reverse=True
-    )
-
-    top_anchor_ids = {
-        p["product_id"]
-        for p in sorted_anchors[:MAX_ANCHORS]
-    }
-
-    # FINALIZE ROLES: anchor / high / medium / slow mover
+    # FINALIZE ROLES: keep every data-qualified anchor (no top-N cap)
     for product in products:
-
-        product["anchor_eligible"] = (
-            product["product_id"] in top_anchor_ids
-        )
 
         if product["anchor_eligible"]:
             mover_type = "anchor"
@@ -326,7 +307,7 @@ def score_products(products):
             mover_type = "medium_mover"
 
         else:
-            # High movers that are not selected as anchors
+            # High movers that are not anchors
             mover_type = "high_mover"
 
         product["mover_type"] = mover_type
