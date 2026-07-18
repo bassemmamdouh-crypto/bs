@@ -1,5 +1,4 @@
 import argparse
-from itertools import combinations
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -11,13 +10,20 @@ MAX_PRODUCTS = 300
 INPUT_SHEET = "Input_Data"
 SCORING_SHEET = "Scoring_Model"
 BUNDLE_SHEET = "All_Possible_Bundles"
-TOP_BUNDLE_SHEET = "Top_15_Bundles"
+TOP_BUNDLE_SHEET = "Top_30_Bundles"
 
 # KEEP ONLY TOP N STRONGEST PRODUCTS AS ANCHORS
 MAX_ANCHORS = 7
 
 # KEEP ONLY THE TOP N BUNDLES (BY BUNDLE PRIORITY SCORE)
-TOP_N_BUNDLES = 15
+TOP_N_BUNDLES = 30
+
+# Prefer same-category anchors when choosing the single best anchor
+SAME_CATEGORY_BONUS = 0.10
+
+# Soft penalty so candidates spread across anchors instead of all
+# locking onto the single strongest product
+ANCHOR_LOAD_PENALTY = 0.03
 
 
 def to_number(value, default=0.0):
@@ -427,12 +433,28 @@ def set_widths(ws, widths):
         ].width = width
 
 
-def build_candidate_bundles(products):
-    """Build every possible bundle (2 and 3 products) with its priority score.
+def pair_score(candidate, anchor):
+    """Score one candidate against one anchor (higher is better)."""
 
-    Returns a list of dicts, each with a ``score``, ``anchor_id``,
-    ``candidate_ids``, and the row payload (without the ``bundle_id``, which is
-    assigned after ranking).
+    score = (
+        0.75 * candidate["priority_score"]
+        + 0.25 * anchor["anchor_strength"]
+    )
+
+    if candidate["category"] and (
+        candidate["category"] == anchor["category"]
+    ):
+        score += SAME_CATEGORY_BONUS
+
+    return score
+
+
+def build_candidate_bundles(products):
+    """Assign each candidate product to exactly one best anchor.
+
+    Creates one 2-product bundle per candidate. With 7 anchors and 30+
+    eligible candidates this yields 30+ bundles, and no product is paired
+    with more than one anchor.
     """
 
     anchors = [
@@ -455,153 +477,89 @@ def build_candidate_bundles(products):
         reverse=True
     )
 
+    if not anchors:
+        return []
+
     bundles = []
+    anchor_loads = {
+        anchor["product_id"]: 0
+        for anchor in anchors
+    }
 
     # ==========================================
-    # 2-PRODUCT BUNDLES
+    # ONE BUNDLE PER CANDIDATE → ONE BEST ANCHOR
     # ==========================================
-    for anchor in anchors:
+    for candidate in candidates:
 
-        for candidate in candidates:
+        best_anchor = None
+        best_score = None
+        best_adjusted = None
+
+        for anchor in anchors:
 
             if anchor["product_id"] == candidate["product_id"]:
                 continue
 
-            score = (
-                0.75 * candidate["priority_score"]
-                + 0.25 * anchor["anchor_strength"]
+            score = pair_score(candidate, anchor)
+
+            # Prefer stronger / same-category matches, but spread load
+            # across anchors so 7 anchors can support 30+ bundles.
+            adjusted = (
+                score
+                - ANCHOR_LOAD_PENALTY
+                * anchor_loads[anchor["product_id"]]
             )
 
-            discount = candidate["discount"]
+            if (
+                best_adjusted is None
+                or adjusted > best_adjusted
+            ):
+                best_adjusted = adjusted
+                best_score = score
+                best_anchor = anchor
 
-            category_mix = (
-                "Same Category"
-                if anchor["category"] == candidate["category"]
-                else "Cross Category"
-            )
-
-            bundles.append(
-                {
-                    "score": score,
-                    "anchor_id": anchor["product_id"],
-                    "candidate_ids": {
-                        candidate["product_id"],
-                    },
-                    "row": [
-                        2,
-
-                        anchor["product_id"],
-                        anchor["name"],
-
-                        candidate["product_id"],
-                        candidate["name"],
-
-                        "",
-                        "",
-
-                        category_mix,
-
-                        score,
-
-                        discount,
-
-                        "Moves one medium/slow mover using one strong anchor",
-                    ],
-                }
-            )
-
-    # ==========================================
-    # 3-PRODUCT BUNDLES
-    # ==========================================
-    for anchor in anchors:
-
-        for first, second in combinations(candidates, 2):
-
-            if anchor["product_id"] in {
-                first["product_id"],
-                second["product_id"],
-            }:
-                continue
-
-            score = (
-                0.45 * first["priority_score"]
-                + 0.35 * second["priority_score"]
-                + 0.20 * anchor["anchor_strength"]
-            )
-
-            discount = max(
-                first["discount"],
-                second["discount"]
-            )
-
-            same_category = (
-                anchor["category"]
-                == first["category"]
-                == second["category"]
-            )
-
-            category_mix = (
-                "Same Category"
-                if same_category
-                else "Mixed Category"
-            )
-
-            bundles.append(
-                {
-                    "score": score,
-                    "anchor_id": anchor["product_id"],
-                    "candidate_ids": {
-                        first["product_id"],
-                        second["product_id"],
-                    },
-                    "row": [
-                        3,
-
-                        anchor["product_id"],
-                        anchor["name"],
-
-                        first["product_id"],
-                        first["name"],
-
-                        second["product_id"],
-                        second["name"],
-
-                        category_mix,
-
-                        score,
-
-                        discount,
-
-                        "Moves two medium/slow movers with one strong anchor",
-                    ],
-                }
-            )
-
-    return bundles
-
-
-def select_exclusive_bundles(bundles):
-    """Keep highest-scoring bundles without reusing candidate products.
-
-    Bundles must already be sorted by score descending. Anchors may appear in
-    multiple kept bundles. Candidate / slow-mover products may appear only once,
-    so the same product is never paired with different anchors.
-    """
-
-    selected = []
-    used_candidate_ids = set()
-
-    for bundle in bundles:
-
-        candidate_ids = bundle["candidate_ids"]
-
-        if candidate_ids & used_candidate_ids:
+        if best_anchor is None:
             continue
 
-        selected.append(bundle)
-        used_candidate_ids.update(candidate_ids)
+        anchor_loads[best_anchor["product_id"]] += 1
 
-    return selected
+        category_mix = (
+            "Same Category"
+            if best_anchor["category"] == candidate["category"]
+            else "Cross Category"
+        )
+
+        bundles.append(
+            {
+                "score": best_score,
+                "anchor_id": best_anchor["product_id"],
+                "candidate_ids": {
+                    candidate["product_id"],
+                },
+                "row": [
+                    2,
+
+                    best_anchor["product_id"],
+                    best_anchor["name"],
+
+                    candidate["product_id"],
+                    candidate["name"],
+
+                    "",
+                    "",
+
+                    category_mix,
+
+                    best_score,
+
+                    candidate["discount"],
+
+                    "Moves one medium/slow mover using one strong anchor",
+                ],
+            }
+        )
+
+    return bundles
 
 
 def write_bundle_sheet(ws, bundles):
@@ -729,7 +687,7 @@ def main():
         products
     )
 
-    # BUILD EVERY POSSIBLE BUNDLE ONCE, RANKED BY PRIORITY SCORE
+    # ONE BEST ANCHOR PER CANDIDATE → ONE BUNDLE PER PRODUCT
     bundles = build_candidate_bundles(products)
 
     bundles.sort(
@@ -737,13 +695,9 @@ def main():
         reverse=True
     )
 
-    # TOP BUNDLES: no candidate product reused across different anchors.
-    # Anchors may appear in multiple top bundles.
-    top_bundles = select_exclusive_bundles(bundles)[
-        :TOP_N_BUNDLES
-    ]
+    top_bundles = bundles[:TOP_N_BUNDLES]
 
-    # TAB 1: ALL POSSIBLE BUNDLES
+    # TAB 1: ALL ASSIGNED BUNDLES (1 ANCHOR PER PRODUCT)
     all_bundles_ws = ensure_sheet(
         wb,
         BUNDLE_SHEET
@@ -754,7 +708,7 @@ def main():
         bundles
     )
 
-    # TAB 2: TOP 15 BUNDLES (CANDIDATE-EXCLUSIVE)
+    # TAB 2: TOP N BUNDLES
     top_bundles_ws = ensure_sheet(
         wb,
         TOP_BUNDLE_SHEET
@@ -787,13 +741,13 @@ def main():
     )
 
     print(
-        f"'{BUNDLE_SHEET}' tab: {total_bundles} bundles"
+        f"'{BUNDLE_SHEET}' tab: {total_bundles} bundles "
+        f"(one best anchor per product)"
     )
 
     print(
         f"'{TOP_BUNDLE_SHEET}' tab: {kept_bundles} bundles "
-        f"(top {TOP_N_BUNDLES} by priority score; "
-        f"candidates not reused across anchors)"
+        f"(top {TOP_N_BUNDLES} by priority score)"
     )
 
 
