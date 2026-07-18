@@ -11,6 +11,7 @@ MAX_PRODUCTS = 300
 INPUT_SHEET = "Input_Data"
 SCORING_SHEET = "Scoring_Model"
 BUNDLE_SHEET = "All_Possible_Bundles"
+TOP_BUNDLE_SHEET = "Top_15_Bundles"
 
 # KEEP ONLY TOP N STRONGEST PRODUCTS AS ANCHORS
 MAX_ANCHORS = 7
@@ -569,7 +570,12 @@ def build_candidate_bundles(products):
     return bundles
 
 
-def fill_all_possible_bundles(ws, products):
+def write_bundle_sheet(ws, bundles):
+    """Write the given (already ranked) bundles to a worksheet.
+
+    ``bundles`` is a list of dicts as produced by ``build_candidate_bundles``.
+    Rows are re-numbered sequentially (``B-000001``, ``B-000002``, ...).
+    """
 
     headers = [
         "bundle_id",
@@ -599,17 +605,7 @@ def fill_all_possible_bundles(ws, products):
 
     style_header(ws)
 
-    # BUILD EVERY POSSIBLE BUNDLE, THEN KEEP ONLY THE TOP N
-    bundles = build_candidate_bundles(products)
-
-    bundles.sort(
-        key=lambda b: b["score"],
-        reverse=True
-    )
-
-    top_bundles = bundles[:TOP_N_BUNDLES]
-
-    for bundle_id, bundle in enumerate(top_bundles, start=1):
+    for bundle_id, bundle in enumerate(bundles, start=1):
 
         ws.append(
             [f"B-{bundle_id:06d}"] + bundle["row"]
@@ -643,7 +639,7 @@ def fill_all_possible_bundles(ws, products):
         },
     )
 
-    return len(top_bundles), len(bundles)
+    return len(bundles)
 
 
 def ensure_sheet(workbook, name):
@@ -699,14 +695,36 @@ def main():
         products
     )
 
-    bundle_ws = ensure_sheet(
+    # BUILD EVERY POSSIBLE BUNDLE ONCE, RANKED BY PRIORITY SCORE
+    bundles = build_candidate_bundles(products)
+
+    bundles.sort(
+        key=lambda b: b["score"],
+        reverse=True
+    )
+
+    top_bundles = bundles[:TOP_N_BUNDLES]
+
+    # TAB 1: ALL POSSIBLE BUNDLES
+    all_bundles_ws = ensure_sheet(
         wb,
         BUNDLE_SHEET
     )
 
-    kept_bundles, total_bundles = fill_all_possible_bundles(
-        bundle_ws,
-        products
+    total_bundles = write_bundle_sheet(
+        all_bundles_ws,
+        bundles
+    )
+
+    # TAB 2: TOP 15 BUNDLES
+    top_bundles_ws = ensure_sheet(
+        wb,
+        TOP_BUNDLE_SHEET
+    )
+
+    kept_bundles = write_bundle_sheet(
+        top_bundles_ws,
+        top_bundles
     )
 
     wb.save(workbook_path)
@@ -731,11 +749,12 @@ def main():
     )
 
     print(
-        f"Possible bundles generated: {total_bundles}"
+        f"'{BUNDLE_SHEET}' tab: {total_bundles} bundles"
     )
 
     print(
-        f"Top bundles kept (max {TOP_N_BUNDLES}): {kept_bundles}"
+        f"'{TOP_BUNDLE_SHEET}' tab: {kept_bundles} bundles "
+        f"(top {TOP_N_BUNDLES} by priority score)"
     )
 
 

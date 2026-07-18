@@ -6,7 +6,7 @@ This repository includes an Excel template to build bundle actions for slow move
 
 - `bundle_planning_template.xlsx`: Ready-to-use workbook with input, scoring, bundle recommendation, and logic sheets.
 - `create_bundle_workbook.py`: Script that generates/regenerates the workbook.
-- `generate_all_possible_bundles.py`: Builds all possible bundles (max 3 products), then keeps only the top 15 by bundle priority score.
+- `generate_all_possible_bundles.py`: Builds all possible bundles (max 3 products) and writes two tabs: `All_Possible_Bundles` (every bundle) and `Top_15_Bundles` (the top 15 by bundle priority score).
 
 ## How to use
 
@@ -28,14 +28,18 @@ This repository includes an Excel template to build bundle actions for slow move
    - Focus on rows with `Low Movement`.
    - Every candidate bundle includes an anchor product to attract purchase.
    - Use slight discount guidance to control burn.
-5. Generate bundle combinations (maximum 3 products) and keep the top 15:
+5. Generate bundle combinations (maximum 3 products):
 
 ```bash
 python3 generate_all_possible_bundles.py bundle_planning_template.xlsx
 ```
 
 This builds every possible bundle, ranks them by `bundle_priority_score`, and
-writes only the top 15 to `All_Possible_Bundles` (controlled by `TOP_N_BUNDLES`):
+writes two tabs:
+- `All_Possible_Bundles`: every possible bundle (sorted by score)
+- `Top_15_Bundles`: the top 15 bundles (controlled by `TOP_N_BUNDLES`)
+
+Each bundle is one of:
 - 2-product bundles: `1 anchor + 1 slow mover`
 - 3-product bundles: `1 anchor + 2 slow movers`
 
