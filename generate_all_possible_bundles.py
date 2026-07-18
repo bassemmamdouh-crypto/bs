@@ -482,6 +482,10 @@ def build_candidate_bundles(products):
             bundles.append(
                 {
                     "score": score,
+                    "product_ids": [
+                        anchor["product_id"],
+                        candidate["product_id"],
+                    ],
                     "row": [
                         2,
 
@@ -544,6 +548,11 @@ def build_candidate_bundles(products):
             bundles.append(
                 {
                     "score": score,
+                    "product_ids": [
+                        anchor["product_id"],
+                        first["product_id"],
+                        second["product_id"],
+                    ],
                     "row": [
                         3,
 
@@ -642,6 +651,34 @@ def write_bundle_sheet(ws, bundles):
     return len(bundles)
 
 
+def select_top_distinct_bundles(bundles, limit):
+    """Pick the highest-scoring bundles that do not share any product.
+
+    ``bundles`` must already be sorted by score (descending). A bundle is
+    selected only if none of its products (anchor or items) were already used by
+    a previously selected bundle, so no product is repeated across the top list.
+    """
+
+    selected = []
+
+    used_products = set()
+
+    for bundle in bundles:
+
+        product_ids = bundle["product_ids"]
+
+        if used_products.isdisjoint(product_ids):
+
+            selected.append(bundle)
+
+            used_products.update(product_ids)
+
+            if len(selected) >= limit:
+                break
+
+    return selected
+
+
 def ensure_sheet(workbook, name):
 
     if name in workbook.sheetnames:
@@ -703,7 +740,11 @@ def main():
         reverse=True
     )
 
-    top_bundles = bundles[:TOP_N_BUNDLES]
+    # TOP BUNDLES WITHOUT REPEATING ANY PRODUCT ACROSS THEM
+    top_bundles = select_top_distinct_bundles(
+        bundles,
+        TOP_N_BUNDLES
+    )
 
     # TAB 1: ALL POSSIBLE BUNDLES
     all_bundles_ws = ensure_sheet(
@@ -754,7 +795,7 @@ def main():
 
     print(
         f"'{TOP_BUNDLE_SHEET}' tab: {kept_bundles} bundles "
-        f"(top {TOP_N_BUNDLES} by priority score)"
+        f"(top {TOP_N_BUNDLES} by priority score, no repeated products)"
     )
 
 

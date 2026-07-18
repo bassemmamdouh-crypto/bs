@@ -38,7 +38,10 @@ python3 generate_all_possible_bundles.py bundle_planning_template.xlsx
 This builds every possible bundle, ranks them by `bundle_priority_score`, and
 writes two tabs:
 - `All_Possible_Bundles`: every possible bundle (sorted by score)
-- `Top_15_Bundles`: the top 15 bundles (controlled by `TOP_N_BUNDLES`)
+- `Top_15_Bundles`: the top 15 bundles (controlled by `TOP_N_BUNDLES`), selected
+  so that **no product is repeated across the chosen bundles** (each product,
+  anchor or item, is used at most once). Because every bundle needs an anchor,
+  the number of top bundles is limited by the number of distinct anchors.
 
 Each bundle is one of:
 - 2-product bundles: `1 anchor + 1 slow mover`
