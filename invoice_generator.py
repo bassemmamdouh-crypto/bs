@@ -965,11 +965,15 @@ def fill_invoice_lines(ws: xw.Sheet, lines: List[Dict[str, object]], config: Scr
 
 def compute_invoice_totals(lines: List[Dict[str, object]], discount_amount: float) -> Dict[str, float]:
     total_qty = sum(safe_float(line.get("qty", 0), 0.0) + safe_float(line.get("gift_qty", 0), 0.0) for line in lines)
+    total_price_before_discount = sum(safe_float(line.get("price_before_discount", 0), 0.0) for line in lines)
+    total_line_discount = sum(safe_float(line.get("line_discount", 0), 0.0) for line in lines)
     subtotal = sum(safe_float(line.get("net_amount", 0), 0.0) for line in lines)
     discount = max(0.0, safe_float(discount_amount, 0.0))
     net_total = subtotal - discount
     return {
         "total_qty": total_qty,
+        "total_price_before_discount": total_price_before_discount,
+        "total_line_discount": total_line_discount,
         "subtotal": subtotal,
         "discount": discount,
         "net_total": net_total,
@@ -991,11 +995,15 @@ def write_totals(
 
     totals = compute_invoice_totals(lines, discount_amount)
     total_qty = totals["total_qty"]
+    total_price_before_discount = totals["total_price_before_discount"]
+    total_line_discount = totals["total_line_discount"]
     subtotal = totals["subtotal"]
     discount = totals["discount"]
     net_total = totals["net_total"]
 
     ws.range((totals_row, 3)).value = total_qty
+    ws.range((totals_row, config.line_price_before_discount_col)).value = total_price_before_discount
+    ws.range((totals_row, config.line_discount_value_col)).value = total_line_discount
     ws.range((totals_row, config.line_total_price_col)).value = subtotal
     ws.range((subtotal_row, 5)).value = subtotal
     ws.range((discount_row, 5)).value = discount
