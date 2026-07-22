@@ -103,6 +103,12 @@ class ScriptConfig:
     qty_column_candidates: List[str] = field(default_factory=lambda: ["purchased_item_count", "qty", "quantity", "item_qty"])
     unit_column_candidates: List[str] = field(default_factory=lambda: ["unit", "uom", "unit_name"])
     amount_column_candidates: List[str] = field(default_factory=lambda: ["total_price", "line_total", "item_total", "amount", "price"])
+    price_before_discount_column_candidates: List[str] = field(
+        default_factory=lambda: ["price_befor_discount", "price_before_discount"]
+    )
+    line_discount_column_candidates: List[str] = field(
+        default_factory=lambda: ["total_discount", "line_discount", "discount_value"]
+    )
 
     # Offer columns from dataframe (optional, safe if missing)
     offer_item_name_candidates: List[str] = field(
@@ -149,6 +155,16 @@ class ScriptConfig:
     adjustment_row: int = 295
     net_total_row: int = 296
 
+    # Invoice line columns in template
+    line_serial_col: int = 1
+    line_item_name_col: int = 2
+    line_qty_col: int = 3
+    line_unit_col: int = 4
+    line_gift_qty_col: int = 5
+    line_price_before_discount_col: int = 6
+    line_discount_value_col: int = 7
+    line_total_price_col: int = 8
+
     # Enable/disable offer lines (gifts and explicit offer items)
     include_offer_lines: bool = True
 
@@ -193,6 +209,8 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "section": ["section_name", "business_unit", "category", "division"],
     "sku_name": ["item_name", "product_name", "item", "description"],
     "sku_code": ["sku", "product_code", "sku_id"],
+    "price_befor_discount": ["price_before_discount"],
+    "total_discount": ["discount_value", "line_discount"],
 }
 
 
@@ -218,6 +236,8 @@ REQUIRED_COLUMNS_DEFAULTS: Dict[str, object] = {
 OPTIONAL_COLUMNS_DEFAULTS: Dict[str, object] = {
     "sku_code": "",
     "section": "",
+    "price_befor_discount": 0,
+    "total_discount": 0,
 }
 
 
@@ -566,7 +586,7 @@ def adjust_line_capacity(ws: xw.Sheet, required_count: int, config: ScriptConfig
 def clear_invoice_lines(ws: xw.Sheet, start_row: int, end_row: int) -> None:
     if end_row < start_row:
         return
-    ws.range((start_row, 1), (end_row, 6)).value = None
+    ws.range((start_row, 1), (end_row, 8)).value = None
 
 
 def write_header(ws: xw.Sheet, order_df: pd.DataFrame, order_id: str, config: ScriptConfig) -> None:
@@ -684,6 +704,14 @@ def build_base_items(order_df: pd.DataFrame, config: ScriptConfig) -> List[Dict[
         if not size:
             size = extract_size_text(name)
         qty = safe_float(row_first_value(row, config.qty_column_candidates, 0), 0.0)
+        price_before_discount = safe_float(
+            row_first_value(row, config.price_before_discount_column_candidates, 0),
+            0.0,
+        )
+        line_discount_value = safe_float(
+            row_first_value(row, config.line_discount_column_candidates, 0),
+            0.0,
+        )
         amount = safe_float(row_first_value(row, config.amount_column_candidates, 0), 0.0)
         key = f"{brand}||{size}||{name}||{unit}"
         if key not in aggregated:
@@ -694,15 +722,28 @@ def build_base_items(order_df: pd.DataFrame, config: ScriptConfig) -> List[Dict[
                 "qty": 0.0,
                 "unit": unit,
                 "gift_qty": 0.0,
+                "price_before_discount": 0.0,
+                "line_discount": 0.0,
                 "net_amount": 0.0,
             }
         aggregated[key]["qty"] = safe_float(aggregated[key]["qty"], 0.0) + qty
+        aggregated[key]["price_before_discount"] = (
+            safe_float(aggregated[key]["price_before_discount"], 0.0) + price_before_discount
+        )
+        aggregated[key]["line_discount"] = (
+            safe_float(aggregated[key]["line_discount"], 0.0) + line_discount_value
+        )
         aggregated[key]["net_amount"] = safe_float(aggregated[key]["net_amount"], 0.0) + amount
 
     items = [
         item
         for item in aggregated.values()
-        if safe_float(item["qty"], 0.0) != 0.0 or safe_float(item["net_amount"], 0.0) != 0.0
+        if (
+            safe_float(item["qty"], 0.0) != 0.0
+            or safe_float(item["net_amount"], 0.0) != 0.0
+            or safe_float(item["price_before_discount"], 0.0) != 0.0
+            or safe_float(item["line_discount"], 0.0) != 0.0
+        )
     ]
     # Required ordering: brand first, then size.
     items.sort(key=sku_sort_key)
@@ -906,12 +947,20 @@ def fill_invoice_lines(ws: xw.Sheet, lines: List[Dict[str, object]], config: Scr
     clear_invoice_lines(ws, config.line_start_row, end_row)
     for idx, line in enumerate(lines):
         row_no = config.line_start_row + idx
-        ws.range((row_no, 1)).value = idx + 1
-        ws.range((row_no, 2)).value = line.get("item_name", "")
-        ws.range((row_no, 3)).value = safe_float(line.get("qty", 0), 0.0)
-        ws.range((row_no, 4)).value = line.get("unit", "")
-        ws.range((row_no, 5)).value = safe_float(line.get("gift_qty", 0), 0.0)
-        ws.range((row_no, 6)).value = safe_float(line.get("net_amount", 0), 0.0)
+        ws.range((row_no, config.line_serial_col)).value = idx + 1
+        ws.range((row_no, config.line_item_name_col)).value = line.get("item_name", "")
+        ws.range((row_no, config.line_qty_col)).value = safe_float(line.get("qty", 0), 0.0)
+        ws.range((row_no, config.line_unit_col)).value = line.get("unit", "")
+        ws.range((row_no, config.line_gift_qty_col)).value = safe_float(line.get("gift_qty", 0), 0.0)
+        ws.range((row_no, config.line_price_before_discount_col)).value = safe_float(
+            line.get("price_before_discount", 0),
+            0.0,
+        )
+        ws.range((row_no, config.line_discount_value_col)).value = safe_float(
+            line.get("line_discount", 0),
+            0.0,
+        )
+        ws.range((row_no, config.line_total_price_col)).value = safe_float(line.get("net_amount", 0), 0.0)
 
 
 def compute_invoice_totals(lines: List[Dict[str, object]], discount_amount: float) -> Dict[str, float]:
@@ -947,7 +996,7 @@ def write_totals(
     net_total = totals["net_total"]
 
     ws.range((totals_row, 3)).value = total_qty
-    ws.range((totals_row, 6)).value = subtotal
+    ws.range((totals_row, config.line_total_price_col)).value = subtotal
     ws.range((subtotal_row, 5)).value = subtotal
     ws.range((discount_row, 5)).value = discount
     ws.range((adjustment_row, 5)).value = 0
