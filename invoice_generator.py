@@ -870,34 +870,65 @@ def apply_offer_rules(
     if discount_percent:
         discount_total += subtotal * (discount_percent / 100.0)
 
-    # B) Fixed bundle offer:
-    # Sum quantities of specific SKUs, then floor(total / divisor) as gift qty.
-    if config.bundle_offer_active and config.bundle_offer_divisor > 0:
-        bundle_source_df = bundle_offer_df if bundle_offer_df is not None else order_df
-        bundle_sku_qty_map = quantity_by_sku(bundle_source_df, config)
+    # B) Bundle offers:
+    # Supports the new `bundle_offers` list and keeps legacy single-offer fields working.
+    bundle_source_df = bundle_offer_df if bundle_offer_df is not None else order_df
+    bundle_sku_qty_map = quantity_by_sku(bundle_source_df, config)
+
+    bundle_offers: List[Dict[str, object]] = []
+    configured_bundle_offers = getattr(config, "bundle_offers", None)
+    if isinstance(configured_bundle_offers, list) and configured_bundle_offers:
+        bundle_offers = configured_bundle_offers
+    else:
+        legacy_active = bool(getattr(config, "bundle_offer_active", False))
+        legacy_divisor = safe_float(getattr(config, "bundle_offer_divisor", 0), 0.0)
+        legacy_source_skus = getattr(config, "bundle_offer_source_skus", []) or []
+        if legacy_active and legacy_divisor > 0 and legacy_source_skus:
+            bundle_offers = [
+                {
+                    "source_skus": list(legacy_source_skus),
+                    "divisor": legacy_divisor,
+                    "gift_sku": safe_str(getattr(config, "bundle_offer_gift_sku", ""), ""),
+                    "gift_name": safe_str(getattr(config, "bundle_offer_gift_name", "Gift Item"), "Gift Item"),
+                }
+            ]
+
+    for bundle_offer in bundle_offers:
         source_skus = {
             normalize_sku(sku)
-            for sku in config.bundle_offer_source_skus
+            for sku in (bundle_offer.get("source_skus", []) if isinstance(bundle_offer, dict) else [])
             if normalize_sku(sku)
         }
-        combo_qty_total = sum(qty for sku, qty in bundle_sku_qty_map.items() if normalize_sku(sku) in source_skus)
-        combo_gift_qty = 0
-        if combo_qty_total > config.bundle_offer_divisor:
-            combo_gift_qty = math.floor(combo_qty_total / config.bundle_offer_divisor)
-        if combo_gift_qty > 0:
-            gift_line_name = safe_str(config.bundle_offer_gift_name, "Gift Item")
-            gift_sku = normalize_sku(config.bundle_offer_gift_sku)
-            if gift_sku:
-                gift_line_name = f"SKU {gift_sku} - {gift_line_name}"
-            offer_lines.append(
-                {
-                    "item_name": gift_line_name,
-                    "qty": 0.0,
-                    "unit": "",
-                    "gift_qty": float(combo_gift_qty),
-                    "net_amount": 0.0,
-                }
-            )
+        divisor = safe_float(bundle_offer.get("divisor", 0) if isinstance(bundle_offer, dict) else 0, 0.0)
+        if not source_skus or divisor <= 0:
+            continue
+
+        combo_qty_total = sum(
+            qty
+            for sku, qty in bundle_sku_qty_map.items()
+            if normalize_sku(sku) in source_skus
+        )
+        combo_gift_qty = math.floor(combo_qty_total / divisor)
+        if combo_gift_qty <= 0:
+            continue
+
+        gift_line_name = safe_str(
+            bundle_offer.get("gift_name", "Gift Item") if isinstance(bundle_offer, dict) else "Gift Item",
+            "Gift Item",
+        )
+        gift_sku = normalize_sku(bundle_offer.get("gift_sku", "") if isinstance(bundle_offer, dict) else "")
+        if gift_sku:
+            gift_line_name = f"SKU {gift_sku} - {gift_line_name}"
+
+        offer_lines.append(
+            {
+                "item_name": gift_line_name,
+                "qty": 0.0,
+                "unit": "",
+                "gift_qty": float(combo_gift_qty),
+                "net_amount": 0.0,
+            }
+        )
 
     # C) BUY 1 GET 1 SAME SKU (180,181,182)
     same_sku_offer = {"180", "181", "182"}
