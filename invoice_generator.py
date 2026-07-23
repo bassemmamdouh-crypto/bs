@@ -148,8 +148,26 @@ class ScriptConfig:
     discount_percent_columns: List[str] = field(
         default_factory=lambda: ["discount_percent", "offer_discount_percent", "promo_discount_percent"]
     )
-    # Fixed invoice-level gift offer:
-    # sum qty for selected SKUs, divide by 6, floor result => gift qty of SKU 273.
+    # Preferred: define one or many bundle offers here.
+    # Each item:
+    # {
+    #   "source_skus": [...],
+    #   "divisor": 6.0,
+    #   "gift_sku": "",
+    #   "gift_name": "Gift Name"
+    # }
+    bundle_offers: List[Dict[str, object]] = field(
+        default_factory=lambda: [
+            {
+                "source_skus": ["200", "201", "202", "203", "204", "205", "206", "207", "221"],
+                "divisor": 6.0,
+                "gift_sku": "",
+                "gift_name": "عصير يومي برتقال 200 مل * 36",
+            }
+        ]
+    )
+    # Legacy single-bundle fields (kept for backward compatibility).
+    # If bundle_offers has entries, these legacy fields are ignored.
     bundle_offer_active: bool = True
     bundle_offer_source_skus: List[str] = field(
         default_factory=lambda: ["200", "201", "202", "203", "204", "205", "206", "207", "221"]
