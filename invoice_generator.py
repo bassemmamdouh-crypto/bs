@@ -64,10 +64,22 @@ class ScriptConfig:
     order_id_column: str = "order_id"
     delivery_date_column: str = "estimated_delivery_date"
     split_by_section: bool = True
+    target_by_supply_chain: bool = True
     section_column_candidates: List[str] = field(
         default_factory=lambda: ["section", "section_name", "business_unit", "category", "brand_section", "brand"]
     )
+    supply_chain_column_candidates: List[str] = field(
+        default_factory=lambda: ["supply_chain", "supply chain", "supply_chain_name", "supplychain"]
+    )
     target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS", "MARAII"])
+    target_supply_chains: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS", "MARAII"])
+    supply_chain_section_map: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "PEPSI": ["PEPSI"],
+            "LAYS": ["LAYS"],
+            "MARAII": ["MARAII"],
+        }
+    )
     other_section_name: str = "OTHER"
     generation_mode: str = "per_order_section_workbooks"
     # summary_by_section: one workbook per area with two summary sheets (PEPSI/LAYS)
@@ -207,6 +219,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "sales_agent": ["salesman", "sales_rep"],
     "route_agent": ["driver"],
     "section": ["section_name", "business_unit", "category", "division"],
+    "supply_chain": ["supply chain", "supply_chain_name", "supplychain"],
     "sku_name": ["item_name", "product_name", "item", "description"],
     "sku_code": ["sku", "product_code", "sku_id"],
     "price_befor_discount": ["price_before_discount"],
@@ -236,6 +249,7 @@ REQUIRED_COLUMNS_DEFAULTS: Dict[str, object] = {
 OPTIONAL_COLUMNS_DEFAULTS: Dict[str, object] = {
     "sku_code": "",
     "section": "",
+    "supply_chain": "",
     "price_befor_discount": 0,
     "total_discount": 0,
 }
@@ -375,16 +389,62 @@ def normalize_section_name(value: object, config: ScriptConfig) -> str:
     return config.other_section_name
 
 
+def normalize_supply_chain_name(value: object, config: ScriptConfig) -> str:
+    text = safe_str(value, "").strip().upper()
+    if not text:
+        return config.other_section_name
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def normalize_group_key(value: object) -> str:
+    return re.sub(r"\s+", " ", safe_str(value, "").strip().upper())
+
+
+def build_supply_chain_lookup(config: ScriptConfig) -> Dict[str, str]:
+    lookup: Dict[str, str] = {}
+    for chain_name, section_names in (config.supply_chain_section_map or {}).items():
+        normalized_chain = normalize_supply_chain_name(chain_name, config)
+        if normalized_chain == config.other_section_name:
+            continue
+        for section_name in section_names:
+            raw_key = normalize_group_key(section_name)
+            if raw_key:
+                lookup[raw_key] = normalized_chain
+            normalized_section = normalize_section_name(section_name, config)
+            normalized_section_key = normalize_group_key(normalized_section)
+            if normalized_section_key:
+                lookup[normalized_section_key] = normalized_chain
+    return lookup
+
+
 def get_target_sections(config: ScriptConfig) -> List[str]:
     target_sections: List[str] = []
     seen_sections = set()
-    for sec in config.target_sections:
-        normalized = normalize_section_name(sec, config)
-        if normalized == config.other_section_name:
-            continue
-        if normalized not in seen_sections:
-            seen_sections.add(normalized)
-            target_sections.append(normalized)
+
+    if config.target_by_supply_chain:
+        target_source = config.target_supply_chains or []
+        if not target_source and config.supply_chain_section_map:
+            target_source = list(config.supply_chain_section_map.keys())
+        if not target_source:
+            target_source = config.target_sections
+
+        for chain_name in target_source:
+            normalized = normalize_supply_chain_name(chain_name, config)
+            if normalized == config.other_section_name:
+                continue
+            if normalized not in seen_sections:
+                seen_sections.add(normalized)
+                target_sections.append(normalized)
+    else:
+        for sec in config.target_sections:
+            normalized = normalize_section_name(sec, config)
+            if normalized == config.other_section_name:
+                continue
+            if normalized not in seen_sections:
+                seen_sections.add(normalized)
+                target_sections.append(normalized)
+
     if not target_sections:
         return ["PEPSI", "LAYS", "MARAII"]
     return target_sections
@@ -1014,10 +1074,45 @@ def write_totals(
 def prepare_area_sections(area_df: pd.DataFrame, config: ScriptConfig) -> pd.DataFrame:
     prepared = area_df.copy()
     section_col = find_existing_column(prepared, config.section_column_candidates)
-    if config.split_by_section and section_col:
-        prepared["_section_group"] = prepared[section_col].apply(lambda x: normalize_section_name(x, config))
-    else:
+
+    if not config.split_by_section:
         prepared["_section_group"] = config.other_section_name
+        return prepared
+
+    if config.target_by_supply_chain:
+        supply_chain_col = find_existing_column(prepared, config.supply_chain_column_candidates)
+        supply_chain_lookup = build_supply_chain_lookup(config)
+
+        def resolve_supply_chain_group(row: pd.Series) -> str:
+            if supply_chain_col:
+                direct_chain = normalize_supply_chain_name(row.get(supply_chain_col, ""), config)
+                if direct_chain != config.other_section_name:
+                    return direct_chain
+
+            if section_col:
+                raw_section_key = normalize_group_key(row.get(section_col, ""))
+                if raw_section_key in supply_chain_lookup:
+                    return supply_chain_lookup[raw_section_key]
+
+                raw_section_chain = normalize_supply_chain_name(row.get(section_col, ""), config)
+                if raw_section_chain in supply_chain_lookup.values():
+                    return raw_section_chain
+
+                normalized_section = normalize_section_name(row.get(section_col, ""), config)
+                normalized_section_key = normalize_group_key(normalized_section)
+                if normalized_section_key in supply_chain_lookup:
+                    return supply_chain_lookup[normalized_section_key]
+                if normalized_section != config.other_section_name:
+                    return normalize_supply_chain_name(normalized_section, config)
+
+            return config.other_section_name
+
+        prepared["_section_group"] = prepared.apply(resolve_supply_chain_group, axis=1)
+    else:
+        if section_col:
+            prepared["_section_group"] = prepared[section_col].apply(lambda x: normalize_section_name(x, config))
+        else:
+            prepared["_section_group"] = config.other_section_name
     return prepared
 
 
