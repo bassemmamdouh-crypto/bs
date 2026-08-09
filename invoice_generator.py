@@ -154,7 +154,11 @@ class ScriptConfig:
     #   "source_skus": [...],
     #   "divisor": 6.0,
     #   "gift_sku": "",
-    #   "gift_name": "Gift Name"
+    #   "gift_name": "Gift Name",
+    #   # Optional extra condition:
+    #   # apply only if total qty of these SKUs reaches minimum
+    #   "condition_source_skus": [...],
+    #   "condition_min_qty": 5,
     # }
     bundle_offers: List[Dict[str, object]] = field(
         default_factory=lambda: [
@@ -920,6 +924,37 @@ def apply_offer_rules(
         divisor = safe_float(bundle_offer.get("divisor", 0) if isinstance(bundle_offer, dict) else 0, 0.0)
         if not source_skus or divisor <= 0:
             continue
+
+        # Optional condition: require minimum qty from another SKU set before applying this offer.
+        condition_skus_raw = []
+        condition_min_qty = 0.0
+        if isinstance(bundle_offer, dict):
+            condition_skus_raw = (
+                bundle_offer.get("condition_source_skus")
+                or bundle_offer.get("required_source_skus")
+                or bundle_offer.get("condition_skus")
+                or []
+            )
+            condition_min_qty = safe_float(
+                bundle_offer.get("condition_min_qty", bundle_offer.get("required_min_qty", 0)),
+                0.0,
+            )
+        condition_source_skus = {
+            normalize_sku(sku)
+            for sku in condition_skus_raw
+            if normalize_sku(sku)
+        }
+        if condition_min_qty > 0:
+            if not condition_source_skus:
+                # Misconfigured conditional offer: minimum exists without condition SKU set.
+                continue
+            condition_qty_total = sum(
+                qty
+                for sku, qty in bundle_sku_qty_map.items()
+                if normalize_sku(sku) in condition_source_skus
+            )
+            if condition_qty_total < condition_min_qty:
+                continue
 
         combo_qty_total = sum(
             qty
