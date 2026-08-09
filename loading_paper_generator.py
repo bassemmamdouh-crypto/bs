@@ -575,21 +575,25 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
 def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.DataFrame:
     if df.empty:
         return df
-    if "_order_id" not in df.columns or "_sku" not in df.columns:
-        return df
-
-    scoped = df[df["_order_id"] != ""]
-    if scoped.empty:
+    if "_sku" not in df.columns:
         return df
 
     offer_records: List[Dict[str, object]] = []
-    for (_, _, _), order_df in scoped.groupby(["_route_agent", "_run", "_order_id"], sort=False):
+    if "_order_id" in df.columns and not df[df["_order_id"] != ""].empty:
+        grouped_iter = df[df["_order_id"] != ""].groupby(["_route_agent", "_run", "_order_id"], sort=False)
+        group_mode = "order"
+    else:
+        # Fallback when order_id is missing: compute at route/run level so gifts are still visible.
+        grouped_iter = df.groupby(["_route_agent", "_run"], sort=False)
+        group_mode = "route-run"
+
+    for group_key, order_df in grouped_iter:
         rows = build_offer_rows_for_order(order_df, config)
         if not rows:
             continue
         route_agent = safe_str(order_df.iloc[0].get("_route_agent", ""), "")
         run_name = safe_str(order_df.iloc[0].get("_run", ""), "")
-        order_id = safe_str(order_df.iloc[0].get("_order_id", ""), "")
+        order_id = safe_str(order_df.iloc[0].get("_order_id", ""), "") if group_mode == "order" else ""
         delivery_date = pd.to_datetime(order_df["_delivery_date"], errors="coerce").max()
         for row in rows:
             offer_records.append(
@@ -609,9 +613,13 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
             )
 
     if not offer_records:
+        if group_mode == "route-run":
+            log_warning("Offer rows were computed by route/run because order_id was missing.")
         return df
 
     offers_df = pd.DataFrame(offer_records)
+    if group_mode == "route-run":
+        log_warning("Added offer rows using route/run fallback because order_id was missing.")
     return pd.concat([df, offers_df], ignore_index=True, sort=False)
 
 
