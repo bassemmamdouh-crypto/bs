@@ -109,6 +109,9 @@ class ScriptConfig:
     brand_column_candidates: List[str] = field(
         default_factory=lambda: ["brand", "brand_name", "product_brand", "manufacturer"]
     )
+    offer_brand_column_candidates: List[str] = field(
+        default_factory=lambda: ["brand_name_en", "brand_name", "brand", "product_brand", "manufacturer"]
+    )
     size_column_candidates: List[str] = field(
         default_factory=lambda: ["size", "pack_size", "sku_size", "item_size", "variant_size"]
     )
@@ -152,12 +155,14 @@ class ScriptConfig:
     # Each item:
     # {
     #   "source_skus": [...],
+    #   "source_brand_names": [...],  # optional, supports brand-level targeting (OR with source_skus)
     #   "divisor": 6.0,
     #   "gift_sku": "",
     #   "gift_name": "Gift Name",
     #   # Optional extra condition:
     #   # apply only if total qty of these SKUs reaches minimum
     #   "condition_source_skus": [...],
+    #   "condition_brand_names": [...],  # optional, OR with condition_source_skus
     #   "condition_min_qty": 5,
     # }
     bundle_offers: List[Dict[str, object]] = field(
@@ -347,6 +352,11 @@ def normalize_identifier(value: object, default: str = "") -> str:
 
 def normalize_sku(value: object) -> str:
     return normalize_identifier(value, "")
+
+
+def normalize_brand_key(value: object) -> str:
+    text = safe_str(value, "").lower().strip()
+    return re.sub(r"[^a-z0-9]+", "", text)
 
 
 def normalize_column_key(name: object) -> str:
@@ -895,7 +905,20 @@ def apply_offer_rules(
     # B) Bundle offers:
     # Supports the new `bundle_offers` list and keeps legacy single-offer fields working.
     bundle_source_df = bundle_offer_df if bundle_offer_df is not None else order_df
-    bundle_sku_qty_map = quantity_by_sku(bundle_source_df, config)
+    bundle_rows: List[Dict[str, object]] = []
+    for _, row in bundle_source_df.iterrows():
+        sku = normalize_sku(row_first_value(row, config.sku_code_column_candidates, ""))
+        qty = safe_float(row_first_value(row, config.qty_column_candidates, 0), 0.0)
+        if qty == 0:
+            continue
+        brand_value = row_first_value(row, config.offer_brand_column_candidates, "")
+        bundle_rows.append(
+            {
+                "sku": sku,
+                "qty": qty,
+                "brand_key": normalize_brand_key(brand_value),
+            }
+        )
 
     bundle_offers: List[Dict[str, object]] = []
     configured_bundle_offers = getattr(config, "bundle_offers", None)
@@ -921,18 +944,34 @@ def apply_offer_rules(
             for sku in (bundle_offer.get("source_skus", []) if isinstance(bundle_offer, dict) else [])
             if normalize_sku(sku)
         }
+        source_brand_names_raw = (
+            (bundle_offer.get("source_brand_names") or bundle_offer.get("source_brands") or [])
+            if isinstance(bundle_offer, dict)
+            else []
+        )
+        source_brand_keys = {
+            normalize_brand_key(brand_name)
+            for brand_name in source_brand_names_raw
+            if normalize_brand_key(brand_name)
+        }
         divisor = safe_float(bundle_offer.get("divisor", 0) if isinstance(bundle_offer, dict) else 0, 0.0)
-        if not source_skus or divisor <= 0:
+        if (not source_skus and not source_brand_keys) or divisor <= 0:
             continue
 
         # Optional condition: require minimum qty from another SKU set before applying this offer.
         condition_skus_raw = []
+        condition_brands_raw = []
         condition_min_qty = 0.0
         if isinstance(bundle_offer, dict):
             condition_skus_raw = (
                 bundle_offer.get("condition_source_skus")
                 or bundle_offer.get("required_source_skus")
                 or bundle_offer.get("condition_skus")
+                or []
+            )
+            condition_brands_raw = (
+                bundle_offer.get("condition_brand_names")
+                or bundle_offer.get("condition_brands")
                 or []
             )
             condition_min_qty = safe_float(
@@ -944,22 +983,45 @@ def apply_offer_rules(
             for sku in condition_skus_raw
             if normalize_sku(sku)
         }
+        condition_brand_keys = {
+            normalize_brand_key(brand_name)
+            for brand_name in condition_brands_raw
+            if normalize_brand_key(brand_name)
+        }
         if condition_min_qty > 0:
-            if not condition_source_skus:
-                # Misconfigured conditional offer: minimum exists without condition SKU set.
+            if not condition_source_skus and not condition_brand_keys:
+                # Misconfigured conditional offer: minimum exists without condition selectors.
                 continue
             condition_qty_total = sum(
-                qty
-                for sku, qty in bundle_sku_qty_map.items()
-                if normalize_sku(sku) in condition_source_skus
+                safe_float(bundle_row["qty"], 0.0)
+                for bundle_row in bundle_rows
+                if (
+                    (
+                        bool(condition_source_skus)
+                        and safe_str(bundle_row.get("sku", ""), "") in condition_source_skus
+                    )
+                    or (
+                        bool(condition_brand_keys)
+                        and safe_str(bundle_row.get("brand_key", ""), "") in condition_brand_keys
+                    )
+                )
             )
             if condition_qty_total < condition_min_qty:
                 continue
 
         combo_qty_total = sum(
-            qty
-            for sku, qty in bundle_sku_qty_map.items()
-            if normalize_sku(sku) in source_skus
+            safe_float(bundle_row["qty"], 0.0)
+            for bundle_row in bundle_rows
+            if (
+                (
+                    bool(source_skus)
+                    and safe_str(bundle_row.get("sku", ""), "") in source_skus
+                )
+                or (
+                    bool(source_brand_keys)
+                    and safe_str(bundle_row.get("brand_key", ""), "") in source_brand_keys
+                )
+            )
         )
         combo_gift_qty = math.floor(combo_qty_total / divisor)
         if combo_gift_qty <= 0:
