@@ -308,6 +308,45 @@ def extract_row_sku(row: pd.Series) -> str:
     return ""
 
 
+def to_selector_list(value: object) -> List[object]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        return [part.strip() for part in re.split(r"[,;\n\r\t|]+", text) if part.strip()]
+    return [value]
+
+
+def parse_sku_selector_set(value: object) -> set:
+    parsed: set = set()
+    for item in to_selector_list(value):
+        text = safe_str(item, "")
+        if not text:
+            continue
+        # Support whitespace-separated numeric SKU lists in one cell/string.
+        parts = [text]
+        if re.search(r"\s", text) and not re.search(r"[A-Za-z\u0600-\u06FF]", text):
+            parts = [p for p in re.split(r"\s+", text) if p]
+        for part in parts:
+            sku = normalize_sku(part)
+            if sku:
+                parsed.add(sku)
+    return parsed
+
+
+def parse_brand_selector_set(value: object) -> set:
+    parsed: set = set()
+    for item in to_selector_list(value):
+        brand = normalize_brand_key(item)
+        if brand:
+            parsed.add(brand)
+    return parsed
+
+
 def normalize_brand_for_order(brand_value: object) -> str:
     # Keep brand_name-driven grouping, but normalize formatting for reliable ordering.
     text = safe_str(brand_value, "").lower().strip()
@@ -396,7 +435,9 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
     has_any_bundle_sku = any(safe_str(bundle_row.get("sku", ""), "") for bundle_row in bundle_rows)
 
     bundle_offers: List[Dict[str, object]] = []
-    if isinstance(config.bundle_offers, list) and config.bundle_offers:
+    if isinstance(config.bundle_offers, dict):
+        bundle_offers = [config.bundle_offers]
+    elif isinstance(config.bundle_offers, list) and config.bundle_offers:
         bundle_offers = config.bundle_offers
     elif config.bundle_offer_active and config.bundle_offer_divisor > 0:
         bundle_offers = [
@@ -416,42 +457,54 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
         if not bool(bundle_offer.get("active", True)):
             continue
 
-        source_skus = {
-            normalize_sku(sku)
-            for sku in (bundle_offer.get("source_skus") or [])
-            if normalize_sku(sku)
-        }
-        source_brand_keys = {
-            normalize_brand_key(brand_name)
-            for brand_name in (bundle_offer.get("source_brand_names") or bundle_offer.get("source_brands") or [])
-            if normalize_brand_key(brand_name)
-        }
+        source_skus_raw = (
+            bundle_offer.get("source_skus")
+            or bundle_offer.get("source_sku")
+            or bundle_offer.get("source_sku_ids")
+            or bundle_offer.get("source_ids")
+            or bundle_offer.get("skus")
+            or []
+        )
+        source_skus = parse_sku_selector_set(source_skus_raw)
+        source_brands_raw = (
+            bundle_offer.get("source_brand_names")
+            or bundle_offer.get("source_brand_name")
+            or bundle_offer.get("source_brands")
+            or bundle_offer.get("source_brand_name_en")
+            or bundle_offer.get("source_brands_en")
+            or bundle_offer.get("brands")
+            or []
+        )
+        source_brand_keys = parse_brand_selector_set(source_brands_raw)
         if source_skus and not source_brand_keys and not has_any_bundle_sku:
             log_warning("Bundle offer source SKUs configured, but no SKU values were resolved for current group.")
             continue
         divisor = safe_float(bundle_offer.get("divisor", 0), 0.0)
         if divisor <= 0 or (not source_skus and not source_brand_keys):
+            log_warning(
+                "Bundle offer skipped due to invalid selectors or divisor. "
+                f"divisor={divisor}, source_skus={len(source_skus)}, source_brands={len(source_brand_keys)}"
+            )
             continue
 
-        condition_source_skus = {
-            normalize_sku(sku)
-            for sku in (
-                bundle_offer.get("condition_source_skus")
-                or bundle_offer.get("required_source_skus")
-                or bundle_offer.get("condition_skus")
-                or []
-            )
-            if normalize_sku(sku)
-        }
-        condition_brand_keys = {
-            normalize_brand_key(brand_name)
-            for brand_name in (
-                bundle_offer.get("condition_brand_names")
-                or bundle_offer.get("condition_brands")
-                or []
-            )
-            if normalize_brand_key(brand_name)
-        }
+        condition_source_skus_raw = (
+            bundle_offer.get("condition_source_skus")
+            or bundle_offer.get("condition_source_sku")
+            or bundle_offer.get("required_source_skus")
+            or bundle_offer.get("condition_skus")
+            or bundle_offer.get("condition_sku_ids")
+            or []
+        )
+        condition_source_skus = parse_sku_selector_set(condition_source_skus_raw)
+        condition_brand_raw = (
+            bundle_offer.get("condition_brand_names")
+            or bundle_offer.get("condition_brand_name")
+            or bundle_offer.get("condition_brands")
+            or bundle_offer.get("condition_brand_name_en")
+            or bundle_offer.get("condition_brands_en")
+            or []
+        )
+        condition_brand_keys = parse_brand_selector_set(condition_brand_raw)
         condition_min_qty = safe_float(
             bundle_offer.get("condition_min_qty", bundle_offer.get("required_min_qty", 0)),
             0.0,
@@ -516,7 +569,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
         )
 
     # D) BUY 1 GET 1 SAME SKU (same as invoice script logic).
-    same_sku_offer = {normalize_sku(sku) for sku in config.same_sku_offer_skus if normalize_sku(sku)}
+    same_sku_offer = parse_sku_selector_set(config.same_sku_offer_skus)
     for sku in sorted(same_sku_offer):
         sku_rows = order_df[effective_sku == sku]
         if sku_rows.empty:
