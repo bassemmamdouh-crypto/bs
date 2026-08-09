@@ -265,6 +265,10 @@ def normalize_sku(value: object) -> str:
     return normalize_identifier(value, "")
 
 
+def normalize_column_key(name: object) -> str:
+    return re.sub(r"[^a-z0-9]", "", safe_str(name, "").lower())
+
+
 def normalize_brand_for_order(brand_value: object) -> str:
     # Keep brand_name-driven grouping, but normalize formatting for reliable ordering.
     text = safe_str(brand_value, "").lower().strip()
@@ -587,6 +591,7 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
         grouped_iter = df.groupby(["_route_agent", "_run"], sort=False)
         group_mode = "route-run"
 
+    total_offer_qty_added = 0.0
     for group_key, order_df in grouped_iter:
         rows = build_offer_rows_for_order(order_df, config)
         if not rows:
@@ -596,13 +601,15 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
         order_id = safe_str(order_df.iloc[0].get("_order_id", ""), "") if group_mode == "order" else ""
         delivery_date = pd.to_datetime(order_df["_delivery_date"], errors="coerce").max()
         for row in rows:
+            offer_qty = safe_float(row.get("_qty", 0), 0.0)
+            total_offer_qty_added += offer_qty
             offer_records.append(
                 {
                     "_route_agent": route_agent,
                     "_run": run_name,
                     "_order_id": order_id,
                     "_product": safe_str(row.get("_product", "Offer"), "Offer"),
-                    "_qty": safe_float(row.get("_qty", 0), 0.0),
+                    "_qty": offer_qty,
                     "_brand_raw": safe_str(row.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
                     "_size_raw": safe_str(row.get("_size_raw", ""), ""),
                     "_sku": normalize_sku(row.get("_sku", "")),
@@ -615,11 +622,16 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
     if not offer_records:
         if group_mode == "route-run":
             log_warning("Offer rows were computed by route/run because order_id was missing.")
+        if isinstance(config.bundle_offers, list) and config.bundle_offers:
+            log_warning("No bundle offer rows were added. Verify SKU/brand selectors match source data.")
         return df
 
     offers_df = pd.DataFrame(offer_records)
     if group_mode == "route-run":
         log_warning("Added offer rows using route/run fallback because order_id was missing.")
+    log_info(
+        f"Added {len(offers_df)} offer row(s) with total gift qty {total_offer_qty_added:.2f}."
+    )
     return pd.concat([df, offers_df], ignore_index=True, sort=False)
 
 
@@ -648,6 +660,19 @@ def find_existing_column(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optio
     for col in candidates:
         if col in df.columns:
             return col
+    normalized_index = {normalize_column_key(c): c for c in df.columns}
+    for col in candidates:
+        normalized_col = normalized_index.get(normalize_column_key(col))
+        if normalized_col:
+            return normalized_col
+    for col in candidates:
+        col_key = normalize_column_key(col)
+        if not col_key:
+            continue
+        for existing_col in df.columns:
+            existing_key = normalize_column_key(existing_col)
+            if col_key in existing_key:
+                return existing_col
     return None
 
 
