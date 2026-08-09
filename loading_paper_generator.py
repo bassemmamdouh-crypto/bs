@@ -45,7 +45,7 @@ class LoadingPaperConfig:
     route_agent_candidates: Tuple[str, ...] = ("route_agent", "driver")
     run_candidates: Tuple[str, ...] = ("run", "trip", "run_name")
     delivery_date_candidates: Tuple[str, ...] = ("estimated_delivery_date", "delivery_date")
-    brand_candidates: Tuple[str, ...] = ("brand_name",)
+    brand_candidates: Tuple[str, ...] = ("brand_name_en", "brand_name", "brand")
     size_candidates: Tuple[str, ...] = (
         "size",
         "pack_size",
@@ -79,6 +79,35 @@ class LoadingPaperConfig:
         "free_qty",
     )
 
+    # Preferred: define one or many bundle offers here.
+    # Each item:
+    # {
+    #   "active": True,
+    #   "source_skus": [...],                # optional
+    #   "source_brand_names": [...],         # optional (OR with source_skus)
+    #   "divisor": 6.0,
+    #   "gift_sku": "",
+    #   "gift_name": "Gift Name",
+    #   "gift_size": "",
+    #   # Optional condition:
+    #   "condition_source_skus": [...],      # optional
+    #   "condition_brand_names": [...],      # optional (OR with condition_source_skus)
+    #   "condition_min_qty": 5,
+    # }
+    bundle_offers: List[Dict[str, object]] = field(
+        default_factory=lambda: [
+            {
+                "active": True,
+                "source_skus": ["200", "201", "202", "203", "204", "205", "206", "207", "221"],
+                "divisor": 6.0,
+                "gift_sku": "",
+                "gift_name": "عصير يومي برتقال 200 مل * 36",
+                "gift_size": "200 مل",
+            }
+        ]
+    )
+    # Legacy single-bundle fields (kept for backward compatibility).
+    # If bundle_offers has entries, these legacy fields are ignored.
     bundle_offer_active: bool = True
     bundle_offer_source_skus: Tuple[str, ...] = ("200", "201", "202", "203", "204", "205", "206", "207", "221")
     bundle_offer_divisor: float = 6.0
@@ -180,6 +209,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "estimated_delivery_date": ["delivery_date"],
     "order_id": ["order_number", "orderid", "order_no"],
     "sku_code": ["sku", "product_id", "item_id", "sku_id", "product_code"],
+    "brand_name_en": ["brand_name", "brand"],
     "brand_name": ["brand"],
     "size": ["pack_size", "sku_size", "item_size", "variant_size"],
     "sku_name": ["item_name", "product_name", "product_name_ar", "item", "description"],
@@ -244,6 +274,10 @@ def normalize_brand_for_order(brand_value: object) -> str:
     return text
 
 
+def normalize_brand_key(value: object) -> str:
+    return normalize_brand_for_order(value)
+
+
 def normalize_size_for_order(size_value: object) -> str:
     return re.sub(r"\s+", " ", safe_str(size_value, "")).strip()
 
@@ -300,40 +334,138 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
                 }
             )
 
-    # C) Fixed bundle offer (same as invoice script logic).
-    if config.bundle_offer_active and config.bundle_offer_divisor > 0:
+    # C) Bundle offers:
+    # supports list-based bundle_offers plus legacy single-bundle fallback.
+    bundle_rows: List[Dict[str, object]] = []
+    for _, row in order_df.iterrows():
+        sku_value = normalize_sku(row.get("_sku", ""))
+        qty_value = safe_float(row.get("_qty", 0), 0.0)
+        if qty_value == 0:
+            continue
+        bundle_rows.append(
+            {
+                "sku": sku_value,
+                "qty": qty_value,
+                "brand_key": normalize_brand_key(row.get("_brand_raw", "")),
+            }
+        )
+
+    bundle_offers: List[Dict[str, object]] = []
+    if isinstance(config.bundle_offers, list) and config.bundle_offers:
+        bundle_offers = config.bundle_offers
+    elif config.bundle_offer_active and config.bundle_offer_divisor > 0:
+        bundle_offers = [
+            {
+                "active": True,
+                "source_skus": list(config.bundle_offer_source_skus),
+                "divisor": config.bundle_offer_divisor,
+                "gift_sku": config.bundle_offer_gift_sku,
+                "gift_name": config.bundle_offer_gift_name,
+                "gift_size": config.bundle_offer_gift_size,
+            }
+        ]
+
+    for bundle_offer in bundle_offers:
+        if not isinstance(bundle_offer, dict):
+            continue
+        if not bool(bundle_offer.get("active", True)):
+            continue
+
         source_skus = {
             normalize_sku(sku)
-            for sku in config.bundle_offer_source_skus
+            for sku in (bundle_offer.get("source_skus") or [])
             if normalize_sku(sku)
         }
-        combo_qty_total = sum(
-            qty for sku, qty in sku_qty_map.items()
-            if normalize_sku(sku) in source_skus
-        )
-        combo_gift_qty = 0
-        if combo_qty_total >= config.bundle_offer_divisor:
-            combo_gift_qty = math.floor(combo_qty_total / config.bundle_offer_divisor)
-        if combo_gift_qty > 0:
-            gift_name = safe_str(config.bundle_offer_gift_name, "Gift Item")
-            gift_sku = normalize_sku(config.bundle_offer_gift_sku)
-            gift_size = safe_str(config.bundle_offer_gift_size, "")
-            if gift_sku:
-                sku_rows = order_df[order_df["_sku"] == gift_sku]
-                if not sku_rows.empty:
-                    gift_name = safe_str(sku_rows.iloc[0].get("_product", gift_name), gift_name)
-                    gift_size = safe_str(sku_rows.iloc[0].get("_size_raw", gift_size), gift_size)
-                else:
-                    gift_name = f"SKU {gift_sku} - {gift_name}"
-            offer_rows.append(
-                {
-                    "_product": gift_name,
-                    "_qty": float(combo_gift_qty),
-                    "_brand_raw": config.offer_fallback_brand,
-                    "_size_raw": gift_size,
-                    "_sku": gift_sku,
-                }
+        source_brand_keys = {
+            normalize_brand_key(brand_name)
+            for brand_name in (bundle_offer.get("source_brand_names") or bundle_offer.get("source_brands") or [])
+            if normalize_brand_key(brand_name)
+        }
+        divisor = safe_float(bundle_offer.get("divisor", 0), 0.0)
+        if divisor <= 0 or (not source_skus and not source_brand_keys):
+            continue
+
+        condition_source_skus = {
+            normalize_sku(sku)
+            for sku in (
+                bundle_offer.get("condition_source_skus")
+                or bundle_offer.get("required_source_skus")
+                or bundle_offer.get("condition_skus")
+                or []
             )
+            if normalize_sku(sku)
+        }
+        condition_brand_keys = {
+            normalize_brand_key(brand_name)
+            for brand_name in (
+                bundle_offer.get("condition_brand_names")
+                or bundle_offer.get("condition_brands")
+                or []
+            )
+            if normalize_brand_key(brand_name)
+        }
+        condition_min_qty = safe_float(
+            bundle_offer.get("condition_min_qty", bundle_offer.get("required_min_qty", 0)),
+            0.0,
+        )
+        if condition_min_qty > 0:
+            if not condition_source_skus and not condition_brand_keys:
+                continue
+            condition_qty_total = sum(
+                safe_float(bundle_row.get("qty", 0), 0.0)
+                for bundle_row in bundle_rows
+                if (
+                    (
+                        bool(condition_source_skus)
+                        and safe_str(bundle_row.get("sku", ""), "") in condition_source_skus
+                    )
+                    or (
+                        bool(condition_brand_keys)
+                        and safe_str(bundle_row.get("brand_key", ""), "") in condition_brand_keys
+                    )
+                )
+            )
+            if condition_qty_total < condition_min_qty:
+                continue
+
+        combo_qty_total = sum(
+            safe_float(bundle_row.get("qty", 0), 0.0)
+            for bundle_row in bundle_rows
+            if (
+                (
+                    bool(source_skus)
+                    and safe_str(bundle_row.get("sku", ""), "") in source_skus
+                )
+                or (
+                    bool(source_brand_keys)
+                    and safe_str(bundle_row.get("brand_key", ""), "") in source_brand_keys
+                )
+            )
+        )
+        combo_gift_qty = math.floor(combo_qty_total / divisor)
+        if combo_gift_qty <= 0:
+            continue
+
+        gift_name = safe_str(bundle_offer.get("gift_name", "Gift Item"), "Gift Item")
+        gift_sku = normalize_sku(bundle_offer.get("gift_sku", ""))
+        gift_size = safe_str(bundle_offer.get("gift_size", ""), "")
+        if gift_sku:
+            sku_rows = order_df[order_df["_sku"] == gift_sku]
+            if not sku_rows.empty:
+                gift_name = safe_str(sku_rows.iloc[0].get("_product", gift_name), gift_name)
+                gift_size = safe_str(sku_rows.iloc[0].get("_size_raw", gift_size), gift_size)
+            else:
+                gift_name = f"SKU {gift_sku} - {gift_name}"
+
+        offer_rows.append(
+            {
+                "_product": gift_name,
+                "_qty": float(combo_gift_qty),
+                "_brand_raw": config.offer_fallback_brand,
+                "_size_raw": gift_size,
+                "_sku": gift_sku,
+            }
+        )
 
     # D) BUY 1 GET 1 SAME SKU (same as invoice script logic).
     same_sku_offer = {normalize_sku(sku) for sku in config.same_sku_offer_skus if normalize_sku(sku)}
