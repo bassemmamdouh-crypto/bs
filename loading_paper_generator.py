@@ -351,6 +351,8 @@ def normalize_brand_for_order(brand_value: object) -> str:
     # Keep brand_name-driven grouping, but normalize formatting for reliable ordering.
     text = safe_str(brand_value, "").lower().strip()
     text = text.replace("’", "'")
+    text = text.replace("_", " ")
+    text = text.replace("-", " ")
     text = re.sub(r"\s+", " ", text)
     text = text.replace("'", "")
     return text
@@ -723,6 +725,37 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
                         "_route_agent": route_agent,
                         "_run": run_name,
                         "_order_id": order_id,
+                        "_product": safe_str(row.get("_product", "Offer"), "Offer"),
+                        "_qty": offer_qty,
+                        "_brand_raw": safe_str(row.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
+                        "_size_raw": safe_str(row.get("_size_raw", ""), ""),
+                        "_sku": normalize_sku(row.get("_sku", "")),
+                        "_delivery_date": delivery_date,
+                        "_offer_item_name": "",
+                        "_offer_item_qty": 0.0,
+                    }
+                )
+
+    if not offer_records and has_non_empty_orders:
+        # Final fallback: if no order-level offers were generated at all, compute at route/run aggregate.
+        # This helps when threshold SKUs are split across many small orders on the same vehicle.
+        log_warning(
+            "No order-level offers were generated. Retrying bundle computation at route/run aggregate level."
+        )
+        for (route_agent, run_name), group_df in df.groupby(["_route_agent", "_run"], sort=False):
+            rows = build_offer_rows_for_order(group_df, config)
+            if not rows:
+                continue
+            delivery_date = pd.to_datetime(group_df["_delivery_date"], errors="coerce").max()
+            used_fallback_group = True
+            for row in rows:
+                offer_qty = safe_float(row.get("_qty", 0), 0.0)
+                total_offer_qty_added += offer_qty
+                offer_records.append(
+                    {
+                        "_route_agent": safe_str(route_agent, ""),
+                        "_run": safe_str(run_name, ""),
+                        "_order_id": "",
                         "_product": safe_str(row.get("_product", "Offer"), "Offer"),
                         "_qty": offer_qty,
                         "_brand_raw": safe_str(row.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
