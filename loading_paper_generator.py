@@ -693,12 +693,9 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
             )
         )
         if has_order_col and not df[df["_order_id"] == ""].empty:
-            # Include rows missing order_id via route/run fallback so they are not skipped.
-            grouped_batches.append(
-                (
-                    "route-run-missing-order-id",
-                    df[df["_order_id"] == ""].groupby(["_route_agent", "_run"], sort=False),
-                )
+            log_warning(
+                "Some rows have empty order_id. Those rows are excluded from offer qualification "
+                "because offers are computed per order, then summed in loading output."
             )
     else:
         # Fallback when order_id is missing: compute at route/run level so gifts are still visible.
@@ -736,42 +733,14 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
                     }
                 )
 
-    if not offer_records and has_non_empty_orders:
-        # Final fallback: if no order-level offers were generated at all, compute at route/run aggregate.
-        # This helps when threshold SKUs are split across many small orders on the same vehicle.
-        log_warning(
-            "No order-level offers were generated. Retrying bundle computation at route/run aggregate level."
-        )
-        for (route_agent, run_name), group_df in df.groupby(["_route_agent", "_run"], sort=False):
-            rows = build_offer_rows_for_order(group_df, config)
-            if not rows:
-                continue
-            delivery_date = pd.to_datetime(group_df["_delivery_date"], errors="coerce").max()
-            used_fallback_group = True
-            for row in rows:
-                offer_qty = safe_float(row.get("_qty", 0), 0.0)
-                total_offer_qty_added += offer_qty
-                offer_records.append(
-                    {
-                        "_route_agent": safe_str(route_agent, ""),
-                        "_run": safe_str(run_name, ""),
-                        "_order_id": "",
-                        "_product": safe_str(row.get("_product", "Offer"), "Offer"),
-                        "_qty": offer_qty,
-                        "_brand_raw": safe_str(row.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
-                        "_size_raw": safe_str(row.get("_size_raw", ""), ""),
-                        "_sku": normalize_sku(row.get("_sku", "")),
-                        "_delivery_date": delivery_date,
-                        "_offer_item_name": "",
-                        "_offer_item_qty": 0.0,
-                    }
-                )
-
     if not offer_records:
         if used_fallback_group or not has_non_empty_orders:
             log_warning("Offer rows were computed by route/run because order_id was missing.")
         if isinstance(config.bundle_offers, list) and config.bundle_offers:
-            log_warning("No bundle offer rows were added. Verify SKU/brand selectors match source data.")
+            log_warning(
+                "No bundle offer rows were added from qualified orders. "
+                "Verify selectors/conditions against per-order data."
+            )
         return df
 
     offers_df = pd.DataFrame(offer_records)
