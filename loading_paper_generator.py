@@ -269,6 +269,45 @@ def normalize_column_key(name: object) -> str:
     return re.sub(r"[^a-z0-9]", "", safe_str(name, "").lower())
 
 
+def extract_row_sku(row: pd.Series) -> str:
+    """
+    Resolve SKU robustly from normalized `_sku` first, then from any SKU-like raw source column.
+    This prevents bundle-offer misses when input headers vary unexpectedly.
+    """
+    direct = normalize_sku(row.get("_sku", ""))
+    if direct:
+        return direct
+
+    explicit_keys = {
+        "sku",
+        "skucode",
+        "skuid",
+        "productid",
+        "itemid",
+        "productcode",
+        "productsku",
+        "itemsku",
+    }
+    for key, value in row.items():
+        key_norm = normalize_column_key(key)
+        if not key_norm:
+            continue
+        looks_like_sku = (
+            key_norm in explicit_keys
+            or (key_norm.endswith("sku") and "name" not in key_norm)
+            or key_norm.endswith("skuid")
+            or key_norm.endswith("productid")
+            or key_norm.endswith("itemid")
+            or key_norm.endswith("productcode")
+        )
+        if not looks_like_sku:
+            continue
+        candidate = normalize_sku(value)
+        if candidate:
+            return candidate
+    return ""
+
+
 def normalize_brand_for_order(brand_value: object) -> str:
     # Keep brand_name-driven grouping, but normalize formatting for reliable ordering.
     text = safe_str(brand_value, "").lower().strip()
@@ -301,9 +340,10 @@ def aggregate_order_level_numeric(order_df: pd.DataFrame, column_name: str) -> f
 
 def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfig) -> List[Dict[str, object]]:
     offer_rows: List[Dict[str, object]] = []
+    effective_sku = order_df.apply(extract_row_sku, axis=1)
     sku_qty_map: Dict[str, float] = {}
-    for _, row in order_df.iterrows():
-        sku = normalize_sku(row.get("_sku", ""))
+    for idx, row in order_df.iterrows():
+        sku = safe_str(effective_sku.get(idx, ""), "")
         if not sku:
             continue
         qty = safe_float(row.get("_qty", 0), 0.0)
@@ -341,8 +381,8 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
     # C) Bundle offers:
     # supports list-based bundle_offers plus legacy single-bundle fallback.
     bundle_rows: List[Dict[str, object]] = []
-    for _, row in order_df.iterrows():
-        sku_value = normalize_sku(row.get("_sku", ""))
+    for idx, row in order_df.iterrows():
+        sku_value = safe_str(effective_sku.get(idx, ""), "")
         qty_value = safe_float(row.get("_qty", 0), 0.0)
         if qty_value == 0:
             continue
@@ -353,6 +393,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
                 "brand_key": normalize_brand_key(row.get("_brand_raw", "")),
             }
         )
+    has_any_bundle_sku = any(safe_str(bundle_row.get("sku", ""), "") for bundle_row in bundle_rows)
 
     bundle_offers: List[Dict[str, object]] = []
     if isinstance(config.bundle_offers, list) and config.bundle_offers:
@@ -385,6 +426,9 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
             for brand_name in (bundle_offer.get("source_brand_names") or bundle_offer.get("source_brands") or [])
             if normalize_brand_key(brand_name)
         }
+        if source_skus and not source_brand_keys and not has_any_bundle_sku:
+            log_warning("Bundle offer source SKUs configured, but no SKU values were resolved for current group.")
+            continue
         divisor = safe_float(bundle_offer.get("divisor", 0), 0.0)
         if divisor <= 0 or (not source_skus and not source_brand_keys):
             continue
@@ -454,7 +498,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
         gift_sku = normalize_sku(bundle_offer.get("gift_sku", ""))
         gift_size = safe_str(bundle_offer.get("gift_size", ""), "")
         if gift_sku:
-            sku_rows = order_df[order_df["_sku"] == gift_sku]
+            sku_rows = order_df[effective_sku == gift_sku]
             if not sku_rows.empty:
                 gift_name = safe_str(sku_rows.iloc[0].get("_product", gift_name), gift_name)
                 gift_size = safe_str(sku_rows.iloc[0].get("_size_raw", gift_size), gift_size)
@@ -474,7 +518,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
     # D) BUY 1 GET 1 SAME SKU (same as invoice script logic).
     same_sku_offer = {normalize_sku(sku) for sku in config.same_sku_offer_skus if normalize_sku(sku)}
     for sku in sorted(same_sku_offer):
-        sku_rows = order_df[order_df["_sku"].apply(normalize_sku) == sku]
+        sku_rows = order_df[effective_sku == sku]
         if sku_rows.empty:
             continue
         total_qty = safe_float(sku_rows["_qty"].sum(), 0.0)
@@ -504,7 +548,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
             multiplier = math.floor(bought / rule.buy_qty)
             if multiplier > 0:
                 gift_qty = multiplier * rule.gift_qty
-                buy_rows = order_df[order_df["_sku"].apply(normalize_sku) == buy_sku]
+                buy_rows = order_df[effective_sku == buy_sku]
                 fallback_name = safe_str(rule.gift_name, "") or f"Offer Gift SKU {buy_sku}"
                 inferred_name = (
                     safe_str(buy_rows.iloc[0].get("_product", fallback_name), fallback_name)
@@ -536,7 +580,7 @@ def build_offer_rows_for_order(order_df: pd.DataFrame, config: LoadingPaperConfi
             multiplier = math.floor(bought / rule.buy_qty)
             if multiplier > 0:
                 gift_qty = multiplier * rule.gift_qty
-                gift_rows = order_df[order_df["_sku"].apply(normalize_sku) == gift_sku]
+                gift_rows = order_df[effective_sku == gift_sku]
                 fallback_name = safe_str(rule.gift_name, "") or f"Offer Gift SKU {gift_sku}"
                 inferred_name = (
                     safe_str(gift_rows.iloc[0].get("_product", fallback_name), fallback_name)
@@ -583,51 +627,69 @@ def append_offer_quantities(df: pd.DataFrame, config: LoadingPaperConfig) -> pd.
         return df
 
     offer_records: List[Dict[str, object]] = []
-    if "_order_id" in df.columns and not df[df["_order_id"] != ""].empty:
-        grouped_iter = df[df["_order_id"] != ""].groupby(["_route_agent", "_run", "_order_id"], sort=False)
-        group_mode = "order"
+    has_order_col = "_order_id" in df.columns
+    has_non_empty_orders = has_order_col and not df[df["_order_id"] != ""].empty
+    grouped_batches: List[Tuple[str, object]] = []
+    if has_non_empty_orders:
+        grouped_batches.append(
+            (
+                "order",
+                df[df["_order_id"] != ""].groupby(["_route_agent", "_run", "_order_id"], sort=False),
+            )
+        )
+        if has_order_col and not df[df["_order_id"] == ""].empty:
+            # Include rows missing order_id via route/run fallback so they are not skipped.
+            grouped_batches.append(
+                (
+                    "route-run-missing-order-id",
+                    df[df["_order_id"] == ""].groupby(["_route_agent", "_run"], sort=False),
+                )
+            )
     else:
         # Fallback when order_id is missing: compute at route/run level so gifts are still visible.
-        grouped_iter = df.groupby(["_route_agent", "_run"], sort=False)
-        group_mode = "route-run"
+        grouped_batches.append(("route-run", df.groupby(["_route_agent", "_run"], sort=False)))
 
     total_offer_qty_added = 0.0
-    for group_key, order_df in grouped_iter:
-        rows = build_offer_rows_for_order(order_df, config)
-        if not rows:
-            continue
-        route_agent = safe_str(order_df.iloc[0].get("_route_agent", ""), "")
-        run_name = safe_str(order_df.iloc[0].get("_run", ""), "")
-        order_id = safe_str(order_df.iloc[0].get("_order_id", ""), "") if group_mode == "order" else ""
-        delivery_date = pd.to_datetime(order_df["_delivery_date"], errors="coerce").max()
-        for row in rows:
-            offer_qty = safe_float(row.get("_qty", 0), 0.0)
-            total_offer_qty_added += offer_qty
-            offer_records.append(
-                {
-                    "_route_agent": route_agent,
-                    "_run": run_name,
-                    "_order_id": order_id,
-                    "_product": safe_str(row.get("_product", "Offer"), "Offer"),
-                    "_qty": offer_qty,
-                    "_brand_raw": safe_str(row.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
-                    "_size_raw": safe_str(row.get("_size_raw", ""), ""),
-                    "_sku": normalize_sku(row.get("_sku", "")),
-                    "_delivery_date": delivery_date,
-                    "_offer_item_name": "",
-                    "_offer_item_qty": 0.0,
-                }
-            )
+    used_fallback_group = False
+    for group_mode, grouped_iter in grouped_batches:
+        for group_key, order_df in grouped_iter:
+            rows = build_offer_rows_for_order(order_df, config)
+            if not rows:
+                continue
+            route_agent = safe_str(order_df.iloc[0].get("_route_agent", ""), "")
+            run_name = safe_str(order_df.iloc[0].get("_run", ""), "")
+            order_id = safe_str(order_df.iloc[0].get("_order_id", ""), "") if group_mode == "order" else ""
+            delivery_date = pd.to_datetime(order_df["_delivery_date"], errors="coerce").max()
+            if group_mode != "order":
+                used_fallback_group = True
+            for row in rows:
+                offer_qty = safe_float(row.get("_qty", 0), 0.0)
+                total_offer_qty_added += offer_qty
+                offer_records.append(
+                    {
+                        "_route_agent": route_agent,
+                        "_run": run_name,
+                        "_order_id": order_id,
+                        "_product": safe_str(row.get("_product", "Offer"), "Offer"),
+                        "_qty": offer_qty,
+                        "_brand_raw": safe_str(row.get("_brand_raw", config.offer_fallback_brand), config.offer_fallback_brand),
+                        "_size_raw": safe_str(row.get("_size_raw", ""), ""),
+                        "_sku": normalize_sku(row.get("_sku", "")),
+                        "_delivery_date": delivery_date,
+                        "_offer_item_name": "",
+                        "_offer_item_qty": 0.0,
+                    }
+                )
 
     if not offer_records:
-        if group_mode == "route-run":
+        if used_fallback_group or not has_non_empty_orders:
             log_warning("Offer rows were computed by route/run because order_id was missing.")
         if isinstance(config.bundle_offers, list) and config.bundle_offers:
             log_warning("No bundle offer rows were added. Verify SKU/brand selectors match source data.")
         return df
 
     offers_df = pd.DataFrame(offer_records)
-    if group_mode == "route-run":
+    if used_fallback_group or not has_non_empty_orders:
         log_warning("Added offer rows using route/run fallback because order_id was missing.")
     log_info(
         f"Added {len(offers_df)} offer row(s) with total gift qty {total_offer_qty_added:.2f}."
@@ -980,6 +1042,15 @@ def load_orders_dataframe(config: LoadingPaperConfig) -> pd.DataFrame:
         raise ValueError(
             "Missing required columns for loading paper generation. "
             "Need route_agent/driver, run/trip, product name, and quantity."
+        )
+    log_info(
+        "Resolved columns | "
+        f"route={route_col}, run={run_col}, product={product_col}, qty={qty_col}, "
+        f"order_id={order_id_col}, sku={sku_col}, brand={brand_col}, size={size_col}"
+    )
+    if sku_col is None:
+        log_warning(
+            "SKU column was not explicitly matched. Offers will attempt SKU fallback from any SKU-like columns."
         )
 
     brand_rank_map = {
