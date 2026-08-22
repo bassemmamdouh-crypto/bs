@@ -847,28 +847,40 @@ def adjust_loading_capacity(ws: xw.Sheet, required_rows: int, config: LoadingPap
     requested_shift = target - base_capacity
 
     if requested_shift > 0:
-        inserted = 0
-        for _ in range(requested_shift):
-            try:
-                ws.api.Rows(config.summary_anchor_row).Insert()
-                inserted += 1
-            except Exception as exc:
-                log_warning(f"Unable to insert extra loading rows before summary: {exc}")
-                break
-        return inserted
+        try:
+            insert_end = config.summary_anchor_row + requested_shift - 1
+            ws.api.Rows(f"{config.summary_anchor_row}:{insert_end}").Insert()
+            return requested_shift
+        except Exception as exc:
+            log_warning(f"Bulk insert failed; falling back to row insert loop: {exc}")
+            inserted = 0
+            for _ in range(requested_shift):
+                try:
+                    ws.api.Rows(config.summary_anchor_row).Insert()
+                    inserted += 1
+                except Exception as row_exc:
+                    log_warning(f"Unable to insert extra loading rows before summary: {row_exc}")
+                    break
+            return inserted
 
     if requested_shift < 0:
         delete_count = abs(requested_shift)
         delete_start_row = config.start_row + target
-        deleted = 0
-        for _ in range(delete_count):
-            try:
-                ws.api.Rows(delete_start_row).Delete()
-                deleted += 1
-            except Exception as exc:
-                log_warning(f"Unable to delete unused loading row before summary: {exc}")
-                break
-        return -deleted
+        delete_end_row = delete_start_row + delete_count - 1
+        try:
+            ws.api.Rows(f"{delete_start_row}:{delete_end_row}").Delete()
+            return -delete_count
+        except Exception as exc:
+            log_warning(f"Bulk delete failed; falling back to row delete loop: {exc}")
+            deleted = 0
+            for _ in range(delete_count):
+                try:
+                    ws.api.Rows(delete_start_row).Delete()
+                    deleted += 1
+                except Exception as row_exc:
+                    log_warning(f"Unable to delete unused loading row before summary: {row_exc}")
+                    break
+            return -deleted
 
     return 0
 
@@ -1193,7 +1205,9 @@ def generate_loading_papers() -> None:
         existing_sheet_names = set()
 
         grouped = df.groupby(["_route_agent", "_run"], sort=True)
-        for (route_agent, run_name), group_df in grouped:
+        total_groups = grouped.ngroups
+        for idx, ((route_agent, run_name), group_df) in enumerate(grouped, start=1):
+            log_info(f"Generating loading sheet {idx}/{total_groups} for route '{route_agent}' run '{run_name}'.")
             new_ws = copy_sheet(template_ws, output_wb, "TempSheet")
             if new_ws is None:
                 log_warning(f"Could not create loading sheet for route '{route_agent}' run '{run_name}'.")
