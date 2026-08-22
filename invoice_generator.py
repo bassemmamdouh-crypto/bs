@@ -72,12 +72,12 @@ class ScriptConfig:
         default_factory=lambda: ["supply_chain", "supply chain", "supply_chain_name", "supplychain"]
     )
     target_sections: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS", "MARAII"])
-    target_supply_chains: List[str] = field(default_factory=lambda: ["PEPSI", "LAYS", "MARAII"])
+    # Primary supply-chain split mode (e.g. CSDS, CHIPS).
+    target_supply_chains: List[str] = field(default_factory=lambda: ["CSDS", "CHIPS"])
     supply_chain_section_map: Dict[str, List[str]] = field(
         default_factory=lambda: {
-            "PEPSI": ["PEPSI"],
-            "LAYS": ["LAYS"],
-            "MARAII": ["MARAII"],
+            "CSDS": ["CSDS", "PEPSI"],
+            "CHIPS": ["CHIPS", "LAYS", "MARAII"],
         }
     )
     other_section_name: str = "OTHER"
@@ -450,7 +450,22 @@ def build_supply_chain_lookup(config: ScriptConfig) -> Dict[str, str]:
     return lookup
 
 
-def get_target_sections(config: ScriptConfig) -> List[str]:
+def get_available_groups_from_data(prepared_df: Optional[pd.DataFrame], config: ScriptConfig) -> List[str]:
+    if prepared_df is None or "_section_group" not in prepared_df.columns:
+        return []
+    available: List[str] = []
+    seen = set()
+    for value in prepared_df["_section_group"].dropna().tolist():
+        normalized = normalize_supply_chain_name(value, config) if config.target_by_supply_chain else normalize_section_name(value, config)
+        if not normalized or normalized == config.other_section_name:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            available.append(normalized)
+    return available
+
+
+def get_target_sections(config: ScriptConfig, prepared_df: Optional[pd.DataFrame] = None) -> List[str]:
     target_sections: List[str] = []
     seen_sections = set()
 
@@ -477,8 +492,22 @@ def get_target_sections(config: ScriptConfig) -> List[str]:
                 seen_sections.add(normalized)
                 target_sections.append(normalized)
 
+    available_from_data = get_available_groups_from_data(prepared_df, config)
+    if available_from_data:
+        if not target_sections:
+            return available_from_data
+        available_keys = {normalize_group_key(val) for val in available_from_data}
+        matched = [sec for sec in target_sections if normalize_group_key(sec) in available_keys]
+        if matched:
+            return matched
+        log_warning(
+            "Configured target supply chains/sections were not found in data. "
+            f"Using detected groups instead: {', '.join(available_from_data)}"
+        )
+        return available_from_data
+
     if not target_sections:
-        return ["PEPSI", "LAYS", "MARAII"]
+        return ["CSDS", "CHIPS"] if config.target_by_supply_chain else ["PEPSI", "LAYS", "MARAII"]
     return target_sections
 
 
@@ -1430,7 +1459,7 @@ def process_area_summary(area_value: str, area_df: pd.DataFrame, app: xw.App, co
         return None
 
     area_df = prepare_area_sections(area_df, config)
-    target_sections = get_target_sections(config)
+    target_sections = get_target_sections(config, area_df)
     summary_invoice_count = 0
     summary_total_qty = 0.0
     summary_total_prices = 0.0
@@ -1513,7 +1542,7 @@ def process_area_order_workbooks(
     area_df = prepare_area_sections(area_df, config)
     area_df["_order_key"] = area_df[config.order_id_column].apply(lambda x: normalize_identifier(x, ""))
     area_df = area_df[area_df["_order_key"] != ""].copy()
-    target_sections = get_target_sections(config)
+    target_sections = get_target_sections(config, area_df)
     area_ctx = area_output_context(area_df, area_value, config)
     latest_delivery_date = area_ctx["latest_delivery_date"]
     output_dir = area_ctx["output_dir"]
