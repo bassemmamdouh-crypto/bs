@@ -822,13 +822,16 @@ def copy_sheet(template_ws: xw.Sheet, output_wb: xw.Book, temp_sheet_name: str) 
 
 def make_unique_sheet_name(base_name: str, existing_names: set) -> str:
     clean = re.sub(r"[\[\]\*\/\\\?\:]", "", safe_str(base_name, "LOAD"))[:25]
-    candidate = f"LOAD_{clean}" if clean else "LOAD"
+    base = f"LOAD_{clean}" if clean else "LOAD"
+    candidate = base[:31]
     i = 1
     while candidate in existing_names:
-        candidate = f"LOAD_{clean}_{i}"[:31]
+        suffix = f"_{i}"
+        trim_len = max(0, 31 - len(suffix))
+        candidate = f"{base[:trim_len]}{suffix}"[-31:]
         i += 1
     existing_names.add(candidate)
-    return candidate[:31]
+    return candidate
 
 
 def adjust_loading_capacity(ws: xw.Sheet, required_rows: int, config: LoadingPaperConfig) -> int:
