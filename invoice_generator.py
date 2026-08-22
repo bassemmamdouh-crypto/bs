@@ -45,6 +45,15 @@ class OfferRule:
     min_subtotal: float = 0.0
     discount_amount: float = 0.0
     discount_percent: float = 0.0
+    # Optional scope filters for where this offer rule applies.
+    include_warehouses: List[str] = field(default_factory=list)
+    exclude_warehouses: List[str] = field(default_factory=list)
+    include_retailer_segments: List[str] = field(default_factory=list)
+    exclude_retailer_segments: List[str] = field(default_factory=list)
+    include_areas: List[str] = field(default_factory=list)
+    exclude_areas: List[str] = field(default_factory=list)
+    include_supply_chains: List[str] = field(default_factory=list)
+    exclude_supply_chains: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,6 +95,12 @@ class ScriptConfig:
     # per_order_section_workbooks: up to two workbooks per area (PEPSI and LAYS),
     # each workbook contains one invoice sheet per order.
     create_empty_summary_sections: bool = True
+    warehouse_column_candidates: List[str] = field(
+        default_factory=lambda: ["warehouse", "warehouse_name", "warehouse_code", "depot", "wh"]
+    )
+    retailer_segment_column_candidates: List[str] = field(
+        default_factory=lambda: ["retailer_segment", "segment", "customer_segment", "channel", "retailer_type"]
+    )
 
     # Header fields (from first row of each order)
     retailer_column_candidates: List[str] = field(default_factory=lambda: ["retailer_name", "customer_name", "customer"])
@@ -164,6 +179,15 @@ class ScriptConfig:
     #   "condition_source_skus": [...],
     #   "condition_brand_names": [...],  # optional, OR with condition_source_skus
     #   "condition_min_qty": 5,
+    #   # Optional scope filters (include/exclude):
+    #   # "include_warehouses": ["WH1", "MAIN"],
+    #   # "exclude_warehouses": ["CLEARANCE"],
+    #   # "include_retailer_segments": ["GROCERY", "WHOLESALE"],
+    #   # "exclude_retailer_segments": ["VIP"],
+    #   # "include_areas": ["AGENT_A"],          # uses `area_column` values
+    #   # "exclude_areas": ["AGENT_B"],
+    #   # "include_supply_chains": ["CSDS"],
+    #   # "exclude_supply_chains": ["CHIPS"],
     # }
     bundle_offers: List[Dict[str, object]] = field(
         default_factory=lambda: [
@@ -247,6 +271,8 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     "route_agent": ["driver"],
     "section": ["section_name", "business_unit", "category", "division"],
     "supply_chain": ["supply chain", "supply_chain_name", "supplychain"],
+    "warehouse": ["warehouse_name", "warehouse_code", "depot", "wh"],
+    "retailer_segment": ["segment", "customer_segment", "channel", "retailer_type"],
     "sku_name": ["item_name", "product_name", "item", "description"],
     "sku_code": ["sku", "product_code", "sku_id"],
     "price_befor_discount": ["price_before_discount"],
@@ -277,6 +303,8 @@ OPTIONAL_COLUMNS_DEFAULTS: Dict[str, object] = {
     "sku_code": "",
     "section": "",
     "supply_chain": "",
+    "warehouse": "",
+    "retailer_segment": "",
     "price_befor_discount": 0,
     "total_discount": 0,
 }
@@ -431,6 +459,107 @@ def normalize_supply_chain_name(value: object, config: ScriptConfig) -> str:
 
 def normalize_group_key(value: object) -> str:
     return re.sub(r"\s+", " ", safe_str(value, "").strip().upper())
+
+
+def split_scope_values(value: object) -> List[str]:
+    if value is None:
+        return []
+    raw_values: List[object]
+    if isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        raw_values = [value]
+
+    parsed: List[str] = []
+    seen = set()
+    for raw in raw_values:
+        text = safe_str(raw, "")
+        if not text:
+            continue
+        for part in re.split(r"[,;\n\r\t|]+", text):
+            normalized = normalize_group_key(part)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            parsed.append(normalized)
+    return parsed
+
+
+def get_scope_values(scope_source: object, aliases: List[str]) -> List[str]:
+    merged: List[str] = []
+    seen = set()
+    for key in aliases:
+        raw_value = None
+        if isinstance(scope_source, dict):
+            raw_value = scope_source.get(key)
+        else:
+            raw_value = getattr(scope_source, key, None)
+        for value in split_scope_values(raw_value):
+            if value in seen:
+                continue
+            seen.add(value)
+            merged.append(value)
+    return merged
+
+
+def build_order_offer_scope(order_df: pd.DataFrame, config: ScriptConfig) -> Dict[str, str]:
+    return {
+        "warehouse": normalize_group_key(first_row_value(order_df, config.warehouse_column_candidates, "")),
+        "retailer_segment": normalize_group_key(
+            first_row_value(order_df, config.retailer_segment_column_candidates, "")
+        ),
+        "area": normalize_group_key(first_row_value(order_df, [config.area_column], "")),
+        "supply_chain": normalize_group_key(first_row_value(order_df, config.supply_chain_column_candidates, "")),
+        "section": normalize_group_key(first_row_value(order_df, config.section_column_candidates, "")),
+    }
+
+
+def scope_dimension_allows(current_value: str, include_values: List[str], exclude_values: List[str]) -> bool:
+    include_set = set(include_values)
+    exclude_set = set(exclude_values)
+    if include_set and (not current_value or current_value not in include_set):
+        return False
+    if exclude_set and current_value and current_value in exclude_set:
+        return False
+    return True
+
+
+def offer_applies_to_scope(scope_source: object, order_scope: Dict[str, str]) -> bool:
+    scope_checks = [
+        (
+            "warehouse",
+            ["include_warehouses", "warehouses", "warehouse_names"],
+            ["exclude_warehouses", "skip_warehouses", "disabled_warehouses"],
+        ),
+        (
+            "retailer_segment",
+            ["include_retailer_segments", "include_segments", "retailer_segments", "segments"],
+            ["exclude_retailer_segments", "exclude_segments", "skip_segments"],
+        ),
+        (
+            "area",
+            ["include_areas", "include_area_values", "include_sales_agents", "include_routes"],
+            ["exclude_areas", "exclude_area_values", "exclude_sales_agents", "exclude_routes"],
+        ),
+        (
+            "supply_chain",
+            ["include_supply_chains", "include_supplychain", "supply_chains"],
+            ["exclude_supply_chains", "exclude_supplychain"],
+        ),
+        (
+            "section",
+            ["include_sections", "sections"],
+            ["exclude_sections"],
+        ),
+    ]
+    for dimension, include_aliases, exclude_aliases in scope_checks:
+        include_values = get_scope_values(scope_source, include_aliases)
+        exclude_values = get_scope_values(scope_source, exclude_aliases)
+        if not include_values and not exclude_values:
+            continue
+        if not scope_dimension_allows(order_scope.get(dimension, ""), include_values, exclude_values):
+            return False
+    return True
 
 
 def build_supply_chain_lookup(config: ScriptConfig) -> Dict[str, str]:
@@ -891,6 +1020,7 @@ def apply_offer_rules(
     offer_lines: List[Dict[str, object]] = []
     discount_total = 0.0
     sku_qty_map = quantity_by_sku(order_df, config)
+    order_scope = build_order_offer_scope(order_df, config)
 
     # A) Offer/gift columns in dataframe (safe if missing)
     for gift_col in config.gift_qty_columns:
@@ -968,6 +1098,8 @@ def apply_offer_rules(
             ]
 
     for bundle_offer in bundle_offers:
+        if not offer_applies_to_scope(bundle_offer, order_scope):
+            continue
         source_skus = {
             normalize_sku(sku)
             for sku in (bundle_offer.get("source_skus", []) if isinstance(bundle_offer, dict) else [])
@@ -1107,6 +1239,8 @@ def apply_offer_rules(
     # D) Configured rule-engine offers
     for rule in config.offer_rules:
         if not rule.active:
+            continue
+        if not offer_applies_to_scope(rule, order_scope):
             continue
 
         if rule.rule_type == "buy_qty_get_free_same_sku":
