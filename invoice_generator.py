@@ -60,7 +60,7 @@ class ScriptConfig:
     )
 
     # Grouping
-    area_column: str = "route"
+    area_column: str = "sales_agent"
     order_id_column: str = "order_id"
     delivery_date_column: str = "estimated_delivery_date"
     split_by_section: bool = True
