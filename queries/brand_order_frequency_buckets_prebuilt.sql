@@ -1,10 +1,12 @@
 -- Order-frequency buckets per brand section (Metabase, PostgreSQL).
 --
--- Optimized rewrite of the original report. Same output; see
--- queries/README.md for the reasoning and the measured speed-up.
+-- Same report as brand_order_frequency_buckets.sql, but reading the section
+-- flags from materialized_views.polygon_brand_sections instead of deriving
+-- them from the whole order history on every run. Create that view with
+-- polygon_brand_sections_mv.sql and refresh it on a schedule.
 --
--- The base CTE is called base_retailers, not retailers: the original name
--- shadowed the physical `retailers` table, which reads as a self-reference.
+-- The two files are otherwise identical. Use the other one if you need the
+-- flags to always reflect the live tables.
 
 WITH base_retailers AS (
     -- One row per (retailer, polygon). DISTINCT collapses the duplicates the
@@ -31,45 +33,8 @@ WITH base_retailers AS (
       [[AND st.route = {{route}} ]]
 ),
 
--- Historical brand flags per retailer. Aggregating the fact table on its own
--- and joining afterwards avoids replaying every order line once per
--- address/polygon row of its retailer.
---
--- The EXISTS runs against base_retailers rather than a DISTINCT-ed CTE of it:
--- SELECT DISTINCT over a CTE gives the planner a fixed 200-row guess, which
--- was enough to make it pick a per-retailer nested loop over the fact table.
-retailer_history AS (
-    SELECT
-        so.retailer_id,
-        bool_or(so.brand_id IN (3,4,5,23,24,25,26,27,28)) AS has_lays,
-        bool_or(so.brand_id IN (8,9,10))                  AS has_pepsi,
-        bool_or(so.brand_id IN (1,2,6))                   AS has_alyoum,
-        bool_or(so.brand_id BETWEEN 11 AND 22)            AS has_maraii
-    FROM {{#417-products-sales-order-data}} so
-    WHERE EXISTS (
-        SELECT 1 FROM base_retailers b WHERE b.retailer_id = so.retailer_id
-    )
-    GROUP BY so.retailer_id
-),
-
-historical_section_flags AS (
-    SELECT
-        b.polygon_name,
-        bool_or(h.has_lays)   AS has_lays_section,
-        bool_or(h.has_pepsi)  AS has_pepsi_section,
-        bool_or(h.has_alyoum) AS has_alyoum_section,
-        bool_or(h.has_maraii) AS has_maraii_section
-    FROM base_retailers b
-    JOIN retailer_history h ON h.retailer_id = b.retailer_id
-    GROUP BY b.polygon_name
-),
-
 -- One row per order in the reporting window, so the seven
 -- COUNT(DISTINCT sales_order_id) below become plain counts.
---
--- This replaces the original current_orders + order_level pair: the DISTINCT
--- there only removed rows that bool_or and GROUP BY ignore anyway, so it was a
--- full extra dedup pass over the whole date range for nothing.
 order_flags AS (
     SELECT
         so.retailer_id,
@@ -81,12 +46,6 @@ order_flags AS (
         bool_or(so.brand_id IN (1,2,6))                   AS is_alyoum,
         bool_or(so.brand_id BETWEEN 11 AND 22)            AS is_maraii
     FROM {{#417-products-sales-order-data}} so
-    -- No retailer restriction here on purpose. The original joined the base
-    -- CTE at this point, but `combined` already discards retailers outside the
-    -- base universe, so filtering here changes nothing -- and doing it means
-    -- the planner drives the fact table by retailer_id, which turns the date
-    -- range into millions of single-row heap lookups.
-    --
     -- Sargable range predicate: no cast on created_at, so an index on
     -- created_at can be used. Keep this on one line for the [[ ... --]] trick.
     WHERE [[so.created_at >= {{Start_date}}::date AND so.created_at < {{end_date}}::date + 1 --]] so.created_at >= date_trunc('month', current_date)
@@ -94,8 +53,6 @@ order_flags AS (
     GROUP BY 1, 2
 ),
 
--- Frequencies depend only on the retailer, so they are computed once per
--- retailer rather than once per (retailer, polygon) group.
 retailer_frequency AS (
     SELECT
         retailer_id,
@@ -110,19 +67,6 @@ retailer_frequency AS (
     GROUP BY 1
 ),
 
--- One row per retailer, carrying two things per brand column: whether the
--- retailer belongs to the section at all (which is what makes a bucket row
--- appear), and whether it is counted in it.
---
--- The original counted
---   COUNT(DISTINCT CASE WHEN brand IN ('PEPSI','AQUAFINA','ALYOUM')
---                       THEN pepsi_retailers ELSE retailer_id END)
--- over one row per (retailer, polygon). pepsi_retailers is either the
--- retailer's own id or NULL, and NULLs are not counted, so for those three
--- brands a retailer is counted only when the SAME polygon row is both
--- in-section and outside districts 13/14/15/32 -- the *_counts flags below.
--- The section flags are kept separately because a group whose ids are all NULL
--- still appears in the original's output, with a count of 0.
 retailer_eligibility AS (
     SELECT
         b.retailer_id,
@@ -133,11 +77,11 @@ retailer_eligibility AS (
         bool_or(hf.has_pepsi_section  AND b.pepsi_retailers IS NOT NULL) AS pepsi_counts,
         bool_or(hf.has_alyoum_section AND b.pepsi_retailers IS NOT NULL) AS alyoum_counts
     FROM base_retailers b
-    LEFT JOIN historical_section_flags hf ON hf.polygon_name = b.polygon_name
+    LEFT JOIN materialized_views.polygon_brand_sections hf
+        ON hf.polygon_name = b.polygon_name
     GROUP BY b.retailer_id
 ),
 
--- One pass instead of seven UNION ALL branches over the same rows.
 unpivoted AS (
     SELECT v.brand, v.freq, v.counts
     FROM retailer_eligibility e

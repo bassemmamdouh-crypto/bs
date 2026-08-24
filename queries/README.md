@@ -8,7 +8,9 @@ Both keep the original output; the only intentional difference anywhere is
 | --- | --- |
 | `monthly_active_retailers_by_brand.sql` | Per month: base retailer universe, brand-active retailers, NMV |
 | `brand_order_frequency_buckets.sql` | Retailers per brand section bucketed by order frequency |
-| `recommended_indexes.sql` | Supporting indexes for both |
+| `brand_order_frequency_buckets_prebuilt.sql` | The same report, ~2.5x faster again, reading precomputed section flags |
+| `polygon_brand_sections_mv.sql` | Materialized view the `_prebuilt` variant reads |
+| `recommended_indexes.sql` | Supporting indexes |
 
 ## Benchmark environment
 
@@ -154,14 +156,16 @@ Output is byte-identical to the original in every parameter combination tested.
 - Drops the `current_orders`/`order_level` dedup pass entirely: `DISTINCT`
   there only removed rows that `bool_or` and `GROUP BY` ignore anyway.
 - Computes frequencies **once per retailer**, then joins to the (retailer,
-  polygon) rows, preserving the per-row correlation the final `COUNT(DISTINCT
-  CASE ... pepsi_retailers ... END)` depends on.
+  polygon) rows.
+- Collapses to **one row per retailer** before the unpivot, so the final
+  aggregate is a plain `count(*) FILTER (...)` instead of a `COUNT(DISTINCT)`
+  that had to sort every (retailer, polygon, brand) combination. See
+  [the zero-count subtlety](#the-zero-count-subtlety) for what that has to
+  preserve.
 - Deduplicates the base CTE with `DISTINCT`, which the original's `GROUP BY`
   did later anyway.
 - Replaces the seven-branch `UNION ALL` with one `CROSS JOIN LATERAL (VALUES
-  ...)`, so `combined` is scanned once. The counted-id column in that list
-  reproduces the original's
-  `CASE WHEN brand IN ('PEPSI','AQUAFINA','ALYOUM') THEN pepsi_retailers ELSE retailer_id END`.
+  ...)`, so the rows are scanned once.
 - Makes the date filter sargable, and renames the base CTE to
   `base_retailers`.
 - Adds `frequency_bucket` to the `ORDER BY`. The original leaves ordering
@@ -170,27 +174,72 @@ Output is byte-identical to the original in every parameter combination tested.
 
 ### Measured
 
-| Scenario | Original | Rewrite | |
-| --- | --- | --- | --- |
-| Default (current month) | 22.2 s | **10.5 s** | 2.1x |
-| 4-month range | 26.2 s | **15.6 s** | 1.7x |
-| `area` set | 12.5 s | **4.1 s** | 3.1x |
-| `route` set | 2.5 s | 2.7 s | parity |
-| `warehouse` set | 19.2 s | **8.8 s** | 2.2x |
-| `area` + `warehouse` | 5.3 s | **2.5 s** | 2.1x |
+All with the recommended indexes. Run-to-run variation is around 10%.
 
-With the fact-table indexes dropped, the same scenarios run 23.7 / 27.3 / 21.0 /
-19.6 / 21.6 / 13.3 s for the original and 20.5 / 24.5 / 10.2 / 6.8 / 19.4 /
-7.0 s for the rewrite. **This report needs `idx_sales_order_retailer_brand`**:
-its section flags are derived from the entire order history, so without that
-index both versions spend most of their time reading the whole table, and the
-rewrite's advantage in the unfiltered cases largely disappears.
+| Scenario | Original | Rewrite | Rewrite + precomputed flags |
+| --- | --- | --- | --- |
+| Default (current month) | 21.9 s | 8.9 s | **3.6 s** |
+| 4-month range | 26.1 s | 14.0 s | **8.7 s** |
+| `area` set | 12.5 s | 3.8 s | **2.7 s** |
+| `route` set | 2.3 s | 2.7 s | 2.4 s |
+| `warehouse` set | 19.1 s | 7.6 s | **1.8 s** |
+| `area` + `warehouse` | 5.0 s | 2.3 s | **0.8 s** |
+
+With the fact-table indexes dropped, the first two columns run 23.7 / 27.3 /
+21.0 / 19.6 / 21.6 / 13.3 s and 20.5 / 24.5 / 10.2 / 6.8 / 19.4 / 7.0 s.
+**Without precomputed flags this report needs
+`idx_sales_order_retailer_brand`**: the section flags come from the entire
+order history, so otherwise both versions spend most of their time reading the
+whole table.
+
+### Precomputed section flags
+
+`brand_order_frequency_buckets_prebuilt.sql` reads
+`materialized_views.polygon_brand_sections` (built by
+`polygon_brand_sections_mv.sql`) instead of deriving the section flags inline.
+
+That step is worth removing because it reads **every order line ever recorded**
+on every run — no date bound — to produce a few hundred rows. In the default
+scenario it was 10.8 s of a 16 s plan: a full 57M-row index-only scan feeding a
+merge join that emitted 39.6M rows.
+
+The flags also do not depend on any report parameter. `area` and `route` filter
+which polygons survive, not which retailers feed a surviving polygon's flags,
+so one view serves every parameter combination — confirmed by the equivalence
+run below, where the filtered scenarios match exactly.
+
+The cost is staleness: a polygon recording its very first order of a brand
+section, or a retailer newly linked to a polygon, shows up only after the next
+refresh. The flags are monotonic and slow moving, so a nightly
+`REFRESH MATERIALIZED VIEW CONCURRENTLY` is normally enough. Building the view
+from scratch took 6 s on the benchmark data. If you need always-live flags, use
+`brand_order_frequency_buckets.sql`.
 
 ### Verified
 
 Output compared row for row (sorted, since the original's within-brand order is
 unspecified) with no parameters, a 4-month range, `area` set, `route` set,
-`warehouse` set, and `area` + `warehouse` together. Identical in all six.
+`warehouse` set, and `area` + `warehouse` together. Both rewrites are identical
+to the original in all six, including the intermediate `1`/`2`/`3` buckets and
+the zero-count row described next.
+
+### The zero-count subtlety
+
+`PEPSI`, `AQUAFINA` and `ALYOUM` count `pepsi_retailers`, which is NULL for
+districts 13/14/15/32, and `COUNT(DISTINCT ...)` skips NULLs. So the original
+can emit a bucket row whose count is `0`: the group exists because in-section
+rows landed in that bucket, but every one of them had a NULL id. Collapsing to
+one row per retailer drops such groups unless membership and counting are
+tracked separately, which is why `retailer_eligibility` carries both a
+`*_section` and a `*_counts` flag. The `area` scenario produces exactly this
+case (`ALYOUM | 2 | 0`), and it caught the first version of the collapse.
+
+### Optional server-side settings
+
+`jit = off` and a larger `work_mem` on the Metabase role are worth about 17% on
+the default scenario (3.55 s to 2.96 s) and nothing measurable on the 4-month
+range. Not required, and only worth doing if the same settings suit the rest of
+the workload.
 
 ### A note on the fact-table semi-join
 
