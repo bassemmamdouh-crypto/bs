@@ -71,6 +71,20 @@ cast: its plan stays a sequential scan (`Rows Removed by Filter: 57000000`),
 while the rewrite switches to `Index Only Scan ... Heap Fetches: 0` and reads
 only the reporting month.
 
+## Verified against the original
+
+Both queries were rendered through the same Metabase template renderer and run
+against the same database. The retailer count columns matched exactly in every
+parameter combination:
+
+| Parameters | Result |
+| --- | --- |
+| none (defaults to the current month) | identical counts |
+| `Start_date` / `end_date` spanning 4 months | identical counts, 4 rows |
+| `area` set | identical counts |
+| `route` set | identical counts |
+| `area` + `route` matching no retailer | both return 0 rows |
+
 ## Behaviour changes
 
 `total_nmv` is now lower than the original. In the original, revenue is summed

@@ -78,12 +78,14 @@ base_retailers AS (
     GROUP BY r.id
 ),
 
--- The base universe is month independent, so count it once.
+-- The base universe is month independent, so count it once. HAVING keeps the
+-- original behaviour of returning no rows when the filters match no retailer.
 base_counts AS (
     SELECT
         count(*)                           AS total_retailers,
         count(*) FILTER (WHERE pepsi_base) AS pepsi_total_base
     FROM base_retailers
+    HAVING count(*) > 0
 ),
 
 monthly AS (
