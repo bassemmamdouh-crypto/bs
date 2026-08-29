@@ -601,8 +601,8 @@ def build_mix_and_targets(
     area_summary = area_3m.merge(area_avg, on="area", how="left")
     area_summary = area_summary.merge(area_month_count, on="area", how="left")
     area_summary["months_with_sales"] = area_summary["months_with_sales"].fillna(0).astype(int)
-    area_summary["lookback_start"] = str(window[0])
-    area_summary["lookback_end"] = str(window[-1])
+    area_summary["lookback_start"] = str(present_months[0])
+    area_summary["lookback_end"] = str(present_months[-1])
     area_summary["target_month"] = str(target_month)
     area_summary["avg_monthly_sales"] = area_summary["area_sales_last_n"] / n_present
     area_summary["months_in_file"] = n_present
