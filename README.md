@@ -61,8 +61,18 @@ Column names are matched loosely (`area` / `polygon` / `city`, `sales` / `net_am
 
 `weighted_contribution` is the mix used for targeting (share of 3-month sales). `simple_avg_contribution` is the unweighted average of the three monthly shares, so a thin month is visible.
 
+## Retailer MTD targets (Metabase)
+
+`queries/retailer_category_mtd_targets.sql` adds **MTD target** for Lays, Pepsi, and Aquafina:
+
+```
+mtd_target = month_target × working_days_elapsed / working_days_in_month
+```
+
+Fridays are excluded (`ISODOW <> 5`). The original query defined `working_days` but did not use it in the select; Pepsi and Aquafina tiers were also aliased as `lays_tier` and are now `pepsi_tier` / `aquafina_tier`.
+
 ## Tests
 
 ```bash
-python -m pytest tests/test_area_item_target_planner.py -q
+python -m pytest tests -q
 ```
