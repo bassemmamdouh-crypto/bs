@@ -144,7 +144,42 @@ def test_missing_area_column_raises():
         normalize_purchasing_frame(raw)
 
 
-def test_cli_main(tmp_path: Path, monkeypatch):
+def test_arabic_month_headers_and_two_month_average():
+    raw = pd.DataFrame(
+        {
+            "المنطقة": ["الحرية", "الحرية", "الحرية", "شعلة"],
+            "اسم المشرف / الفريق": ["رسول", "رسول", "رسول", "ميسر"],
+            "مركز الكلفة": ["احمد سعدي", "احمد سعدي", "موزع 18", "موزع 3"],
+            "العبوة (Container)": ["1.25 ltr", "1.25 ltr", "Can185 ml", "1.25 ltr"],
+            "الصنف (ROUT)": ["Pepsi", "7-Up", "Pepsi", "Pepsi"],
+            "شهر 6": [300, 100, 100, 50],
+            "شهر 7": [500, 100, 0, 50],
+            "الإجمالي": [800, 200, 100, 100],
+        }
+    )
+    frame = normalize_purchasing_frame(raw, default_year=2026)
+    assert set(frame["month"].astype(str)) == {"2026-06", "2026-07"}
+    result = build_mix_and_targets(frame, lookback_months=3)
+    assert result["target_month"] == "2026-08"
+    assert result["months_in_file"] == 2
+    hurriya = result["item_targets"]
+    hurriya = hurriya[hurriya["area"] == "الحرية"].set_index("sku")
+    # Area last-2-month total = 300+100+100 + 500+100+0 = 1100, default target = 550
+    assert hurriya.loc["1.25 ltr | Pepsi", "weighted_contribution"] == pytest.approx(800 / 1100)
+    assert hurriya["next_month_sales_target"].sum() == pytest.approx(550)
+    cc = result["cost_center_targets"]
+    pepsi_125 = cc[(cc["sku"] == "1.25 ltr | Pepsi") & (cc["area"] == "الحرية")]
+    assert pepsi_125["next_month_sales_target"].sum() == pytest.approx(
+        hurriya.loc["1.25 ltr | Pepsi", "next_month_sales_target"]
+    )
+
+
+def test_parse_arabic_month_header():
+    assert parse_month_label("شهر 6", default_year=2026) == pd.Period("2026-06", "M")
+    assert parse_month_label("الإجمالي", default_year=2026) is None
+
+
+def test_cli_main(tmp_path: Path):
     sample = create_sample(tmp_path / "sample.xlsx")
     output = tmp_path / "out.xlsx"
     from area_item_target_planner import main

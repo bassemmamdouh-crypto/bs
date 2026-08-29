@@ -8,7 +8,9 @@ For each area the planner takes the last 3 months of sales, measures every item'
 item next-month target = area next-month total × (item sales last 3 months / area sales last 3 months)
 ```
 
-Area next-month totals default to the **average monthly sales of those 3 months**. Put a commercial number in `Area_Targets.next_month_target` and rerun with `--area-targets` to lock the mix to a different headline.
+Area next-month totals default to the **average of the months actually present** in that window (if the file only has June and July, the mix and the average use those two months). Put a commercial number in `Area_Targets.next_month_target` and rerun with `--area-targets` to lock the mix to a different headline.
+
+Arabic area workbooks are supported: `المنطقة`, `الصنف (ROUT)`, `العبوة (Container)`, and month columns like `شهر 6` / `شهر 7`. The all-areas sheet is preferred when several tabs exist. Each item is keyed as `container | product`. `Cost_Center_Targets` splits the area/item target by cost-center share of that item.
 
 ## Install
 
