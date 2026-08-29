@@ -18,6 +18,7 @@ import re
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -340,11 +341,9 @@ def build_mix_and_targets(
         .rename(columns={"sales": "area_month_sales"})
     )
     monthly = window_data.merge(month_totals, on=["area", "month"], how="left")
-    monthly["monthly_contribution"] = 0.0
-    has_sales = monthly["area_month_sales"] > 0
-    monthly.loc[has_sales, "monthly_contribution"] = (
-        monthly.loc[has_sales, "sales"] / monthly.loc[has_sales, "area_month_sales"]
-    )
+    monthly["monthly_contribution"] = (
+        monthly["sales"] / monthly["area_month_sales"].replace(0, np.nan)
+    ).fillna(0.0)
 
     month_labels = [str(m) for m in window]
     contrib_wide = (
@@ -405,16 +404,14 @@ def build_mix_and_targets(
     items = item_3m.merge(area_3m, on="area", how="left")
     items = items.merge(area_month_count, on="area", how="left")
     items["months_with_sales"] = items["months_with_sales"].fillna(0).astype(int)
-    items["weighted_contribution"] = 0.0
-    positive = items["area_sales_last_n"] > 0
-    items.loc[positive, "weighted_contribution"] = (
-        items.loc[positive, "sales_last_n"] / items.loc[positive, "area_sales_last_n"]
-    )
+    items["weighted_contribution"] = (
+        items["sales_last_n"] / items["area_sales_last_n"].replace(0, np.nan)
+    ).fillna(0.0)
     items["avg_monthly_sales"] = items["sales_last_n"] / lookback_months
     items["avg_monthly_qty"] = items["qty_last_n"] / lookback_months
-    items["unit_price"] = 0.0
-    priced = items["qty_last_n"] > 0
-    items.loc[priced, "unit_price"] = items.loc[priced, "sales_last_n"] / items.loc[priced, "qty_last_n"]
+    items["unit_price"] = (
+        items["sales_last_n"] / items["qty_last_n"].replace(0, np.nan)
+    ).fillna(0.0)
 
     items = items.merge(contrib_wide, on=["area", "sku", "item"], how="left")
     items = items.merge(sales_wide, on=["area", "sku", "item"], how="left")
@@ -452,11 +449,9 @@ def build_mix_and_targets(
         how="left",
     )
     items["next_month_sales_target"] = items["next_month_target"] * items["weighted_contribution"]
-    items["next_month_qty_target"] = 0.0
-    can_qty = items["unit_price"] > 0
-    items.loc[can_qty, "next_month_qty_target"] = (
-        items.loc[can_qty, "next_month_sales_target"] / items.loc[can_qty, "unit_price"]
-    )
+    items["next_month_qty_target"] = (
+        items["next_month_sales_target"] / items["unit_price"].replace(0, np.nan)
+    ).fillna(0.0)
     items["rank_in_area"] = (
         items.groupby("area")["weighted_contribution"].rank(method="first", ascending=False).astype(int)
     )
