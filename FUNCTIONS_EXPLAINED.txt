@@ -1,0 +1,282 @@
+FUNCTIONS EXPLAINED - invoice_generator.py
+=========================================
+
+This document explains every function in `invoice_generator.py`, what it does, and how it is used in the full invoice-generation flow.
+
+
+1) Logging and basic normalization helpers
+-----------------------------------------
+
+1. `log_info(msg: str) -> None`
+   - Prints informational messages to console with `INFO:` prefix.
+   - Used for normal execution updates (for example, skipping empty sections).
+
+2. `log_warning(msg: str) -> None`
+   - Prints warning messages with `WARNING:` prefix.
+   - Used when something is missing or fallback behavior is used.
+
+3. `normalize_columns(df: pd.DataFrame) -> pd.DataFrame`
+   - Converts dataframe column names to lowercase and trims spaces.
+   - Makes later column matching case-insensitive and cleaner.
+
+4. `apply_column_aliases(df, aliases) -> pd.DataFrame`
+   - Renames columns to standard internal names using alias mapping.
+   - Example: `order_number` -> `order_id`.
+   - Ensures downstream logic works with one canonical column name.
+
+5. `ensure_columns(df, defaults, warn_missing=True) -> pd.DataFrame`
+   - Ensures required/optional columns exist.
+   - If missing, creates column with default value.
+   - Can optionally print warning when required columns are absent.
+
+6. `safe_str(value, default="") -> str`
+   - Safely converts values to string.
+   - Treats null-like values (`nan`, `none`, `null`, `nat`) as default.
+
+7. `normalize_identifier(value, default="") -> str`
+   - Normalizes ID-like values from Excel.
+   - Removes trailing `.0` for numeric identifiers and converts Arabic digits.
+   - Example: `123.0` -> `123`.
+   - Used for order IDs and identifier consistency.
+
+8. `normalize_sku(value) -> str`
+   - Wrapper around `normalize_identifier` specialized for SKU values.
+   - Ensures SKU matching is stable when Excel reads numeric SKUs as floats.
+
+9. `normalize_column_key(name) -> str`
+   - Converts column names into alphanumeric-only lowercase keys.
+   - Used by fuzzy/normalized column matching logic.
+
+10. `resolve_candidate_columns(df, candidates) -> List[str]`
+    - Finds matching dataframe columns from a list of candidate names.
+    - Uses exact normalized match first, then containment fallback.
+    - Returns matching existing columns in priority order.
+
+
+2) Section and value parsing helpers
+------------------------------------
+
+11. `normalize_section_name(value, config) -> str`
+    - Maps raw section text into normalized section groups.
+    - Current groups: `PEPSI`, `LAYS`, `MARAII`, or fallback `OTHER`.
+    - Handles multiple spelling variants (English/Arabic).
+
+12. `get_target_sections(config) -> List[str]`
+    - Reads configured target sections and normalizes them.
+    - Removes duplicates and invalid values.
+    - Returns fallback list if config list becomes empty.
+
+13. `safe_float(value, default=0.0) -> float`
+    - Safely parses numbers from mixed text formats.
+    - Handles Arabic numerals and removes non-numeric symbols.
+    - Used for quantities, prices, discounts, totals.
+
+14. `safe_date_str(value, default="") -> str`
+    - Converts date-like values to `YYYY-MM-DD` text.
+    - Returns default for invalid/missing values.
+
+15. `safe_time_str(value, default="") -> str`
+    - Converts time-like values to `HH:MM` text.
+    - Returns default for invalid/missing values.
+
+16. `first_row_value(order_df, candidates, default="") -> object`
+    - Returns first non-empty value from first row using candidate columns.
+    - Used mainly for invoice header fields.
+
+17. `first_row_float(order_df, candidates, default=0.0) -> float`
+    - Same as `first_row_value` but parsed as float.
+
+18. `aggregate_order_level_numeric(order_df, column_name) -> float`
+    - Aggregates order-level numeric fields.
+    - If same non-zero value is repeated across rows, keeps one value.
+    - Otherwise sums values.
+    - Used for discount/gift columns that may be repeated per line.
+
+
+3) Template and workbook selection helpers
+------------------------------------------
+
+19. `resolve_template_path(template_path) -> str`
+    - Returns first existing template file among known filename variants.
+    - Handles common spelling differences in template filename.
+
+20. `choose_template_file(area_value, config) -> str`
+    - Selects template path for a specific area using area mapping.
+    - Falls back to default template if no area-specific entry exists.
+
+21. `find_existing_column(df, candidates) -> Optional[str]`
+    - Finds one existing column from candidate names (exact then normalized).
+    - Used for detecting section column and other dynamic fields.
+
+22. `get_sheet_if_exists(workbook, sheet_name) -> Optional[xw.Sheet]`
+    - Safe sheet getter; returns None instead of raising error.
+
+23. `get_template_invoice_sheet(workbook, candidates) -> Optional[xw.Sheet]`
+    - Finds invoice sheet from candidate names in template workbook.
+    - Falls back to first sheet if named sheet is not found.
+
+24. `copy_invoice_sheet(template_ws, output_wb, temp_sheet_name) -> Optional[xw.Sheet]`
+    - Copies invoice template sheet into output workbook.
+    - Returns reference to the newly created sheet.
+
+25. `make_unique_sheet_name(base_name, existing_names) -> str`
+    - Creates Excel-valid unique sheet names (max 31 chars, no invalid chars).
+    - Prevents naming collisions across copied sheets.
+
+
+4) Invoice table layout and writing helpers
+-------------------------------------------
+
+26. `adjust_line_capacity(ws, required_count, config) -> int`
+    - Adjusts invoice line area to match number of rows to write.
+    - Inserts rows before footer when lines exceed template capacity.
+    - Deletes unused rows before footer when lines are fewer.
+    - Returns signed row shift for footer rows.
+
+27. `clear_invoice_lines(ws, start_row, end_row) -> None`
+    - Clears invoice line cells (columns A:F) in a row range.
+
+28. `write_header(ws, order_df, order_id, config) -> None`
+    - Writes invoice header values into fixed template cells.
+    - Pulls values using candidate columns and first row of `order_df`.
+
+29. `infer_line_item_name(row, config) -> str`
+    - Determines item display name from row using candidate name columns.
+    - Falls back to `SKU <code>` when name is missing.
+
+30. `extract_size_text(item_name) -> str`
+    - Extracts size tokens from item name text (example: 330ml).
+
+31. `parse_size_sort(size_text) -> tuple`
+    - Parses size text into sortable structure (unit rank, numeric size, unit).
+    - Used to sort products consistently.
+
+32. `sku_sort_key(item) -> tuple`
+    - Returns sorting key for line items.
+    - Current sort: brand, then parsed size, then item name.
+
+33. `row_first_value(row, candidates, default="") -> object`
+    - Row-level version of candidate-based field extraction.
+    - Used while iterating line rows.
+
+34. `build_base_items(order_df, config) -> List[Dict[str, object]]`
+    - Builds aggregated invoice lines from order rows.
+    - Groups similar lines by brand/size/name/unit and sums qty/amount.
+    - Sorts final lines using `sku_sort_key`.
+
+35. `quantity_by_sku(order_df, config) -> Dict[str, float]`
+    - Sums purchased quantity per normalized SKU.
+    - Core input for offer-rule calculations.
+
+
+5) Offer engine and totals computation
+--------------------------------------
+
+36. `apply_offer_rules(order_df, subtotal, config, bundle_offer_df=None) -> Dict[str, object]`
+    - Builds all offer/gift lines and discount total for one invoice.
+    - Components:
+      a) Gift columns from source data.
+      b) Explicit offer lines from source data.
+      c) Discounts (amount + percent columns).
+      d) Fixed bundle offer (configured SKU set / divisor).
+      e) Buy-1-get-1 same-SKU offer for SKUs 180/181/182.
+      f) Generic configurable rule-engine offers (`offer_rules` list).
+    - Merges duplicate offer lines by name.
+    - Returns:
+      - `offer_lines`: list of extra lines to append to invoice.
+      - `discount_total`: total discount value.
+
+37. `fill_invoice_lines(ws, lines, config, row_shift) -> None`
+    - Writes all invoice line rows into the sheet (A:F).
+
+38. `compute_invoice_totals(lines, discount_amount) -> Dict[str, float]`
+    - Calculates:
+      - total quantity (qty + gift_qty),
+      - subtotal (sum of net_amount),
+      - discount,
+      - net total.
+
+39. `write_totals(ws, lines, discount_amount, config, row_shift) -> None`
+    - Writes totals into template footer rows (shifted when rows inserted/deleted).
+    - Uses `compute_invoice_totals`.
+
+
+6) Area preparation and summary-sheet helpers
+---------------------------------------------
+
+40. `prepare_area_sections(area_df, config) -> pd.DataFrame`
+    - Adds `_section_group` column by normalizing section values.
+    - Used before per-section workbook/sheet generation.
+
+41. `area_output_context(area_df, area_value, config) -> Dict[str, object]`
+    - Builds reusable output context:
+      - latest delivery date,
+      - output folder path,
+      - safe area name for filename.
+
+42. `add_workbook_summary_sheet(workbook, invoice_count, total_qty, total_prices, max_estimated_delivery_date, offer_breakdown) -> None`
+    - Appends a formatted `Daily_SUMMARY` sheet to workbook.
+    - Writes KPI metrics and offer breakdown table.
+    - Applies layout styling:
+      - title/header fills,
+      - bold fonts,
+      - borders,
+      - number/date formats,
+      - alignment,
+      - column widths and row autofit,
+      - frozen top row.
+
+
+7) Rendering and generation flows
+---------------------------------
+
+43. `render_invoice_sheet(ws, source_df, header_order_id, config, bundle_offer_df=None) -> Dict[str, object]`
+    - End-to-end renderer for one invoice sheet:
+      - header,
+      - base lines,
+      - offers,
+      - row capacity adjustment,
+      - line writing,
+      - totals writing.
+    - Returns metrics for workbook summary aggregation:
+      - invoice count,
+      - total qty,
+      - total prices,
+      - offer breakdown.
+
+44. `process_area_summary(area_value, area_df, app, config) -> Optional[str]`
+    - Summary mode: one workbook per area.
+    - Creates one invoice-like sheet per target section.
+    - Adds one `Daily_SUMMARY` tab with workbook-level aggregates.
+    - Saves workbook and returns saved path.
+
+45. `process_area_order_workbooks(area_value, area_df, app, config) -> List[str]`
+    - Per-order mode: one workbook per section per area (if section has rows).
+    - Inside each workbook: one sheet per order ID.
+    - Uses full order rows for bundle-offer computation where needed.
+    - Adds one `Daily_SUMMARY` tab to each section workbook.
+    - Saves workbooks and returns list of paths.
+
+46. `process_area(area_value, area_df, app, config) -> List[str]`
+    - Dispatcher based on `generation_mode`.
+    - Routes to:
+      - `process_area_summary` or
+      - `process_area_order_workbooks`.
+
+47. `main() -> None`
+    - Program entrypoint.
+    - Loads and normalizes orders data.
+    - Applies aliases/default columns and date parsing.
+    - Normalizes IDs and areas.
+    - Starts hidden Excel app via xlwings.
+    - Processes each area and prints generated output files.
+
+
+Overall execution pipeline
+--------------------------
+1) Read Excel orders -> normalize/standardize columns.
+2) Split data by area then by normalized section.
+3) Generate invoice sheets/workbooks according to selected mode.
+4) Build invoice lines + offers + totals for each sheet.
+5) Add formatted `Daily_SUMMARY` tab per generated workbook.
+6) Save files under month folder in output root.
