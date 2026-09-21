@@ -1,9 +1,8 @@
 name: Daily Google Sheet Metabase sync
 
+# Manual only. The daily schedule lives in the spreadsheet Apps Script
+# (google_apps_script/) so this workflow does not double-write the tab.
 on:
-  schedule:
-    # 01:00 UTC daily (04:00 Iraq time)
-    - cron: "0 1 * * *"
   workflow_dispatch:
 
 jobs:
