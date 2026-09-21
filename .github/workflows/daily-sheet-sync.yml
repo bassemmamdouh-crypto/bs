@@ -1,0 +1,32 @@
+name: Daily Google Sheet Metabase sync
+
+on:
+  schedule:
+    # 01:00 UTC daily (04:00 Iraq time)
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync sheet
+        env:
+          IRAQ_METABASE_USERNAME: ${{ secrets.IRAQ_METABASE_USERNAME }}
+          IRAQ_METABASE_PASSWORD: ${{ secrets.IRAQ_METABASE_PASSWORD }}
+          METABASE_QUESTION_ID: ${{ secrets.METABASE_QUESTION_ID }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_WORKSHEET_NAME: ${{ secrets.GOOGLE_WORKSHEET_NAME }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python sheets_daily_sync.py
