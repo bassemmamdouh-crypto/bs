@@ -1,5 +1,6 @@
 from io import StringIO
 import logging
+import os
 
 import pandas as pd
 import requests
@@ -7,10 +8,16 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Iraq Metabase configuration (hardcoded as requested)
-IRAQ_METABASE_BASE_URL = "https://bi.marbah.info/api"
-IRAQ_METABASE_USERNAME = "YOUR_IRAQ_METABASE_USERNAME"
-IRAQ_METABASE_PASSWORD = "YOUR_IRAQ_METABASE_PASSWORD"
+# Iraq Metabase configuration. Username/password can be overridden with env vars.
+IRAQ_METABASE_BASE_URL = os.environ.get(
+    "IRAQ_METABASE_BASE_URL", "https://bi.marbah.info/api"
+)
+IRAQ_METABASE_USERNAME = os.environ.get(
+    "IRAQ_METABASE_USERNAME", "YOUR_IRAQ_METABASE_USERNAME"
+)
+IRAQ_METABASE_PASSWORD = os.environ.get(
+    "IRAQ_METABASE_PASSWORD", "YOUR_IRAQ_METABASE_PASSWORD"
+)
 
 
 def _safe_response_json(response, context):
