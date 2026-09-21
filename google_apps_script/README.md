@@ -1,26 +1,31 @@
-# In-sheet daily sync (Apps Script)
+# In-sheet telesales scripts (Apps Script)
 
-This is the intended daily runner. It lives on the Google Sheet itself: no service account and no GitHub Action required.
+Two independent scripts on [telesales_test](https://docs.google.com/spreadsheets/d/1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q/edit?gid=292013814#gid=292013814):
 
-Target tab: [telesales_test](https://docs.google.com/spreadsheets/d/1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q/edit?gid=292013814#gid=292013814)  
-Metabase question: `590`
-
-Each run keeps the header, deletes data rows with a blank **column P**, then appends question 590.
+| Script | Function | What it does |
+| --- | --- | --- |
+| 1 | `checkEmptyColumnL` | Inspects the tab and reports rows whose **column L** is empty. Does not delete. |
+| 1 | `removeEmptyColumnL` | Runs that check, logs the empty row numbers, then deletes those rows. Keeps the header. |
+| 2 | `appendMetabaseData` | Pulls Metabase question **590** and **appends** it under the rows already on the sheet. Does not delete. |
 
 ## Install
 
-1. Open the spreadsheet.
-2. **Extensions → Apps Script**.
-3. Delete the stub `Code.gs` contents. Add two files:
-   - `Code.gs` ← paste `google_apps_script/Code.gs`
-   - `SyncLogic.js` ← paste `google_apps_script/SyncLogic.js` (Apps Script accepts `.js` in the editor; you can also name the file `SyncLogic.gs`)
-4. **Project Settings → Script properties** and add:
-   - `METABASE_USERNAME` = your Metabase login
-   - `METABASE_PASSWORD` = your Metabase password
-5. **Run → runSelfTests** once. Approve the Sheets permission prompt.
-6. **Run → dailySync** once. Approve the external-request prompt (Metabase) if asked.
-7. **Run → installDailyTrigger**. This schedules `dailySync` every day at **04:00 Asia/Baghdad**.
+1. Open the spreadsheet → **Extensions → Apps Script**.
+2. Paste these files into the project:
 
-A **Metabase sync** menu also appears after you reload the sheet.
+   - `Code.gs`
+   - `Shared.gs`
+   - `1_RemoveBlankColumnL.gs`
+   - `2_AppendMetabase.gs`
+   - `SyncLogic.js` (or name it `SyncLogic.gs`)
 
-If Metabase is not reachable from Google (`UrlFetchApp` blocked, or login fails), check Executions in the Apps Script editor for the error body.
+3. **Project Settings → Script properties**:
+   - `METABASE_USERNAME`
+   - `METABASE_PASSWORD`
+4. Run `runSelfTests`.
+5. Run `checkEmptyColumnL`, then `removeEmptyColumnL`, then `appendMetabaseData` (approve permissions).
+6. Run `installDailyTriggers` once:
+   - Script 1 at **04:00** Asia/Baghdad
+   - Script 2 at **04:15** Asia/Baghdad
+
+Reload the sheet for the **Telesales scripts** menu.

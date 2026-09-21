@@ -1,9 +1,12 @@
 /**
- * Pure merge logic for the telesales daily refresh.
- * Safe to run in Apps Script (global functions) and in Node tests (module.exports).
+ * Pure logic for the two telesales scripts.
+ * Safe in Apps Script (globals) and Node tests (module.exports).
+ *
+ * Script 1: inspect / drop rows whose column L is empty.
+ * Script 2: append Metabase rows under the existing sheet data.
  */
 
-var COLUMN_P_INDEX = 15;
+var COLUMN_L_INDEX = 11; // 0-based index for column L
 
 function isBlankCell(value) {
   if (value === null || value === undefined) {
@@ -31,26 +34,68 @@ function normalizeHeaderName(value) {
     .replace(/\s+/g, " ");
 }
 
-function keepRowsWithColumnP(rows, hasHeader) {
+function inspectEmptyColumnRows(rows, columnIndex, hasHeader) {
+  if (columnIndex === undefined) {
+    columnIndex = COLUMN_L_INDEX;
+  }
+  if (hasHeader === undefined) {
+    hasHeader = true;
+  }
+  if (!rows || !rows.length) {
+    return {
+      header_rows: 0,
+      data_rows: 0,
+      blank_sheet_rows: [],
+      blank_count: 0,
+      keep_count: 0,
+    };
+  }
+  var start = hasHeader ? 1 : 0;
+  var blankSheetRows = [];
+  var keepCount = 0;
+  var i;
+  for (i = start; i < rows.length; i++) {
+    var row = rows[i] || [];
+    var cell = row.length > columnIndex ? row[columnIndex] : "";
+    if (isBlankCell(cell)) {
+      blankSheetRows.push(i + 1);
+    } else {
+      keepCount += 1;
+    }
+  }
+  return {
+    header_rows: hasHeader ? 1 : 0,
+    data_rows: rows.length - start,
+    blank_sheet_rows: blankSheetRows,
+    blank_count: blankSheetRows.length,
+    keep_count: keepCount,
+  };
+}
+
+function keepRowsWithFilledColumn(rows, columnIndex, hasHeader) {
+  if (columnIndex === undefined) {
+    columnIndex = COLUMN_L_INDEX;
+  }
   if (hasHeader === undefined) {
     hasHeader = true;
   }
   if (!rows || !rows.length) {
     return [];
   }
-  function hasValueInP(row) {
-    var cell = row && row.length > COLUMN_P_INDEX ? row[COLUMN_P_INDEX] : "";
+  function hasValue(row) {
+    var cell = row && row.length > columnIndex ? row[columnIndex] : "";
     return !isBlankCell(cell);
   }
   if (!hasHeader) {
-    return rows.filter(hasValueInP).map(function (row) {
+    return rows.filter(hasValue).map(function (row) {
       return row.slice();
     });
   }
   var header = rows[0].slice();
   var kept = [];
-  for (var i = 1; i < rows.length; i++) {
-    if (hasValueInP(rows[i])) {
+  var i;
+  for (i = 1; i < rows.length; i++) {
+    if (hasValue(rows[i])) {
       kept.push(rows[i].slice());
     }
   }
@@ -105,23 +150,25 @@ function alignNewRows(newBody, newHeader, sheetHeader) {
   });
 }
 
-function mergeKeptAndNew(sheetRows, newHeader, newBody) {
-  var kept = keepRowsWithColumnP(sheetRows, true);
-  if (!kept.length) {
-    return [newHeader.slice()].concat(newBody.map(function (row) {
+function appendAlignedRows(sheetRows, newHeader, newBody) {
+  var aligned = alignNewRows(newBody, newHeader, sheetRows && sheetRows.length ? sheetRows[0] : newHeader);
+  if (!sheetRows || !sheetRows.length) {
+    return [newHeader.slice()].concat(aligned.length ? aligned : newBody.map(function (row) {
       return row.slice();
     }));
   }
-  var header = kept[0];
-  return kept.concat(alignNewRows(newBody, newHeader, header));
+  return sheetRows.map(function (row) {
+    return row.slice();
+  }).concat(aligned);
 }
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    COLUMN_P_INDEX: COLUMN_P_INDEX,
+    COLUMN_L_INDEX: COLUMN_L_INDEX,
     isBlankCell: isBlankCell,
-    keepRowsWithColumnP: keepRowsWithColumnP,
+    inspectEmptyColumnRows: inspectEmptyColumnRows,
+    keepRowsWithFilledColumn: keepRowsWithFilledColumn,
     alignNewRows: alignNewRows,
-    mergeKeptAndNew: mergeKeptAndNew,
+    appendAlignedRows: appendAlignedRows,
   };
 }
