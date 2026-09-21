@@ -5,10 +5,16 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 
 from sheets_daily_sync import (
+    DEFAULT_QUESTION_ID,
+    DEFAULT_SPREADSHEET_ID,
+    DEFAULT_WORKSHEET_GID,
+    DEFAULT_WORKSHEET_NAME,
     align_new_rows,
+    coalesce_config,
     is_blank,
     keep_rows_with_column_p,
     merge_kept_and_new,
+    resolve_worksheet,
     run_sync,
 )
 
@@ -153,6 +159,46 @@ class LocalSyncTests(unittest.TestCase):
             self.assertEqual(summary["appended_rows"], 1)
             self.assertEqual(list(result["col_0"]), ["keep-row", "fresh"])
             self.assertEqual(list(result["status"]), ["ok", "new"])
+
+
+class ConfigDefaultsTests(unittest.TestCase):
+    def test_telesales_targets_are_baked_in(self):
+        self.assertEqual(DEFAULT_SPREADSHEET_ID, "1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q")
+        self.assertEqual(DEFAULT_WORKSHEET_NAME, "telesales_test")
+        self.assertEqual(DEFAULT_WORKSHEET_GID, 292013814)
+        self.assertEqual(DEFAULT_QUESTION_ID, "590")
+
+    def test_blank_env_does_not_override_default(self):
+        self.assertEqual(coalesce_config("", "  ", default="590"), "590")
+        self.assertEqual(coalesce_config("590", default="1"), "590")
+
+
+class FakeSpreadsheet:
+    def __init__(self):
+        self.by_id = {}
+        self.by_name = {}
+        self.sheet1 = "sheet1"
+
+    def get_worksheet_by_id(self, gid):
+        return self.by_id[int(gid)]
+
+    def worksheet(self, name):
+        if name not in self.by_name:
+            raise KeyError(name)
+        return self.by_name[name]
+
+
+class ResolveWorksheetTests(unittest.TestCase):
+    def test_prefers_gid(self):
+        sheet = FakeSpreadsheet()
+        sheet.by_id[292013814] = "gid-tab"
+        sheet.by_name["telesales_test"] = "name-tab"
+        self.assertEqual(resolve_worksheet(sheet, "telesales_test", 292013814), "gid-tab")
+
+    def test_falls_back_to_dotted_alias(self):
+        sheet = FakeSpreadsheet()
+        sheet.by_name[".telesales_test"] = "dotted-tab"
+        self.assertEqual(resolve_worksheet(sheet, "telesales_test", None), "dotted-tab")
 
 
 if __name__ == "__main__":

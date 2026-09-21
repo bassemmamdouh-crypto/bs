@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 # Column P is the 16th column (A=1).
 COLUMN_P_INDEX = 15
 
+# Target sheet / Metabase card for the telesales daily refresh.
+DEFAULT_SPREADSHEET_ID = "1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q"
+DEFAULT_WORKSHEET_NAME = "telesales_test"
+DEFAULT_WORKSHEET_GID = 292013814
+DEFAULT_QUESTION_ID = "590"
+
+
+def coalesce_config(*values: Any, default: str = "") -> str:
+    """Return the first non-empty value, treating blank env vars as unset."""
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return default
+
 
 def is_blank(value: Any) -> bool:
     """True when a cell should be treated as empty for the column-P rule."""
@@ -174,7 +191,39 @@ def _service_account_info() -> dict:
     )
 
 
-def open_worksheet(spreadsheet_id: str, worksheet_name: str | None):
+def resolve_worksheet(spreadsheet, worksheet_name: str | None, worksheet_gid: int | str | None):
+    """Open a tab by gid first (stable), then by name, including a leading-dot alias."""
+    if worksheet_gid not in (None, ""):
+        return spreadsheet.get_worksheet_by_id(int(worksheet_gid))
+
+    names_to_try: list[str] = []
+    if worksheet_name:
+        names_to_try.append(worksheet_name)
+        stripped = worksheet_name.lstrip(".")
+        if stripped and stripped != worksheet_name:
+            names_to_try.append(stripped)
+        dotted = f".{stripped}" if stripped else worksheet_name
+        if dotted not in names_to_try:
+            names_to_try.append(dotted)
+
+    last_error: Exception | None = None
+    for name in names_to_try:
+        try:
+            return spreadsheet.worksheet(name)
+        except Exception as exc:  # gspread.WorksheetNotFound when the lib is installed
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise last_error
+    return spreadsheet.sheet1
+
+
+def open_worksheet(
+    spreadsheet_id: str,
+    worksheet_name: str | None,
+    worksheet_gid: int | str | None = None,
+):
     try:
         import gspread
     except ImportError as exc:
@@ -185,9 +234,7 @@ def open_worksheet(spreadsheet_id: str, worksheet_name: str | None):
 
     client = gspread.service_account_from_dict(_service_account_info())
     spreadsheet = client.open_by_key(spreadsheet_id)
-    if worksheet_name:
-        return spreadsheet.worksheet(worksheet_name)
-    return spreadsheet.sheet1
+    return resolve_worksheet(spreadsheet, worksheet_name, worksheet_gid)
 
 
 def read_sheet_rows(worksheet) -> list[list[Any]]:
@@ -213,6 +260,7 @@ def run_sync(
     question_id: str | None,
     spreadsheet_id: str | None,
     worksheet_name: str | None,
+    worksheet_gid: int | str | None = None,
     local_input: str | None = None,
     local_output: str | None = None,
     local_new: str | None = None,
@@ -224,7 +272,7 @@ def run_sync(
     else:
         if not spreadsheet_id:
             raise RuntimeError("spreadsheet_id is required unless --local-input is set.")
-        worksheet = open_worksheet(spreadsheet_id, worksheet_name)
+        worksheet = open_worksheet(spreadsheet_id, worksheet_name, worksheet_gid)
         sheet_rows = read_sheet_rows(worksheet)
 
     original_data_rows = max(len(sheet_rows) - (1 if has_header and sheet_rows else 0), 0)
@@ -259,7 +307,7 @@ def run_sync(
 
     if not spreadsheet_id:
         raise RuntimeError("spreadsheet_id is required to write back to Google Sheets.")
-    worksheet = open_worksheet(spreadsheet_id, worksheet_name)
+    worksheet = open_worksheet(spreadsheet_id, worksheet_name, worksheet_gid)
     write_sheet_rows(worksheet, merged)
     return summary
 
@@ -270,18 +318,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--question-id",
-        default=os.environ.get("METABASE_QUESTION_ID"),
-        help="Metabase card/question ID to pull as the new day's data.",
+        default=None,
+        help="Metabase card/question ID. Defaults to 590 (telesales).",
     )
     parser.add_argument(
         "--spreadsheet-id",
-        default=os.environ.get("GOOGLE_SPREADSHEET_ID"),
+        default=None,
         help="Google Sheet ID from the spreadsheet URL.",
     )
     parser.add_argument(
         "--worksheet",
-        default=os.environ.get("GOOGLE_WORKSHEET_NAME") or None,
-        help="Tab name. Defaults to the first tab.",
+        default=None,
+        help="Tab name. Defaults to telesales_test.",
+    )
+    parser.add_argument(
+        "--worksheet-gid",
+        default=None,
+        help="Google Sheet tab gid. Defaults to 292013814 (telesales_test).",
     )
     parser.add_argument(
         "--local-input",
@@ -317,9 +370,24 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     summary = run_sync(
-        question_id=args.question_id,
-        spreadsheet_id=args.spreadsheet_id,
-        worksheet_name=args.worksheet,
+        question_id=coalesce_config(
+            args.question_id, os.environ.get("METABASE_QUESTION_ID"), default=DEFAULT_QUESTION_ID
+        ),
+        spreadsheet_id=coalesce_config(
+            args.spreadsheet_id,
+            os.environ.get("GOOGLE_SPREADSHEET_ID"),
+            default=DEFAULT_SPREADSHEET_ID,
+        ),
+        worksheet_name=coalesce_config(
+            args.worksheet,
+            os.environ.get("GOOGLE_WORKSHEET_NAME"),
+            default=DEFAULT_WORKSHEET_NAME,
+        ),
+        worksheet_gid=coalesce_config(
+            args.worksheet_gid,
+            os.environ.get("GOOGLE_WORKSHEET_GID"),
+            default=str(DEFAULT_WORKSHEET_GID),
+        ),
         local_input=args.local_input,
         local_output=args.local_output,
         local_new=args.local_new,

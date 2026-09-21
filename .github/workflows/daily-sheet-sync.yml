@@ -21,12 +21,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Sync sheet
+      - name: Sync telesales_test from Metabase question 590
         env:
           IRAQ_METABASE_USERNAME: ${{ secrets.IRAQ_METABASE_USERNAME }}
           IRAQ_METABASE_PASSWORD: ${{ secrets.IRAQ_METABASE_PASSWORD }}
+          # Optional overrides; the script defaults to question 590 and
+          # spreadsheet 1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q / gid 292013814.
           METABASE_QUESTION_ID: ${{ secrets.METABASE_QUESTION_ID }}
           GOOGLE_SPREADSHEET_ID: ${{ secrets.GOOGLE_SPREADSHEET_ID }}
           GOOGLE_WORKSHEET_NAME: ${{ secrets.GOOGLE_WORKSHEET_NAME }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: python sheets_daily_sync.py
+        run: python sheets_daily_sync.py --worksheet-gid 292013814 --worksheet telesales_test --question-id 590

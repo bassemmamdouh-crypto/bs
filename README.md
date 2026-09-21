@@ -2,11 +2,17 @@
 
 ## Daily Google Sheet + Metabase sync
 
-`sheets_daily_sync.py` runs a daily refresh against one Google Sheet tab:
+`sheets_daily_sync.py` refreshes the **telesales_test** tab every day:
 
-1. Keep the header row.
-2. Delete every data row whose **column P** (the 16th column) is blank.
-3. Pull a Metabase question and **append** those rows as the new day's data.
+- Spreadsheet: [telesales workbook](https://docs.google.com/spreadsheets/d/1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q/edit?gid=292013814#gid=292013814)
+- Tab: `telesales_test` (gid `292013814`)
+- Metabase question: `590`
+
+Each run:
+
+1. Keeps the header row.
+2. Deletes every data row whose **column P** (the 16th column) is blank.
+3. Pulls Metabase question 590 and **appends** those rows as the new day's data.
 
 Rows that already have a value in column P stay on the sheet, so completed days accumulate.
 
@@ -14,23 +20,21 @@ Rows that already have a value in column P stay on the sheet, so completed days 
 
 1. Create a Google Cloud service account and download its JSON key.
 2. Enable the **Google Sheets API** and **Google Drive API** on that project.
-3. Share the target spreadsheet with the service account email (`...@...iam.gserviceaccount.com`) as Editor.
-4. Copy the spreadsheet ID from the URL: `https://docs.google.com/spreadsheets/d/<SPREADSHEET_ID>/edit`.
+3. Share `1STzx1zHsztQ1LNAE_0eF9FU0Crfcbes5Q62ZlxaJG6Q` with the service account email as Editor.
 
 ### GitHub Actions (runs every day at 01:00 UTC)
 
-Add these repository secrets:
+Required repository secrets:
 
 | Secret | Purpose |
 | --- | --- |
 | `IRAQ_METABASE_USERNAME` | Metabase login |
 | `IRAQ_METABASE_PASSWORD` | Metabase password |
-| `METABASE_QUESTION_ID` | Card / question id to export |
-| `GOOGLE_SPREADSHEET_ID` | Spreadsheet id from the URL |
-| `GOOGLE_WORKSHEET_NAME` | Tab name (optional; first tab if empty) |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Full service-account JSON key |
 
-The workflow is `.github/workflows/daily-sheet-sync.yml`. Use **Run workflow** on the Actions tab to test it once secrets are in place.
+Question id `590` and the telesales spreadsheet/tab are already the script defaults. Optional secrets `METABASE_QUESTION_ID`, `GOOGLE_SPREADSHEET_ID`, and `GOOGLE_WORKSHEET_NAME` override them.
+
+Use **Run workflow** on the Actions tab to test once secrets are in place.
 
 ### Run locally
 
@@ -38,10 +42,8 @@ The workflow is `.github/workflows/daily-sheet-sync.yml`. Use **Run workflow** o
 pip install -r requirements.txt
 export IRAQ_METABASE_USERNAME=...
 export IRAQ_METABASE_PASSWORD=...
-export METABASE_QUESTION_ID=123
-export GOOGLE_SPREADSHEET_ID=...
 export GOOGLE_SERVICE_ACCOUNT_FILE=/path/to/service-account.json
-python sheets_daily_sync.py --worksheet "Sheet1"
+python sheets_daily_sync.py
 ```
 
 Dry-run a CSV fixture without touching Google or Metabase:
