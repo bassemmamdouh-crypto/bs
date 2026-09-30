@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,7 @@ import pandas as pd
 ORDERS_FILE = r"E:\Marbah Products\Marbah Scripts\Marbah Invoices script\orders_data.xlsx"
 VEHICLES_FILE = r"E:\Marbah Products\Marbah Scripts\Marbah Invoices script\vehicles_data.xlsx"
 OUTPUT_ROOT = r"E:\Marbah Products\Marbah Scripts\Marbah Invoices script"
+KML_FILE = r""
 
 
 @dataclass
@@ -22,6 +24,7 @@ class RunSheetConfig:
     orders_file: str = ORDERS_FILE
     vehicles_file: str = VEHICLES_FILE
     output_root: str = OUTPUT_ROOT
+    kml_file: str = KML_FILE
 
     # Order columns
     order_id_candidates: Tuple[str, ...] = ("order_id", "order_number", "order_no", "orderid")
@@ -58,6 +61,7 @@ class RunSheetConfig:
     # Assignment behavior
     high_volume_min_load_ratio: float = 0.60
     max_stops_per_run: int = 23
+    nearest_routes_per_seed: int = 8
     runsheet_prefix: str = "RS"
     include_inactive_vehicles: bool = False
 
@@ -180,6 +184,87 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def parse_kml_route_centroids(kml_path: str) -> Dict[str, Tuple[float, float]]:
+    if not kml_path:
+        return {}
+    if not os.path.exists(kml_path):
+        log_warning(f"KML file not found, falling back to order coordinates: {kml_path}")
+        return {}
+    try:
+        tree = ET.parse(kml_path)
+        root = tree.getroot()
+    except Exception as exc:
+        log_warning(f"Unable to parse KML file, fallback to order coordinates: {exc}")
+        return {}
+
+    centroids: Dict[str, Tuple[float, float]] = {}
+    placemarks = root.findall(".//{*}Placemark")
+    for placemark in placemarks:
+        name_node = placemark.find(".//{*}name")
+        raw_name = name_node.text if name_node is not None else ""
+        route_key = normalize_key(raw_name)
+        if not route_key:
+            continue
+        coords_node = placemark.find(".//{*}coordinates")
+        if coords_node is None or not safe_str(coords_node.text, ""):
+            continue
+        coords_text = safe_str(coords_node.text, "")
+        lat_lon_points: List[Tuple[float, float]] = []
+        for token in re.split(r"\s+", coords_text.strip()):
+            if not token:
+                continue
+            parts = token.split(",")
+            if len(parts) < 2:
+                continue
+            lon = safe_float(parts[0], 0.0)
+            lat = safe_float(parts[1], 0.0)
+            lat_lon_points.append((lat, lon))
+        if not lat_lon_points:
+            continue
+        centroid_lat = sum(p[0] for p in lat_lon_points) / len(lat_lon_points)
+        centroid_lon = sum(p[1] for p in lat_lon_points) / len(lat_lon_points)
+        centroids[route_key] = (centroid_lat, centroid_lon)
+    if centroids:
+        log_info(f"Loaded {len(centroids)} route centroids from KML.")
+    return centroids
+
+
+def build_route_centers(
+    scoped_orders: pd.DataFrame,
+    kml_centroids: Dict[str, Tuple[float, float]],
+) -> Dict[str, Tuple[float, float]]:
+    centers: Dict[str, Tuple[float, float]] = {}
+    for route, route_df in scoped_orders.groupby("route", sort=False):
+        route_key = normalize_key(route)
+        if route_key in kml_centroids:
+            centers[route_key] = kml_centroids[route_key]
+            continue
+        lat = safe_float(route_df["lat"].mean(), 0.0)
+        lon = safe_float(route_df["lon"].mean(), 0.0)
+        centers[route_key] = (lat, lon)
+    return centers
+
+
+def build_route_neighbors(
+    route_centers: Dict[str, Tuple[float, float]],
+    nearest_routes_per_seed: int,
+) -> Dict[str, List[str]]:
+    neighbors: Dict[str, List[str]] = {}
+    routes = list(route_centers.keys())
+    for route in routes:
+        lat1, lon1 = route_centers[route]
+        scored: List[Tuple[float, str]] = []
+        for other in routes:
+            if other == route:
+                continue
+            lat2, lon2 = route_centers[other]
+            scored.append((haversine_km(lat1, lon1, lat2, lon2), other))
+        scored.sort(key=lambda t: t[0])
+        limit = max(0, nearest_routes_per_seed)
+        neighbors[route] = [x[1] for x in (scored[:limit] if limit else scored)]
+    return neighbors
+
+
 class VehicleBin:
     def __init__(
         self,
@@ -199,6 +284,7 @@ class VehicleBin:
         self.assigned_agent = assigned_agent
         self.vehicle_type = vehicle_type
         self.route = route
+        self.covered_routes: List[str] = []
         self.run_number = run_number
         self.capacity = max(0.0, capacity)
         self.remaining = max(0.0, capacity)
@@ -216,6 +302,11 @@ class VehicleBin:
         load = safe_float(order.get("order_load", 0), 0.0)
         self.orders.append(order)
         self.remaining -= load
+        order_route = safe_str(order.get("route", ""), "")
+        if order_route and order_route not in self.covered_routes:
+            self.covered_routes.append(order_route)
+        if not self.route and order_route:
+            self.route = order_route
         lat = safe_float(order.get("lat", 0), 0.0)
         lon = safe_float(order.get("lon", 0), 0.0)
         if self.centroid_lat is None or self.centroid_lon is None:
@@ -424,24 +515,22 @@ def build_runsheet_id(
     prefix: str,
     supply_chain: str,
     warehouse_id: str,
-    route: str,
     run_number: int,
     vehicle_id: str,
 ) -> str:
     chain_clean = re.sub(r"[^A-Z0-9]+", "", normalize_key(supply_chain)) or "SC"
     warehouse_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(warehouse_id, "W"))
-    route_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(route, "R"))
     vehicle_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(vehicle_id, "V"))
-    return f"{prefix}-{chain_clean}-{warehouse_clean}-{route_clean}-R{run_number:02d}-{vehicle_clean}"[:60]
+    return f"{prefix}-{chain_clean}-{warehouse_clean}-R{run_number:02d}-{vehicle_clean}"[:60]
 
 
-def assign_group_orders(
+def assign_scoped_orders(
     group_orders: pd.DataFrame,
     scoped_vehicles: pd.DataFrame,
     supply_chain: str,
     warehouse_id: str,
-    route: str,
     config: RunSheetConfig,
+    route_neighbors: Dict[str, List[str]],
 ) -> Tuple[List[VehicleBin], List[Dict[str, object]]]:
     if scoped_vehicles.empty:
         unassigned = group_orders.to_dict("records")
@@ -455,15 +544,15 @@ def assign_group_orders(
         capacity_reference = 1.0
     high_volume_threshold = capacity_reference * max(0.0, config.high_volume_min_load_ratio)
 
-    unassigned = group_orders.to_dict("records")
+    remaining = group_orders.to_dict("records")
     created_bins: List[VehicleBin] = []
     run_number = 1
     safety_counter = 0
 
-    while unassigned:
+    while remaining:
         safety_counter += 1
-        if safety_counter > 500:
-            log_warning(f"Safety break triggered for {supply_chain}/{warehouse_id}/{route}.")
+        if safety_counter > 1000:
+            log_warning(f"Safety break triggered for {supply_chain}/{warehouse_id}.")
             break
 
         bins: List[VehicleBin] = []
@@ -474,84 +563,138 @@ def assign_group_orders(
                 warehouse_id=safe_str(warehouse_id, ""),
                 assigned_agent=safe_str(v.get("assigned_agent", ""), ""),
                 vehicle_type=safe_str(v.get("vehicle_type", "GENERIC"), "GENERIC"),
-                route=safe_str(route, ""),
+                route="",
                 run_number=run_number,
                 capacity=safe_float(v["capacity"], 0.0),
                 runsheet_id=build_runsheet_id(
                     config.runsheet_prefix,
                     supply_chain,
                     safe_str(warehouse_id, ""),
-                    safe_str(route, ""),
                     run_number,
                     safe_str(v["vehicle_id"], ""),
                 ),
             )
             bins.append(bin_obj)
 
-        high_orders = [o for o in unassigned if safe_float(o.get("order_load", 0), 0.0) >= high_volume_threshold]
-        normal_orders = [o for o in unassigned if safe_float(o.get("order_load", 0), 0.0) < high_volume_threshold]
-        high_orders.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
-        normal_orders.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
-        ordered_candidates = high_orders + normal_orders
-
         assigned_ids = set()
-        for order in ordered_candidates:
-            chosen_bin = choose_best_bin(order, bins, config.max_stops_per_run)
-            if chosen_bin is None:
-                continue
-            chosen_bin.add_order(order)
-            assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
+        stop_cap = max(0, int(config.max_stops_per_run))
+        for bin_obj in bins:
+            if not remaining:
+                break
+
+            seed_order = max(remaining, key=lambda o: safe_float(o.get("order_load", 0), 0.0))
+            seed_route = safe_str(seed_order.get("route", ""), "")
+            route_priority = [seed_route] + [r for r in route_neighbors.get(seed_route, []) if r != seed_route]
+
+            other_routes = sorted(
+                {safe_str(o.get("route", ""), "") for o in remaining},
+                key=lambda route_name: sum(
+                    safe_float(o.get("order_load", 0), 0.0)
+                    for o in remaining
+                    if safe_str(o.get("route", ""), "") == route_name
+                ),
+                reverse=True,
+            )
+            for route_name in other_routes:
+                if route_name not in route_priority:
+                    route_priority.append(route_name)
+
+            for route_name in route_priority:
+                route_orders = sorted(
+                    [
+                        o
+                        for o in remaining
+                        if safe_str(o.get("route", ""), "") == route_name
+                        and safe_str(o.get("_order_id", ""), "") not in assigned_ids
+                    ],
+                    key=lambda o: safe_float(o.get("order_load", 0), 0.0),
+                    reverse=True,
+                )
+                for order in route_orders:
+                    load = safe_float(order.get("order_load", 0), 0.0)
+                    if not bin_obj.can_fit(load, stop_cap):
+                        continue
+                    bin_obj.add_order(order)
+                    assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
+                    if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                        break
+                if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                    break
 
         if not assigned_ids:
-            # If all bins reached stop cap, open next run and retry.
-            stop_cap = max(0, int(config.max_stops_per_run))
             has_stop_slot = any(stop_cap <= 0 or len(b.orders) < stop_cap for b in bins)
             if not has_stop_slot:
                 run_number += 1
                 continue
 
-            # Oversized order fallback: assign largest order to vehicle with max capacity.
-            unassigned.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
-            forced = unassigned[0]
+            # Oversized fallback: force highest-load order into the biggest available bin.
+            remaining.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
+            forced = remaining[0]
             candidate_bins = [b for b in bins if stop_cap <= 0 or len(b.orders) < stop_cap]
             biggest_bin = max(candidate_bins, key=lambda b: b.capacity)
             biggest_bin.add_order(forced)
             assigned_ids.add(safe_str(forced.get("_order_id", ""), ""))
             log_warning(
                 f"Oversized order '{forced.get('_order_id')}' exceeded vehicle capacity in "
-                f"{supply_chain}/{warehouse_id}/{route}; forced assignment applied."
+                f"{supply_chain}/{warehouse_id}; forced assignment applied."
             )
 
         non_empty_bins = [b for b in bins if b.orders]
         created_bins.extend(non_empty_bins)
-        unassigned = [o for o in unassigned if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
+        remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
         run_number += 1
 
-    return created_bins, unassigned
+    return created_bins, remaining
 
 
-def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunSheetConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_runsheets(
+    orders: pd.DataFrame,
+    vehicles: pd.DataFrame,
+    config: RunSheetConfig,
+    kml_centroids: Dict[str, Tuple[float, float]],
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     assignment_rows: List[Dict[str, object]] = []
     summary_rows: List[Dict[str, object]] = []
     unassigned_rows: List[Dict[str, object]] = []
+    capacity_plan_rows: List[Dict[str, object]] = []
 
     vehicles_by_chain_warehouse = {
         (chain, warehouse): group.copy()
         for (chain, warehouse), group in vehicles.groupby(["supply_chain", "warehouse_id"], sort=False)
     }
 
-    for (supply_chain, warehouse_id, route), group_df in orders.groupby(
-        ["supply_chain", "warehouse_id", "route"],
+    for (supply_chain, warehouse_id), scoped_orders in orders.groupby(
+        ["supply_chain", "warehouse_id"],
         sort=True,
     ):
         scoped_vehicles = vehicles_by_chain_warehouse.get((supply_chain, warehouse_id), pd.DataFrame())
-        bins, leftover = assign_group_orders(
-            group_df,
+        route_centers = build_route_centers(scoped_orders, kml_centroids)
+        route_neighbors = build_route_neighbors(route_centers, config.nearest_routes_per_seed)
+
+        demand = float(scoped_orders["order_load"].sum())
+        first_run_capacity = float(scoped_vehicles["capacity"].sum()) if not scoped_vehicles.empty else 0.0
+        overload_after_first_run = max(0.0, demand - first_run_capacity)
+        estimated_runs_needed = int(math.ceil(demand / first_run_capacity)) if first_run_capacity > 0 else 0
+        capacity_plan_rows.append(
+            {
+                "supply_chain": supply_chain,
+                "warehouse_id": warehouse_id,
+                "orders_count": int(len(scoped_orders)),
+                "routes_count": int(scoped_orders["route"].nunique()),
+                "total_demand_cbm": demand,
+                "first_run_total_capacity_cbm": first_run_capacity,
+                "overload_after_first_run_cbm": overload_after_first_run,
+                "estimated_runs_needed": estimated_runs_needed,
+            }
+        )
+
+        bins, leftover = assign_scoped_orders(
+            scoped_orders,
             scoped_vehicles,
             supply_chain,
             warehouse_id,
-            route,
             config,
+            route_neighbors,
         )
 
         for b in bins:
@@ -583,7 +726,8 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
                     "runsheet_id": b.runsheet_id,
                     "supply_chain": b.supply_chain,
                     "warehouse_id": b.warehouse_id,
-                    "route": b.route,
+                    "route_seed": b.route,
+                    "covered_routes": " | ".join(b.covered_routes),
                     "run_number": b.run_number,
                     "vehicle_id": b.vehicle_id,
                     "assigned_agent": b.assigned_agent,
@@ -615,13 +759,15 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
     assignment_df = pd.DataFrame(assignment_rows)
     summary_df = pd.DataFrame(summary_rows)
     unassigned_df = pd.DataFrame(unassigned_rows)
-    return assignment_df, summary_df, unassigned_df
+    capacity_df = pd.DataFrame(capacity_plan_rows)
+    return assignment_df, summary_df, unassigned_df, capacity_df
 
 
 def export_output(
     assignment_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     unassigned_df: pd.DataFrame,
+    capacity_df: pd.DataFrame,
     config: RunSheetConfig,
 ) -> str:
     now = datetime.now()
@@ -633,6 +779,7 @@ def export_output(
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         assignment_df.to_excel(writer, sheet_name="order_assignment", index=False)
         summary_df.to_excel(writer, sheet_name="runsheet_summary", index=False)
+        capacity_df.to_excel(writer, sheet_name="capacity_plan", index=False)
         if not unassigned_df.empty:
             unassigned_df.to_excel(writer, sheet_name="unassigned_orders", index=False)
 
@@ -643,6 +790,7 @@ def main() -> None:
     config = RunSheetConfig()
     orders_df = load_orders(config)
     vehicles_df = load_vehicles(config)
+    kml_centroids = parse_kml_route_centroids(config.kml_file)
 
     log_info(
         f"Loaded {len(orders_df)} orders across {orders_df['supply_chain'].nunique()} supply chains "
@@ -650,12 +798,17 @@ def main() -> None:
     )
     log_info(f"Loaded {len(vehicles_df)} active vehicles.")
 
-    assignment_df, summary_df, unassigned_df = build_runsheets(orders_df, vehicles_df, config)
+    assignment_df, summary_df, unassigned_df, capacity_df = build_runsheets(
+        orders_df,
+        vehicles_df,
+        config,
+        kml_centroids,
+    )
     if assignment_df.empty:
         log_warning("No runsheets were generated.")
         return
 
-    output_path = export_output(assignment_df, summary_df, unassigned_df, config)
+    output_path = export_output(assignment_df, summary_df, unassigned_df, capacity_df, config)
     log_info(f"Runsheet plan generated: {output_path}")
     log_info(f"Assigned orders: {len(assignment_df)}")
     log_info(f"Runsheets created: {summary_df['runsheet_id'].nunique() if not summary_df.empty else 0}")
