@@ -56,6 +56,7 @@ class RunSheetConfig:
 
     # Assignment behavior
     high_volume_min_load_ratio: float = 0.60
+    max_stops_per_run: int = 23
     runsheet_prefix: str = "RS"
     include_inactive_vehicles: bool = False
 
@@ -193,7 +194,9 @@ class VehicleBin:
         self.centroid_lat: Optional[float] = None
         self.centroid_lon: Optional[float] = None
 
-    def can_fit(self, load: float) -> bool:
+    def can_fit(self, load: float, max_stops_per_run: int = 0) -> bool:
+        if max_stops_per_run > 0 and len(self.orders) >= max_stops_per_run:
+            return False
         return self.remaining >= load
 
     def add_order(self, order: Dict[str, object]) -> None:
@@ -221,9 +224,9 @@ class VehicleBin:
         return (self.assigned_load / self.capacity) * 100.0
 
 
-def choose_best_bin(order: Dict[str, object], bins: List[VehicleBin]) -> Optional[VehicleBin]:
+def choose_best_bin(order: Dict[str, object], bins: List[VehicleBin], max_stops_per_run: int = 0) -> Optional[VehicleBin]:
     load = safe_float(order.get("order_load", 0), 0.0)
-    fit_bins = [b for b in bins if b.can_fit(load)]
+    fit_bins = [b for b in bins if b.can_fit(load, max_stops_per_run)]
     if not fit_bins:
         return None
 
@@ -474,17 +477,25 @@ def assign_group_orders(
 
         assigned_ids = set()
         for order in ordered_candidates:
-            chosen_bin = choose_best_bin(order, bins)
+            chosen_bin = choose_best_bin(order, bins, config.max_stops_per_run)
             if chosen_bin is None:
                 continue
             chosen_bin.add_order(order)
             assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
 
         if not assigned_ids:
+            # If all bins reached stop cap, open next run and retry.
+            stop_cap = max(0, int(config.max_stops_per_run))
+            has_stop_slot = any(stop_cap <= 0 or len(b.orders) < stop_cap for b in bins)
+            if not has_stop_slot:
+                run_number += 1
+                continue
+
             # Oversized order fallback: assign largest order to vehicle with max capacity.
             unassigned.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
             forced = unassigned[0]
-            biggest_bin = max(bins, key=lambda b: b.capacity)
+            candidate_bins = [b for b in bins if stop_cap <= 0 or len(b.orders) < stop_cap]
+            biggest_bin = max(candidate_bins, key=lambda b: b.capacity)
             biggest_bin.add_order(forced)
             assigned_ids.add(safe_str(forced.get("_order_id", ""), ""))
             log_warning(
@@ -563,6 +574,7 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
                     "remaining_capacity": b.remaining,
                     "utilization_pct": b.utilization_pct,
                     "orders_count": len(b.orders),
+                    "max_stops_per_run": config.max_stops_per_run,
                     "high_volume_orders_count": high_count,
                 }
             )
