@@ -27,7 +27,7 @@ class RunSheetConfig:
     order_id_candidates: Tuple[str, ...] = ("order_id", "order_number", "order_no", "orderid")
     supply_chain_candidates: Tuple[str, ...] = ("supply_chain", "supply chain", "supply_chain_name", "supplychain")
     warehouse_candidates: Tuple[str, ...] = ("warehouse_id", "warehouse", "warehouse_name", "wh_id", "depot")
-    district_id_candidates: Tuple[str, ...] = ("district_id", "district", "district_code", "area_id")
+    route_candidates: Tuple[str, ...] = ("route", "route_name", "delivery_route", "route_text")
     latitude_candidates: Tuple[str, ...] = ("retailer_lat", "latitude", "lat", "customer_lat", "store_lat")
     longitude_candidates: Tuple[str, ...] = ("retailer_long", "longitude", "long", "lng", "customer_long", "store_long")
     order_volume_candidates: Tuple[str, ...] = (
@@ -174,7 +174,7 @@ class VehicleBin:
         warehouse_id: str,
         assigned_agent: str,
         vehicle_type: str,
-        district_id: str,
+        route: str,
         run_number: int,
         capacity: float,
         runsheet_id: str,
@@ -184,7 +184,7 @@ class VehicleBin:
         self.warehouse_id = warehouse_id
         self.assigned_agent = assigned_agent
         self.vehicle_type = vehicle_type
-        self.district_id = district_id
+        self.route = route
         self.run_number = run_number
         self.capacity = max(0.0, capacity)
         self.remaining = max(0.0, capacity)
@@ -251,7 +251,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     order_id_col = find_existing_column(raw, config.order_id_candidates)
     chain_col = find_existing_column(raw, config.supply_chain_candidates)
     warehouse_col = find_existing_column(raw, config.warehouse_candidates)
-    district_col = find_existing_column(raw, config.district_id_candidates)
+    route_col = find_existing_column(raw, config.route_candidates)
     lat_col = find_existing_column(raw, config.latitude_candidates)
     lon_col = find_existing_column(raw, config.longitude_candidates)
     load_col = find_existing_column(raw, config.order_volume_candidates)
@@ -261,7 +261,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         "order_id": order_id_col,
         "supply_chain": chain_col,
         "warehouse_id": warehouse_col,
-        "district_id": district_col,
+        "route": route_col,
         "latitude": lat_col,
         "longitude": lon_col,
     }
@@ -273,7 +273,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     orders["_order_id"] = orders[order_id_col].apply(lambda x: normalize_identifier(x, ""))
     orders["_supply_chain"] = orders[chain_col].apply(lambda x: normalize_key(x))
     orders["_warehouse_id"] = orders[warehouse_col].apply(lambda x: normalize_identifier(x, ""))
-    orders["_district_id"] = orders[district_col].apply(lambda x: normalize_identifier(x, ""))
+    orders["_route"] = orders[route_col].apply(lambda x: normalize_key(x))
     orders["_lat"] = orders[lat_col].apply(lambda x: safe_float(x, 0.0))
     orders["_lon"] = orders[lon_col].apply(lambda x: safe_float(x, 0.0))
     if load_col is not None:
@@ -289,14 +289,14 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         (orders["_order_id"] != "")
         & (orders["_supply_chain"] != "")
         & (orders["_warehouse_id"] != "")
-        & (orders["_district_id"] != "")
+        & (orders["_route"] != "")
     ]
     grouped = (
         orders.groupby("_order_id", as_index=False)
         .agg(
             supply_chain=("_supply_chain", "first"),
             warehouse_id=("_warehouse_id", "first"),
-            district_id=("_district_id", "first"),
+            route=("_route", "first"),
             lat=("_lat", "first"),
             lon=("_lon", "first"),
             order_load=("_line_load", "sum"),
@@ -402,15 +402,15 @@ def build_runsheet_id(
     prefix: str,
     supply_chain: str,
     warehouse_id: str,
-    district_id: str,
+    route: str,
     run_number: int,
     vehicle_id: str,
 ) -> str:
     chain_clean = re.sub(r"[^A-Z0-9]+", "", normalize_key(supply_chain)) or "SC"
     warehouse_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(warehouse_id, "W"))
-    district_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(district_id, "D"))
+    route_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(route, "R"))
     vehicle_clean = re.sub(r"[^A-Za-z0-9]+", "", safe_str(vehicle_id, "V"))
-    return f"{prefix}-{chain_clean}-{warehouse_clean}-{district_clean}-R{run_number:02d}-{vehicle_clean}"[:60]
+    return f"{prefix}-{chain_clean}-{warehouse_clean}-{route_clean}-R{run_number:02d}-{vehicle_clean}"[:60]
 
 
 def assign_group_orders(
@@ -418,7 +418,7 @@ def assign_group_orders(
     scoped_vehicles: pd.DataFrame,
     supply_chain: str,
     warehouse_id: str,
-    district_id: str,
+    route: str,
     config: RunSheetConfig,
 ) -> Tuple[List[VehicleBin], List[Dict[str, object]]]:
     if scoped_vehicles.empty:
@@ -441,7 +441,7 @@ def assign_group_orders(
     while unassigned:
         safety_counter += 1
         if safety_counter > 500:
-            log_warning(f"Safety break triggered for {supply_chain}/{warehouse_id}/{district_id}.")
+            log_warning(f"Safety break triggered for {supply_chain}/{warehouse_id}/{route}.")
             break
 
         bins: List[VehicleBin] = []
@@ -452,14 +452,14 @@ def assign_group_orders(
                 warehouse_id=safe_str(warehouse_id, ""),
                 assigned_agent=safe_str(v.get("assigned_agent", ""), ""),
                 vehicle_type=safe_str(v.get("vehicle_type", "GENERIC"), "GENERIC"),
-                district_id=safe_str(district_id, ""),
+                route=safe_str(route, ""),
                 run_number=run_number,
                 capacity=safe_float(v["capacity"], 0.0),
                 runsheet_id=build_runsheet_id(
                     config.runsheet_prefix,
                     supply_chain,
                     safe_str(warehouse_id, ""),
-                    safe_str(district_id, ""),
+                    safe_str(route, ""),
                     run_number,
                     safe_str(v["vehicle_id"], ""),
                 ),
@@ -489,7 +489,7 @@ def assign_group_orders(
             assigned_ids.add(safe_str(forced.get("_order_id", ""), ""))
             log_warning(
                 f"Oversized order '{forced.get('_order_id')}' exceeded vehicle capacity in "
-                f"{supply_chain}/{warehouse_id}/{district_id}; forced assignment applied."
+                f"{supply_chain}/{warehouse_id}/{route}; forced assignment applied."
             )
 
         non_empty_bins = [b for b in bins if b.orders]
@@ -510,8 +510,8 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
         for (chain, warehouse), group in vehicles.groupby(["supply_chain", "warehouse_id"], sort=False)
     }
 
-    for (supply_chain, warehouse_id, district_id), group_df in orders.groupby(
-        ["supply_chain", "warehouse_id", "district_id"],
+    for (supply_chain, warehouse_id, route), group_df in orders.groupby(
+        ["supply_chain", "warehouse_id", "route"],
         sort=True,
     ):
         scoped_vehicles = vehicles_by_chain_warehouse.get((supply_chain, warehouse_id), pd.DataFrame())
@@ -520,7 +520,7 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
             scoped_vehicles,
             supply_chain,
             warehouse_id,
-            district_id,
+            route,
             config,
         )
 
@@ -537,7 +537,7 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
                         "order_id": order.get("_order_id", ""),
                         "supply_chain": order.get("supply_chain", ""),
                         "warehouse_id": order.get("warehouse_id", ""),
-                        "district_id": order.get("district_id", ""),
+                        "route": order.get("route", ""),
                         "retailer_lat": order.get("lat", 0.0),
                         "retailer_long": order.get("lon", 0.0),
                         "order_load": order.get("order_load", 0.0),
@@ -553,7 +553,7 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
                     "runsheet_id": b.runsheet_id,
                     "supply_chain": b.supply_chain,
                     "warehouse_id": b.warehouse_id,
-                    "district_id": b.district_id,
+                    "route": b.route,
                     "run_number": b.run_number,
                     "vehicle_id": b.vehicle_id,
                     "assigned_agent": b.assigned_agent,
@@ -573,7 +573,7 @@ def build_runsheets(orders: pd.DataFrame, vehicles: pd.DataFrame, config: RunShe
                     "order_id": order.get("_order_id", ""),
                     "supply_chain": order.get("supply_chain", ""),
                     "warehouse_id": order.get("warehouse_id", ""),
-                    "district_id": order.get("district_id", ""),
+                    "route": order.get("route", ""),
                     "retailer_lat": order.get("lat", 0.0),
                     "retailer_long": order.get("lon", 0.0),
                     "order_load": order.get("order_load", 0.0),
@@ -615,7 +615,7 @@ def main() -> None:
 
     log_info(
         f"Loaded {len(orders_df)} orders across {orders_df['supply_chain'].nunique()} supply chains "
-        f"and {orders_df['warehouse_id'].nunique()} warehouses and {orders_df['district_id'].nunique()} districts."
+        f"and {orders_df['warehouse_id'].nunique()} warehouses and {orders_df['route'].nunique()} routes."
     )
     log_info(f"Loaded {len(vehicles_df)} active vehicles.")
 
