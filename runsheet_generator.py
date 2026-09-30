@@ -62,6 +62,9 @@ class RunSheetConfig:
     high_volume_min_load_ratio: float = 0.60
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
+    # Retailer proximity guardrails (set <=0 to disable a guard).
+    max_retailer_distance_to_centroid_km: float = 7.0
+    max_retailer_pair_distance_km: float = 10.0
     runsheet_prefix: str = "RS"
     include_inactive_vehicles: bool = False
 
@@ -182,6 +185,33 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
     return 2 * r * math.asin(math.sqrt(a))
+
+
+def order_within_bin_distance_limits(order: Dict[str, object], bin_obj: "VehicleBin", config: RunSheetConfig) -> bool:
+    if not bin_obj.orders:
+        return True
+
+    lat = safe_float(order.get("lat", 0), 0.0)
+    lon = safe_float(order.get("lon", 0), 0.0)
+    if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None:
+        return True
+
+    max_centroid = safe_float(config.max_retailer_distance_to_centroid_km, 0.0)
+    if max_centroid > 0:
+        centroid_dist = haversine_km(lat, lon, bin_obj.centroid_lat, bin_obj.centroid_lon)
+        if centroid_dist > max_centroid:
+            return False
+
+    max_pair = safe_float(config.max_retailer_pair_distance_km, 0.0)
+    if max_pair > 0:
+        for existing in bin_obj.orders:
+            ex_lat = safe_float(existing.get("lat", 0), 0.0)
+            ex_lon = safe_float(existing.get("lon", 0), 0.0)
+            d = haversine_km(lat, lon, ex_lat, ex_lon)
+            if d > max_pair:
+                return False
+
+    return True
 
 
 def parse_kml_route_centroids(kml_path: str) -> Dict[str, Tuple[float, float]]:
@@ -613,6 +643,8 @@ def assign_scoped_orders(
                 for order in route_orders:
                     load = safe_float(order.get("order_load", 0), 0.0)
                     if not bin_obj.can_fit(load, stop_cap):
+                        continue
+                    if not order_within_bin_distance_limits(order, bin_obj, config):
                         continue
                     bin_obj.add_order(order)
                     assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
