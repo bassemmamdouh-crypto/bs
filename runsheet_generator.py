@@ -30,12 +30,13 @@ class RunSheetConfig:
     route_candidates: Tuple[str, ...] = ("route", "route_name", "delivery_route", "route_text")
     latitude_candidates: Tuple[str, ...] = ("retailer_lat", "latitude", "lat", "customer_lat", "store_lat")
     longitude_candidates: Tuple[str, ...] = ("retailer_long", "longitude", "long", "lng", "customer_long", "store_long")
-    order_volume_candidates: Tuple[str, ...] = (
+    # CBM is prioritized for planning load/capacity.
+    order_cbm_candidates: Tuple[str, ...] = ("order_cbm", "cbm", "total_cbm", "volume_cbm", "volume")
+    # Fallback only when CBM column is missing/empty.
+    order_volume_fallback_candidates: Tuple[str, ...] = (
         "order_volume",
         "vehicle_load",
         "load",
-        "cbm",
-        "volume",
         "total_qty",
         "purchased_item_count",
         "qty",
@@ -157,6 +158,18 @@ def bool_from_value(value: object, default: bool = True) -> bool:
     return default
 
 
+def aggregate_order_measure(series: pd.Series) -> float:
+    numeric = pd.to_numeric(series, errors="coerce").fillna(0)
+    non_zero = numeric[numeric > 0]
+    if non_zero.empty:
+        return 0.0
+    unique = non_zero.unique()
+    # If same non-zero value repeats in each line, treat it as order-level value.
+    if len(unique) == 1 and len(non_zero) > 1:
+        return float(unique[0])
+    return float(non_zero.sum())
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1 = math.radians(lat1)
@@ -257,7 +270,8 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     route_col = find_existing_column(raw, config.route_candidates)
     lat_col = find_existing_column(raw, config.latitude_candidates)
     lon_col = find_existing_column(raw, config.longitude_candidates)
-    load_col = find_existing_column(raw, config.order_volume_candidates)
+    cbm_col = find_existing_column(raw, config.order_cbm_candidates)
+    load_fallback_col = find_existing_column(raw, config.order_volume_fallback_candidates)
     date_col = find_existing_column(raw, config.delivery_date_candidates)
 
     required = {
@@ -279,10 +293,15 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     orders["_route"] = orders[route_col].apply(lambda x: normalize_key(x))
     orders["_lat"] = orders[lat_col].apply(lambda x: safe_float(x, 0.0))
     orders["_lon"] = orders[lon_col].apply(lambda x: safe_float(x, 0.0))
-    if load_col is not None:
-        orders["_line_load"] = orders[load_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+    if cbm_col is not None:
+        orders["_line_load"] = orders[cbm_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+        log_info(f"Using CBM column for load planning: {cbm_col}")
+    elif load_fallback_col is not None:
+        orders["_line_load"] = orders[load_fallback_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+        log_warning(f"CBM column not found. Using fallback load column: {load_fallback_col}")
     else:
         orders["_line_load"] = 1.0
+        log_warning("No CBM/load column found. Using default load=1 per order line.")
     if date_col is not None:
         orders["_delivery_date"] = pd.to_datetime(orders[date_col], errors="coerce")
     else:
@@ -302,7 +321,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
             route=("_route", "first"),
             lat=("_lat", "first"),
             lon=("_lon", "first"),
-            order_load=("_line_load", "sum"),
+            order_load=("_line_load", aggregate_order_measure),
             delivery_date=("_delivery_date", "max"),
         )
     )
