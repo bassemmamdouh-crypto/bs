@@ -572,12 +572,13 @@ def assign_scoped_orders(
     warehouse_id: str,
     config: RunSheetConfig,
     route_neighbors: Dict[str, List[str]],
-) -> Tuple[List[VehicleBin], List[Dict[str, object]]]:
+) -> Tuple[List[VehicleBin], List[Dict[str, object]], List[Dict[str, object]]]:
     if scoped_vehicles.empty:
         unassigned = group_orders.to_dict("records")
-        return [], unassigned
+        return [], unassigned, []
 
     vehicle_list = scoped_vehicles.sort_values("vehicle_id").to_dict("records")
+    max_vehicle_capacity = max(safe_float(v.get("capacity", 0), 0.0) for v in vehicle_list)
     capacity_reference = float(pd.Series([safe_float(v["capacity"], 0.0) for v in vehicle_list]).median())
     if capacity_reference <= 0:
         capacity_reference = float(pd.Series([safe_float(v["capacity"], 0.0) for v in vehicle_list]).mean())
@@ -587,6 +588,7 @@ def assign_scoped_orders(
 
     remaining = group_orders.to_dict("records")
     created_bins: List[VehicleBin] = []
+    capacity_unassigned: List[Dict[str, object]] = []
     run_number = 1
     safety_counter = 0
 
@@ -670,29 +672,57 @@ def assign_scoped_orders(
                 assigned_ids.add(chosen_id)
 
         if not assigned_ids:
-            has_stop_slot = any(stop_cap <= 0 or len(b.orders) < stop_cap for b in bins)
-            if not has_stop_slot:
-                run_number += 1
+            # Pass 2 fallback: capacity-first assignment (ignore distance guardrails, still enforce capacity/stops).
+            capacity_sorted = sorted(
+                remaining,
+                key=lambda o: safe_float(o.get("order_load", 0), 0.0),
+                reverse=True,
+            )
+            for order in capacity_sorted:
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if not order_id or order_id in assigned_ids:
+                    continue
+                load = safe_float(order.get("order_load", 0), 0.0)
+                for bin_obj in bins:
+                    if bin_obj.can_fit(load, stop_cap):
+                        bin_obj.add_order(order)
+                        assigned_ids.add(order_id)
+                        break
+
+        if not assigned_ids:
+            # Remove truly oversized orders that can never fit any vehicle capacity.
+            oversized_ids = set()
+            for order in remaining:
+                load = safe_float(order.get("order_load", 0), 0.0)
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if load > max_vehicle_capacity and order_id:
+                    oversized_ids.add(order_id)
+                    tagged = dict(order)
+                    tagged["unassigned_reason"] = "order_load_exceeds_max_vehicle_capacity"
+                    capacity_unassigned.append(tagged)
+
+            if oversized_ids:
+                remaining = [
+                    o
+                    for o in remaining
+                    if safe_str(o.get("_order_id", ""), "") not in oversized_ids
+                ]
+                log_warning(
+                    f"Found {len(oversized_ids)} oversized order(s) in {supply_chain}/{warehouse_id} "
+                    "that exceed max vehicle capacity and were marked unassigned."
+                )
                 continue
 
-            # Oversized fallback: force highest-load order into the biggest available bin.
-            remaining.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
-            forced = remaining[0]
-            candidate_bins = [b for b in bins if stop_cap <= 0 or len(b.orders) < stop_cap]
-            biggest_bin = max(candidate_bins, key=lambda b: b.capacity)
-            biggest_bin.add_order(forced)
-            assigned_ids.add(safe_str(forced.get("_order_id", ""), ""))
-            log_warning(
-                f"Oversized order '{forced.get('_order_id')}' exceeded vehicle capacity in "
-                f"{supply_chain}/{warehouse_id}; forced assignment applied."
-            )
+            # No assignment possible in this run due stop cap or fragmentation; open next run.
+            run_number += 1
+            continue
 
         non_empty_bins = [b for b in bins if b.orders]
         created_bins.extend(non_empty_bins)
         remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
         run_number += 1
 
-    return created_bins, remaining
+    return created_bins, remaining, capacity_unassigned
 
 
 def build_runsheets(
@@ -736,7 +766,7 @@ def build_runsheets(
             }
         )
 
-        bins, leftover = assign_scoped_orders(
+        bins, leftover, capacity_unassigned = assign_scoped_orders(
             scoped_orders,
             scoped_vehicles,
             supply_chain,
@@ -803,6 +833,19 @@ def build_runsheets(
                     "reason": "No compatible vehicle/scheduling slot",
                 }
             )
+        for order in capacity_unassigned:
+            unassigned_rows.append(
+                {
+                    "order_id": order.get("_order_id", ""),
+                    "supply_chain": order.get("supply_chain", ""),
+                    "warehouse_id": order.get("warehouse_id", ""),
+                    "route": order.get("route", ""),
+                    "retailer_lat": order.get("lat", 0.0),
+                    "retailer_long": order.get("lon", 0.0),
+                    "order_load": order.get("order_load", 0.0),
+                    "reason": safe_str(order.get("unassigned_reason", ""), "No compatible vehicle/scheduling slot"),
+                }
+            )
 
     assignment_df = pd.DataFrame(assignment_rows)
     summary_df = pd.DataFrame(summary_rows)
@@ -855,6 +898,10 @@ def main() -> None:
     if assignment_df.empty:
         log_warning("No runsheets were generated.")
         return
+
+    if not summary_df.empty:
+        max_run = int(summary_df["run_number"].max())
+        log_info(f"Max run number generated in one warehouse/supply-chain scope: {max_run}")
 
     output_path = export_output(assignment_df, summary_df, unassigned_df, capacity_df, config)
     log_info(f"Runsheet plan generated: {output_path}")
