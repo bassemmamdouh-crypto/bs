@@ -214,6 +214,17 @@ def order_within_bin_distance_limits(order: Dict[str, object], bin_obj: "Vehicle
     return True
 
 
+def route_proximity_penalty(route_name: str, seed_route: str, route_neighbors: Dict[str, List[str]]) -> float:
+    if not seed_route:
+        return 0.0
+    if route_name == seed_route:
+        return 0.0
+    neighbors = route_neighbors.get(seed_route, [])
+    if route_name in neighbors:
+        return (neighbors.index(route_name) + 1) * 0.25
+    return 3.0
+
+
 def parse_kml_route_centroids(kml_path: str) -> Dict[str, Tuple[float, float]]:
     if not kml_path:
         return {}
@@ -613,45 +624,50 @@ def assign_scoped_orders(
                 break
 
             seed_order = max(remaining, key=lambda o: safe_float(o.get("order_load", 0), 0.0))
+            seed_id = safe_str(seed_order.get("_order_id", ""), "")
+            seed_load = safe_float(seed_order.get("order_load", 0), 0.0)
+            if seed_id in assigned_ids:
+                continue
+            if bin_obj.can_fit(seed_load, stop_cap):
+                bin_obj.add_order(seed_order)
+                assigned_ids.add(seed_id)
             seed_route = safe_str(seed_order.get("route", ""), "")
-            route_priority = [seed_route] + [r for r in route_neighbors.get(seed_route, []) if r != seed_route]
+            while True:
+                if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                    break
+                if not bin_obj.orders:
+                    break
 
-            other_routes = sorted(
-                {safe_str(o.get("route", ""), "") for o in remaining},
-                key=lambda route_name: sum(
-                    safe_float(o.get("order_load", 0), 0.0)
-                    for o in remaining
-                    if safe_str(o.get("route", ""), "") == route_name
-                ),
-                reverse=True,
-            )
-            for route_name in other_routes:
-                if route_name not in route_priority:
-                    route_priority.append(route_name)
-
-            for route_name in route_priority:
-                route_orders = sorted(
-                    [
-                        o
-                        for o in remaining
-                        if safe_str(o.get("route", ""), "") == route_name
-                        and safe_str(o.get("_order_id", ""), "") not in assigned_ids
-                    ],
-                    key=lambda o: safe_float(o.get("order_load", 0), 0.0),
-                    reverse=True,
-                )
-                for order in route_orders:
+                scored_candidates: List[Tuple[float, float, Dict[str, object]]] = []
+                for order in remaining:
+                    order_id = safe_str(order.get("_order_id", ""), "")
+                    if not order_id or order_id in assigned_ids:
+                        continue
                     load = safe_float(order.get("order_load", 0), 0.0)
                     if not bin_obj.can_fit(load, stop_cap):
                         continue
                     if not order_within_bin_distance_limits(order, bin_obj, config):
                         continue
-                    bin_obj.add_order(order)
-                    assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
-                    if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
-                        break
-                if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+
+                    lat = safe_float(order.get("lat", 0), 0.0)
+                    lon = safe_float(order.get("lon", 0), 0.0)
+                    distance = haversine_km(lat, lon, safe_float(bin_obj.centroid_lat, 0.0), safe_float(bin_obj.centroid_lon, 0.0))
+                    route_name = safe_str(order.get("route", ""), "")
+                    penalty = route_proximity_penalty(route_name, seed_route, route_neighbors)
+                    score = distance + penalty
+                    # Sort by score asc, then by load desc.
+                    scored_candidates.append((score, -load, order))
+
+                if not scored_candidates:
                     break
+
+                scored_candidates.sort(key=lambda t: (t[0], t[1]))
+                chosen_order = scored_candidates[0][2]
+                chosen_id = safe_str(chosen_order.get("_order_id", ""), "")
+                if not chosen_id:
+                    break
+                bin_obj.add_order(chosen_order)
+                assigned_ids.add(chosen_id)
 
         if not assigned_ids:
             has_stop_slot = any(stop_cap <= 0 or len(b.orders) < stop_cap for b in bins)
