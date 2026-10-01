@@ -13,10 +13,10 @@ import pandas as pd
 # =============================
 # SETTINGS (EDIT THIS SECTION)
 # =============================
-ORDERS_FILE = r"E:\Marbah Products\Marbah Scripts\Marbah Invoices script\orders_data.xlsx"
-VEHICLES_FILE = r"E:\Marbah Products\Marbah Scripts\Marbah Invoices script\vehicles_data.xlsx"
-OUTPUT_ROOT = r"E:\Marbah Products\Marbah Scripts\Marbah Invoices script"
-KML_FILE = r""
+ORDERS_FILE = r"C:\Users\Adel El orashy\Downloads\Marbah Project\scripts\orders_data.xlsx"
+VEHICLES_FILE = r"C:\Users\Adel El orashy\Downloads\Marbah Project\scripts\vehicles_data.xlsx"
+OUTPUT_ROOT = r"C:\Users\Adel El orashy\Downloads\Marbah Project\scripts"
+KML_FILE = r"C:\Users\Adel El orashy\Downloads\Marbah Project\scripts\Marbah IRAQ Map.kml"
 
 
 @dataclass
