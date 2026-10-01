@@ -565,42 +565,17 @@ def build_runsheet_id(
     return f"{prefix}-{chain_clean}-{warehouse_clean}-R{run_number:02d}-{vehicle_clean}"[:60]
 
 
-def assign_scoped_orders(
-    group_orders: pd.DataFrame,
-    scoped_vehicles: pd.DataFrame,
+def create_vehicle_bins(
+    vehicle_list: List[Dict[str, object]],
     supply_chain: str,
     warehouse_id: str,
+    run_number: int,
     config: RunSheetConfig,
-    route_neighbors: Dict[str, List[str]],
-) -> Tuple[List[VehicleBin], List[Dict[str, object]], List[Dict[str, object]]]:
-    if scoped_vehicles.empty:
-        unassigned = group_orders.to_dict("records")
-        return [], unassigned, []
-
-    vehicle_list = scoped_vehicles.sort_values("vehicle_id").to_dict("records")
-    max_vehicle_capacity = max(safe_float(v.get("capacity", 0), 0.0) for v in vehicle_list)
-    capacity_reference = float(pd.Series([safe_float(v["capacity"], 0.0) for v in vehicle_list]).median())
-    if capacity_reference <= 0:
-        capacity_reference = float(pd.Series([safe_float(v["capacity"], 0.0) for v in vehicle_list]).mean())
-    if capacity_reference <= 0:
-        capacity_reference = 1.0
-    high_volume_threshold = capacity_reference * max(0.0, config.high_volume_min_load_ratio)
-
-    remaining = group_orders.to_dict("records")
-    created_bins: List[VehicleBin] = []
-    capacity_unassigned: List[Dict[str, object]] = []
-    run_number = 1
-    safety_counter = 0
-
-    while remaining:
-        safety_counter += 1
-        if safety_counter > 1000:
-            log_warning(f"Safety break triggered for {supply_chain}/{warehouse_id}.")
-            break
-
-        bins: List[VehicleBin] = []
-        for v in vehicle_list:
-            bin_obj = VehicleBin(
+) -> List[VehicleBin]:
+    bins: List[VehicleBin] = []
+    for v in vehicle_list:
+        bins.append(
+            VehicleBin(
                 vehicle_id=safe_str(v["vehicle_id"], ""),
                 supply_chain=supply_chain,
                 warehouse_id=safe_str(warehouse_id, ""),
@@ -617,30 +592,204 @@ def assign_scoped_orders(
                     safe_str(v["vehicle_id"], ""),
                 ),
             )
-            bins.append(bin_obj)
+        )
+    return bins
 
-        assigned_ids = set()
-        stop_cap = max(0, int(config.max_stops_per_run))
+
+def select_second_run_order_ids(
+    orders: List[Dict[str, object]],
+    extra_load_target: float,
+    route_neighbors: Dict[str, List[str]],
+    config: RunSheetConfig,
+) -> set:
+    if extra_load_target <= 0:
+        return set()
+
+    remaining = list(orders)
+    selected_ids: set = set()
+    selected_load = 0.0
+    safety = 0
+    while selected_load < extra_load_target and remaining:
+        safety += 1
+        if safety > 10000:
+            break
+
+        seed = max(remaining, key=lambda o: safe_float(o.get("order_load", 0), 0.0))
+        seed_id = safe_str(seed.get("_order_id", ""), "")
+        if not seed_id:
+            remaining = [o for o in remaining if o is not seed]
+            continue
+        if seed_id not in selected_ids:
+            selected_ids.add(seed_id)
+            selected_load += safe_float(seed.get("order_load", 0), 0.0)
+
+        seed_lat = safe_float(seed.get("lat", 0), 0.0)
+        seed_lon = safe_float(seed.get("lon", 0), 0.0)
+        seed_route = safe_str(seed.get("route", ""), "")
+
+        scored: List[Tuple[float, float, Dict[str, object]]] = []
+        for order in remaining:
+            order_id = safe_str(order.get("_order_id", ""), "")
+            if not order_id or order_id in selected_ids:
+                continue
+            load = safe_float(order.get("order_load", 0), 0.0)
+            lat = safe_float(order.get("lat", 0), 0.0)
+            lon = safe_float(order.get("lon", 0), 0.0)
+            distance = haversine_km(seed_lat, seed_lon, lat, lon)
+            route_penalty = route_proximity_penalty(
+                safe_str(order.get("route", ""), ""),
+                seed_route,
+                route_neighbors,
+            )
+            score = distance + (route_penalty * 1.5)
+            scored.append((score, -load, order))
+        scored.sort(key=lambda t: (t[0], t[1]))
+
+        for _, _, order in scored:
+            if selected_load >= extra_load_target:
+                break
+            order_id = safe_str(order.get("_order_id", ""), "")
+            if not order_id or order_id in selected_ids:
+                continue
+            selected_ids.add(order_id)
+            selected_load += safe_float(order.get("order_load", 0), 0.0)
+
+        remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in selected_ids]
+
+    return selected_ids
+
+
+def assign_single_first_run_route_first(
+    first_run_orders: List[Dict[str, object]],
+    bins: List[VehicleBin],
+    route_neighbors: Dict[str, List[str]],
+    config: RunSheetConfig,
+) -> set:
+    assigned_ids: set = set()
+    stop_cap = max(0, int(config.max_stops_per_run))
+
+    for bin_obj in bins:
+        remaining = [
+            o
+            for o in first_run_orders
+            if safe_str(o.get("_order_id", ""), "") not in assigned_ids
+        ]
+        if not remaining:
+            break
+
+        route_loads: Dict[str, float] = {}
+        for order in remaining:
+            route_name = safe_str(order.get("route", ""), "")
+            route_loads[route_name] = route_loads.get(route_name, 0.0) + safe_float(order.get("order_load", 0), 0.0)
+        if not route_loads:
+            continue
+        seed_route = max(route_loads.items(), key=lambda t: t[1])[0]
+        route_sequence = [seed_route] + [r for r in route_neighbors.get(seed_route, []) if r != seed_route]
+        for route_name in sorted(route_loads.keys(), key=lambda r: route_loads[r], reverse=True):
+            if route_name not in route_sequence:
+                route_sequence.append(route_name)
+
+        for route_name in route_sequence:
+            route_orders = [
+                o
+                for o in first_run_orders
+                if safe_str(o.get("route", ""), "") == route_name
+                and safe_str(o.get("_order_id", ""), "") not in assigned_ids
+            ]
+            route_orders.sort(key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
+            for order in route_orders:
+                if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                    break
+                load = safe_float(order.get("order_load", 0), 0.0)
+                if not bin_obj.can_fit(load, stop_cap):
+                    continue
+                if not order_within_bin_distance_limits(order, bin_obj, config):
+                    continue
+                bin_obj.add_order(order)
+                assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
+            if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                break
+
+        # Final fill for this first-run vehicle: nearest feasible orders if capacity still exists.
+        while True:
+            if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                break
+            candidates: List[Tuple[float, float, Dict[str, object]]] = []
+            for order in first_run_orders:
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if not order_id or order_id in assigned_ids:
+                    continue
+                load = safe_float(order.get("order_load", 0), 0.0)
+                if not bin_obj.can_fit(load, stop_cap):
+                    continue
+                if not order_within_bin_distance_limits(order, bin_obj, config):
+                    continue
+                lat = safe_float(order.get("lat", 0), 0.0)
+                lon = safe_float(order.get("lon", 0), 0.0)
+                dist = (
+                    0.0
+                    if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None
+                    else haversine_km(lat, lon, bin_obj.centroid_lat, bin_obj.centroid_lon)
+                )
+                candidates.append((dist, -load, order))
+            if not candidates:
+                break
+            candidates.sort(key=lambda t: (t[0], t[1]))
+            chosen = candidates[0][2]
+            chosen_id = safe_str(chosen.get("_order_id", ""), "")
+            if not chosen_id:
+                break
+            bin_obj.add_order(chosen)
+            assigned_ids.add(chosen_id)
+
+    return assigned_ids
+
+
+def assign_multi_runs_nearest(
+    orders_pool: List[Dict[str, object]],
+    vehicle_list: List[Dict[str, object]],
+    supply_chain: str,
+    warehouse_id: str,
+    start_run_number: int,
+    route_neighbors: Dict[str, List[str]],
+    config: RunSheetConfig,
+) -> Tuple[List[VehicleBin], List[Dict[str, object]], List[Dict[str, object]]]:
+    if not orders_pool:
+        return [], [], []
+
+    max_vehicle_capacity = max(safe_float(v.get("capacity", 0), 0.0) for v in vehicle_list) if vehicle_list else 0.0
+    remaining = list(orders_pool)
+    created_bins: List[VehicleBin] = []
+    capacity_unassigned: List[Dict[str, object]] = []
+    run_number = start_run_number
+    stop_cap = max(0, int(config.max_stops_per_run))
+    safety_counter = 0
+
+    while remaining:
+        safety_counter += 1
+        if safety_counter > 1000:
+            log_warning(f"Safety break triggered for extra runs in {supply_chain}/{warehouse_id}.")
+            break
+
+        bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, run_number, config)
+        assigned_ids: set = set()
         for bin_obj in bins:
             if not remaining:
                 break
-
-            seed_order = max(remaining, key=lambda o: safe_float(o.get("order_load", 0), 0.0))
-            seed_id = safe_str(seed_order.get("_order_id", ""), "")
-            seed_load = safe_float(seed_order.get("order_load", 0), 0.0)
-            if seed_id in assigned_ids:
-                continue
-            if bin_obj.can_fit(seed_load, stop_cap):
-                bin_obj.add_order(seed_order)
+            seed = max(remaining, key=lambda o: safe_float(o.get("order_load", 0), 0.0))
+            seed_id = safe_str(seed.get("_order_id", ""), "")
+            seed_load = safe_float(seed.get("order_load", 0), 0.0)
+            if seed_id and bin_obj.can_fit(seed_load, stop_cap):
+                bin_obj.add_order(seed)
                 assigned_ids.add(seed_id)
-            seed_route = safe_str(seed_order.get("route", ""), "")
+            seed_route = safe_str(seed.get("route", ""), "")
+
             while True:
                 if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
                     break
                 if not bin_obj.orders:
                     break
-
-                scored_candidates: List[Tuple[float, float, Dict[str, object]]] = []
+                candidates: List[Tuple[float, float, Dict[str, object]]] = []
                 for order in remaining:
                     order_id = safe_str(order.get("_order_id", ""), "")
                     if not order_id or order_id in assigned_ids:
@@ -650,34 +799,25 @@ def assign_scoped_orders(
                         continue
                     if not order_within_bin_distance_limits(order, bin_obj, config):
                         continue
-
                     lat = safe_float(order.get("lat", 0), 0.0)
                     lon = safe_float(order.get("lon", 0), 0.0)
                     distance = haversine_km(lat, lon, safe_float(bin_obj.centroid_lat, 0.0), safe_float(bin_obj.centroid_lon, 0.0))
-                    route_name = safe_str(order.get("route", ""), "")
-                    penalty = route_proximity_penalty(route_name, seed_route, route_neighbors)
-                    score = distance + penalty
-                    # Sort by score asc, then by load desc.
-                    scored_candidates.append((score, -load, order))
-
-                if not scored_candidates:
+                    route_penalty = route_proximity_penalty(safe_str(order.get("route", ""), ""), seed_route, route_neighbors)
+                    score = distance + route_penalty
+                    candidates.append((score, -load, order))
+                if not candidates:
                     break
-
-                scored_candidates.sort(key=lambda t: (t[0], t[1]))
-                chosen_order = scored_candidates[0][2]
-                chosen_id = safe_str(chosen_order.get("_order_id", ""), "")
+                candidates.sort(key=lambda t: (t[0], t[1]))
+                chosen = candidates[0][2]
+                chosen_id = safe_str(chosen.get("_order_id", ""), "")
                 if not chosen_id:
                     break
-                bin_obj.add_order(chosen_order)
+                bin_obj.add_order(chosen)
                 assigned_ids.add(chosen_id)
 
         if not assigned_ids:
-            # Pass 2 fallback: capacity-first assignment (ignore distance guardrails, still enforce capacity/stops).
-            capacity_sorted = sorted(
-                remaining,
-                key=lambda o: safe_float(o.get("order_load", 0), 0.0),
-                reverse=True,
-            )
+            # Capacity-first fallback (still strict capacity).
+            capacity_sorted = sorted(remaining, key=lambda o: safe_float(o.get("order_load", 0), 0.0), reverse=True)
             for order in capacity_sorted:
                 order_id = safe_str(order.get("_order_id", ""), "")
                 if not order_id or order_id in assigned_ids:
@@ -690,7 +830,6 @@ def assign_scoped_orders(
                         break
 
         if not assigned_ids:
-            # Remove truly oversized orders that can never fit any vehicle capacity.
             oversized_ids = set()
             for order in remaining:
                 load = safe_float(order.get("order_load", 0), 0.0)
@@ -700,29 +839,71 @@ def assign_scoped_orders(
                     tagged = dict(order)
                     tagged["unassigned_reason"] = "order_load_exceeds_max_vehicle_capacity"
                     capacity_unassigned.append(tagged)
-
             if oversized_ids:
-                remaining = [
-                    o
-                    for o in remaining
-                    if safe_str(o.get("_order_id", ""), "") not in oversized_ids
-                ]
-                log_warning(
-                    f"Found {len(oversized_ids)} oversized order(s) in {supply_chain}/{warehouse_id} "
-                    "that exceed max vehicle capacity and were marked unassigned."
-                )
+                remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in oversized_ids]
                 continue
-
-            # No assignment possible in this run due stop cap or fragmentation; open next run.
             run_number += 1
             continue
 
-        non_empty_bins = [b for b in bins if b.orders]
-        created_bins.extend(non_empty_bins)
+        created_bins.extend([b for b in bins if b.orders])
         remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
         run_number += 1
 
     return created_bins, remaining, capacity_unassigned
+
+
+def assign_scoped_orders(
+    group_orders: pd.DataFrame,
+    scoped_vehicles: pd.DataFrame,
+    supply_chain: str,
+    warehouse_id: str,
+    config: RunSheetConfig,
+    route_neighbors: Dict[str, List[str]],
+) -> Tuple[List[VehicleBin], List[Dict[str, object]], List[Dict[str, object]]]:
+    if scoped_vehicles.empty:
+        unassigned = group_orders.to_dict("records")
+        return [], unassigned, []
+
+    vehicle_list = scoped_vehicles.sort_values("vehicle_id").to_dict("records")
+    all_orders = group_orders.to_dict("records")
+
+    first_run_total_capacity = sum(safe_float(v["capacity"], 0.0) for v in vehicle_list)
+    total_demand = sum(safe_float(o.get("order_load", 0), 0.0) for o in all_orders)
+    extra_load_target = max(0.0, total_demand - first_run_total_capacity)
+
+    # Step 1: carve second-run pool first (based on overload).
+    second_run_order_ids = select_second_run_order_ids(all_orders, extra_load_target, route_neighbors, config)
+    first_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") not in second_run_order_ids]
+    second_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") in second_run_order_ids]
+
+    created_bins: List[VehicleBin] = []
+    capacity_unassigned: List[Dict[str, object]] = []
+
+    # Step 2: assign first runs (run 1) polygon/route-first, nearest route expansion.
+    first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, 1, config)
+    first_run_assigned_ids = assign_single_first_run_route_first(first_run_orders, first_run_bins, route_neighbors, config)
+    created_bins.extend([b for b in first_run_bins if b.orders])
+
+    leftover_first_run = [
+        o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
+    ]
+    # Anything not placed in run 1 must flow to additional runs.
+    second_run_pool = second_run_orders + leftover_first_run
+
+    # Step 3: assign second/extra runs with nearest + largest packing.
+    extra_bins, extra_leftover, extra_unassigned = assign_multi_runs_nearest(
+        second_run_pool,
+        vehicle_list,
+        supply_chain,
+        warehouse_id,
+        2,
+        route_neighbors,
+        config,
+    )
+    created_bins.extend(extra_bins)
+    capacity_unassigned.extend(extra_unassigned)
+
+    return created_bins, extra_leftover, capacity_unassigned
 
 
 def build_runsheets(
