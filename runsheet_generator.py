@@ -35,6 +35,7 @@ class RunSheetConfig:
     longitude_candidates: Tuple[str, ...] = ("retailer_long", "longitude", "long", "lng", "customer_long", "store_long")
     # CBM is prioritized for planning load/capacity.
     order_cbm_candidates: Tuple[str, ...] = ("order_cbm", "cbm", "total_cbm", "volume_cbm", "volume")
+    purchased_items_candidates: Tuple[str, ...] = ("purchased_item_count", "qty", "quantity", "item_qty")
     # Fallback only when CBM column is missing/empty.
     order_volume_fallback_candidates: Tuple[str, ...] = (
         "order_volume",
@@ -62,6 +63,7 @@ class RunSheetConfig:
     high_volume_min_load_ratio: float = 0.60
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
+    min_utilization_target_pct: float = 98.0
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
     max_retailer_pair_distance_km: float = 10.0
@@ -212,6 +214,108 @@ def order_within_bin_distance_limits(order: Dict[str, object], bin_obj: "Vehicle
                 return False
 
     return True
+
+
+def pick_topup_candidate(
+    bin_obj: "VehicleBin",
+    orders_pool: List[Dict[str, object]],
+    assigned_ids: set,
+    target_load: float,
+    seed_route: str,
+    route_neighbors: Dict[str, List[str]],
+    stop_cap: int,
+    config: RunSheetConfig,
+    enforce_distance: bool,
+) -> Optional[Dict[str, object]]:
+    best: Optional[Tuple[float, float, Dict[str, object]]] = None
+    for order in orders_pool:
+        order_id = safe_str(order.get("_order_id", ""), "")
+        if not order_id or order_id in assigned_ids:
+            continue
+        load = safe_float(order.get("order_load", 0), 0.0)
+        if not bin_obj.can_fit(load, stop_cap):
+            continue
+        if enforce_distance and (not order_within_bin_distance_limits(order, bin_obj, config)):
+            continue
+        projected = bin_obj.assigned_load + load
+        remaining_after = max(0.0, bin_obj.capacity - projected)
+        gap_to_target = abs(max(0.0, target_load - projected))
+        lat = safe_float(order.get("lat", 0), 0.0)
+        lon = safe_float(order.get("lon", 0), 0.0)
+        if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None:
+            distance = 0.0
+        else:
+            distance = haversine_km(lat, lon, bin_obj.centroid_lat, bin_obj.centroid_lon)
+        route_penalty = route_proximity_penalty(safe_str(order.get("route", ""), ""), seed_route, route_neighbors)
+        score = gap_to_target + (remaining_after * 0.2) + (distance * 0.05) + (route_penalty * 0.1)
+        rank = (score, -load, order)
+        if best is None or rank[0] < best[0] or (rank[0] == best[0] and rank[1] < best[1]):
+            best = rank
+    return best[2] if best is not None else None
+
+
+def top_up_bin_to_target_utilization(
+    bin_obj: "VehicleBin",
+    orders_pool: List[Dict[str, object]],
+    assigned_ids: set,
+    seed_route: str,
+    route_neighbors: Dict[str, List[str]],
+    stop_cap: int,
+    config: RunSheetConfig,
+) -> None:
+    target_pct = safe_float(config.min_utilization_target_pct, 0.0)
+    if target_pct <= 0 or bin_obj.capacity <= 0:
+        return
+    target_pct = min(target_pct, 100.0)
+    target_load = (target_pct / 100.0) * bin_obj.capacity
+    if bin_obj.assigned_load >= target_load:
+        return
+
+    # First pass: keep strict distance guards.
+    while bin_obj.assigned_load < target_load:
+        if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+            break
+        candidate = pick_topup_candidate(
+            bin_obj,
+            orders_pool,
+            assigned_ids,
+            target_load,
+            seed_route,
+            route_neighbors,
+            stop_cap,
+            config,
+            enforce_distance=True,
+        )
+        if candidate is None:
+            break
+        candidate_id = safe_str(candidate.get("_order_id", ""), "")
+        if not candidate_id:
+            break
+        bin_obj.add_order(candidate)
+        assigned_ids.add(candidate_id)
+
+    # Second pass: relax distance only if still below target.
+    while bin_obj.assigned_load < target_load:
+        if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+            break
+        candidate = pick_topup_candidate(
+            bin_obj,
+            orders_pool,
+            assigned_ids,
+            target_load,
+            seed_route,
+            route_neighbors,
+            stop_cap,
+            config,
+            enforce_distance=False,
+        )
+        if candidate is None:
+            break
+        candidate_id = safe_str(candidate.get("_order_id", ""), "")
+        if not candidate_id:
+            break
+        bin_obj.add_order(candidate)
+        assigned_ids.add(candidate_id)
 
 
 def route_proximity_penalty(route_name: str, seed_route: str, route_neighbors: Dict[str, List[str]]) -> float:
@@ -403,6 +507,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     lat_col = find_existing_column(raw, config.latitude_candidates)
     lon_col = find_existing_column(raw, config.longitude_candidates)
     cbm_col = find_existing_column(raw, config.order_cbm_candidates)
+    items_col = find_existing_column(raw, config.purchased_items_candidates)
     load_fallback_col = find_existing_column(raw, config.order_volume_fallback_candidates)
     date_col = find_existing_column(raw, config.delivery_date_candidates)
 
@@ -434,6 +539,11 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     else:
         orders["_line_load"] = 1.0
         log_warning("No CBM/load column found. Using default load=1 per order line.")
+    if items_col is not None:
+        orders["_line_items"] = orders[items_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+    else:
+        orders["_line_items"] = 0.0
+        log_warning("Purchased-items column not found. Summary purchased items will be zero.")
     if date_col is not None:
         orders["_delivery_date"] = pd.to_datetime(orders[date_col], errors="coerce")
     else:
@@ -454,10 +564,12 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
             lat=("_lat", "first"),
             lon=("_lon", "first"),
             order_load=("_line_load", aggregate_order_measure),
+            purchased_items=("_line_items", "sum"),
             delivery_date=("_delivery_date", "max"),
         )
     )
     grouped["order_load"] = grouped["order_load"].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+    grouped["purchased_items"] = grouped["purchased_items"].apply(lambda x: max(0.0, safe_float(x, 0.0)))
     grouped = grouped[grouped["order_load"] > 0]
     if grouped.empty:
         raise ValueError("No valid orders after preprocessing.")
@@ -742,6 +854,17 @@ def assign_single_first_run_route_first(
             bin_obj.add_order(chosen)
             assigned_ids.add(chosen_id)
 
+        # Capacity-utilization top-up toward target (98% by default).
+        top_up_bin_to_target_utilization(
+            bin_obj,
+            first_run_orders,
+            assigned_ids,
+            seed_route,
+            route_neighbors,
+            stop_cap,
+            config,
+        )
+
     return assigned_ids
 
 
@@ -814,6 +937,16 @@ def assign_multi_runs_nearest(
                     break
                 bin_obj.add_order(chosen)
                 assigned_ids.add(chosen_id)
+
+            top_up_bin_to_target_utilization(
+                bin_obj,
+                remaining,
+                assigned_ids,
+                seed_route,
+                route_neighbors,
+                stop_cap,
+                config,
+            )
 
         if not assigned_ids:
             # Capacity-first fallback (still strict capacity).
@@ -973,6 +1106,7 @@ def build_runsheets(
                         "retailer_lat": order.get("lat", 0.0),
                         "retailer_long": order.get("lon", 0.0),
                         "order_load": order.get("order_load", 0.0),
+                        "purchased_items": order.get("purchased_items", 0.0),
                         "runsheet_id": b.runsheet_id,
                         "run_number": b.run_number,
                         "vehicle_id": b.vehicle_id,
@@ -996,6 +1130,11 @@ def build_runsheets(
                     "remaining_capacity": b.remaining,
                     "utilization_pct": b.utilization_pct,
                     "orders_count": len(b.orders),
+                    "purchased_items_total": sum(
+                        safe_float(order.get("purchased_items", 0), 0.0) for order in b.orders
+                    ),
+                    "min_utilization_target_pct": config.min_utilization_target_pct,
+                    "meets_utilization_target": b.utilization_pct >= safe_float(config.min_utilization_target_pct, 0.0),
                     "max_stops_per_run": config.max_stops_per_run,
                     "high_volume_orders_count": high_count,
                 }
@@ -1011,6 +1150,7 @@ def build_runsheets(
                     "retailer_lat": order.get("lat", 0.0),
                     "retailer_long": order.get("lon", 0.0),
                     "order_load": order.get("order_load", 0.0),
+                    "purchased_items": order.get("purchased_items", 0.0),
                     "reason": "No compatible vehicle/scheduling slot",
                 }
             )
@@ -1024,6 +1164,7 @@ def build_runsheets(
                     "retailer_lat": order.get("lat", 0.0),
                     "retailer_long": order.get("lon", 0.0),
                     "order_load": order.get("order_load", 0.0),
+                    "purchased_items": order.get("purchased_items", 0.0),
                     "reason": safe_str(order.get("unassigned_reason", ""), "No compatible vehicle/scheduling slot"),
                 }
             )
