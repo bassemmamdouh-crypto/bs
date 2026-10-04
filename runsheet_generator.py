@@ -30,6 +30,7 @@ class RunSheetConfig:
     order_id_candidates: Tuple[str, ...] = ("order_id", "order_number", "order_no", "orderid")
     supply_chain_candidates: Tuple[str, ...] = ("supply_chain", "supply chain", "supply_chain_name", "supplychain")
     warehouse_candidates: Tuple[str, ...] = ("warehouse_id", "warehouse", "warehouse_name", "wh_id", "depot")
+    segment_candidates: Tuple[str, ...] = ("segment", "retailer_segment", "customer_segment", "channel", "trade_channel")
     route_candidates: Tuple[str, ...] = ("route", "route_name", "delivery_route", "route_text")
     latitude_candidates: Tuple[str, ...] = ("retailer_lat", "latitude", "lat", "customer_lat", "store_lat")
     longitude_candidates: Tuple[str, ...] = ("retailer_long", "longitude", "long", "lng", "customer_long", "store_long")
@@ -59,6 +60,7 @@ class RunSheetConfig:
     vehicle_id_candidates: Tuple[str, ...] = ("vehicle_id", "truck_id", "car_id", "plate_no", "vehicle")
     vehicle_supply_chain_candidates: Tuple[str, ...] = ("supply_chain", "supply chain", "supply_chain_name", "supplychain")
     vehicle_warehouse_candidates: Tuple[str, ...] = ("warehouse_id", "warehouse", "warehouse_name", "wh_id", "depot")
+    vehicle_segment_candidates: Tuple[str, ...] = ("segment", "assigned_segment", "vehicle_segment", "channel")
     vehicle_agent_candidates: Tuple[str, ...] = ("assigned_agent", "agent", "driver", "route_agent", "agent_name")
     vehicle_type_candidates: Tuple[str, ...] = ("vehicle_type", "type", "truck_type")
     vehicle_capacity_candidates: Tuple[str, ...] = ("vehicle_capacity", "capacity", "load_capacity", "max_load")
@@ -514,6 +516,7 @@ class VehicleBin:
         vehicle_id: str,
         supply_chain: str,
         warehouse_id: str,
+        segment: str,
         assigned_agent: str,
         vehicle_type: str,
         route: str,
@@ -525,6 +528,7 @@ class VehicleBin:
         self.vehicle_id = vehicle_id
         self.supply_chain = supply_chain
         self.warehouse_id = warehouse_id
+        self.segment = segment
         self.assigned_agent = assigned_agent
         self.vehicle_type = vehicle_type
         self.route = route
@@ -639,6 +643,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     order_id_col = find_existing_column(raw, config.order_id_candidates)
     chain_col = find_existing_column(raw, config.supply_chain_candidates)
     warehouse_col = find_existing_column(raw, config.warehouse_candidates)
+    segment_col = find_existing_column(raw, config.segment_candidates)
     route_col = find_existing_column(raw, config.route_candidates)
     lat_col = find_existing_column(raw, config.latitude_candidates)
     lon_col = find_existing_column(raw, config.longitude_candidates)
@@ -666,6 +671,12 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     orders["_order_id"] = orders[order_id_col].apply(lambda x: normalize_identifier(x, ""))
     orders["_supply_chain"] = orders[chain_col].apply(lambda x: normalize_key(x))
     orders["_warehouse_id"] = orders[warehouse_col].apply(lambda x: normalize_identifier(x, ""))
+    if segment_col is not None:
+        orders["_segment"] = orders[segment_col].apply(lambda x: normalize_key(x))
+        orders["_segment"] = orders["_segment"].apply(lambda s: s if s else "GENERAL")
+    else:
+        orders["_segment"] = "GENERAL"
+        log_warning("Order segment column not found. All orders will be treated as segment GENERAL.")
     orders["_route"] = orders[route_col].apply(lambda x: normalize_key(x))
     orders["_lat"] = orders[lat_col].apply(lambda x: safe_float(x, 0.0))
     orders["_lon"] = orders[lon_col].apply(lambda x: safe_float(x, 0.0))
@@ -771,6 +782,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         .agg(
             supply_chain=("_supply_chain", "first"),
             warehouse_id=("_warehouse_id", "first"),
+            segment=("_segment", "first"),
             route=("_route", "first"),
             lat=("_lat", "first"),
             lon=("_lon", "first"),
@@ -800,6 +812,7 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
     vehicle_id_col = find_existing_column(raw, config.vehicle_id_candidates)
     chain_col = find_existing_column(raw, config.vehicle_supply_chain_candidates)
     warehouse_col = find_existing_column(raw, config.vehicle_warehouse_candidates)
+    segment_col = find_existing_column(raw, config.vehicle_segment_candidates)
     agent_col = find_existing_column(raw, config.vehicle_agent_candidates)
     type_col = find_existing_column(raw, config.vehicle_type_candidates)
     capacity_col = find_existing_column(raw, config.vehicle_capacity_candidates)
@@ -819,6 +832,11 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
     vehicles = raw.copy()
     vehicles["_supply_chain"] = vehicles[chain_col].apply(lambda x: normalize_key(x))
     vehicles["_warehouse_id"] = vehicles[warehouse_col].apply(lambda x: normalize_identifier(x, ""))
+    vehicles["_segment"] = (
+        vehicles[segment_col].apply(lambda x: normalize_key(x)).apply(lambda s: s if s else "UNSPECIFIED")
+        if segment_col is not None
+        else "UNSPECIFIED"
+    )
     vehicles["_assigned_agent"] = (
         vehicles[agent_col].apply(lambda x: normalize_identifier(x, ""))
         if agent_col is not None
@@ -867,6 +885,7 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
         chain = safe_str(row["_supply_chain"], "")
         warehouse_id = safe_str(row["_warehouse_id"], "")
         assigned_agent = safe_str(row["_assigned_agent"], "")
+        segment = safe_str(row["_segment"], "UNSPECIFIED")
         vehicle_type = safe_str(row["_vehicle_type"], "GENERIC") or "GENERIC"
         base_vehicle_id = normalize_identifier(row.get(vehicle_id_col, ""), "") if vehicle_id_col is not None else ""
 
@@ -888,6 +907,7 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
                     "vehicle_id": unique_vehicle_id(vehicle_id),
                     "supply_chain": chain,
                     "warehouse_id": warehouse_id,
+                    "segment": segment,
                     "assigned_agent": assigned_agent,
                     "vehicle_type": vehicle_type,
                     "capacity": row["_capacity"],
@@ -917,6 +937,7 @@ def create_vehicle_bins(
     vehicle_list: List[Dict[str, object]],
     supply_chain: str,
     warehouse_id: str,
+    segment: str,
     run_number: int,
     config: RunSheetConfig,
 ) -> List[VehicleBin]:
@@ -927,6 +948,7 @@ def create_vehicle_bins(
                 vehicle_id=safe_str(v["vehicle_id"], ""),
                 supply_chain=supply_chain,
                 warehouse_id=safe_str(warehouse_id, ""),
+                segment=segment,
                 assigned_agent=safe_str(v.get("assigned_agent", ""), ""),
                 vehicle_type=safe_str(v.get("vehicle_type", "GENERIC"), "GENERIC"),
                 route="",
@@ -943,6 +965,99 @@ def create_vehicle_bins(
             )
         )
     return bins
+
+
+def allocate_vehicles_to_segments(
+    scoped_vehicles: pd.DataFrame,
+    scoped_orders: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    segments = [s for s in scoped_orders["segment"].dropna().unique().tolist() if safe_str(s, "")]
+    if not segments:
+        return {}
+
+    segment_vehicle_rows: Dict[str, List[Dict[str, object]]] = {safe_str(s, ""): [] for s in segments}
+    if scoped_vehicles.empty:
+        return {seg: pd.DataFrame(columns=scoped_vehicles.columns) for seg in segment_vehicle_rows.keys()}
+
+    working = scoped_vehicles.copy()
+    if "segment" not in working.columns:
+        working["segment"] = "UNSPECIFIED"
+
+    # Respect explicit vehicle-to-segment assignment when available.
+    explicit_mask = working["segment"].apply(lambda s: safe_str(s, "") not in {"", "UNSPECIFIED"})
+    explicit = working[explicit_mask]
+    unassigned = working[~explicit_mask].sort_values("vehicle_id")
+
+    for segment in segments:
+        segment_key = safe_str(segment, "")
+        if not segment_key:
+            continue
+        seg_rows = explicit[explicit["segment"] == segment_key].to_dict("records")
+        segment_vehicle_rows[segment_key].extend(seg_rows)
+
+    if unassigned.empty:
+        return {seg: pd.DataFrame(rows) for seg, rows in segment_vehicle_rows.items()}
+
+    # Auto-split remaining vehicles by demand share so segments are dispatched separately.
+    demand_by_segment = (
+        scoped_orders.groupby("segment", sort=False)["order_cbm"].sum().to_dict()
+        if "order_cbm" in scoped_orders.columns
+        else {seg: 1.0 for seg in segments}
+    )
+    total_demand = sum(max(0.0, safe_float(demand_by_segment.get(seg, 0.0), 0.0)) for seg in segments)
+    total_vehicles = len(unassigned)
+    alloc_count: Dict[str, int] = {seg: 0 for seg in segments}
+    if total_vehicles <= 0:
+        return {seg: pd.DataFrame(rows) for seg, rows in segment_vehicle_rows.items()}
+
+    if total_vehicles >= len(segments):
+        for seg in segments:
+            alloc_count[seg] = 1
+        remaining_slots = total_vehicles - len(segments)
+    else:
+        # Fewer vehicles than segments: prioritize highest-demand segments.
+        ranked = sorted(
+            segments,
+            key=lambda seg: safe_float(demand_by_segment.get(seg, 0.0), 0.0),
+            reverse=True,
+        )
+        for seg in ranked[:total_vehicles]:
+            alloc_count[seg] = 1
+        remaining_slots = 0
+
+    if remaining_slots > 0:
+        if total_demand <= 0:
+            ranked = sorted(segments)
+            for i in range(remaining_slots):
+                alloc_count[ranked[i % len(ranked)]] += 1
+        else:
+            quotas = {}
+            base_sum = 0
+            for seg in segments:
+                share = max(0.0, safe_float(demand_by_segment.get(seg, 0.0), 0.0)) / total_demand
+                raw = share * remaining_slots
+                base = int(math.floor(raw))
+                quotas[seg] = (raw - base)
+                alloc_count[seg] += base
+                base_sum += base
+            leftovers = remaining_slots - base_sum
+            ranked_frac = sorted(segments, key=lambda seg: quotas.get(seg, 0.0), reverse=True)
+            for seg in ranked_frac[:leftovers]:
+                alloc_count[seg] += 1
+
+    unassigned_rows = unassigned.to_dict("records")
+    cursor = 0
+    for seg in sorted(segments, key=lambda s: safe_float(demand_by_segment.get(s, 0.0), 0.0), reverse=True):
+        take = alloc_count.get(seg, 0)
+        for _ in range(take):
+            if cursor >= len(unassigned_rows):
+                break
+            row = dict(unassigned_rows[cursor])
+            row["segment"] = seg
+            segment_vehicle_rows[seg].append(row)
+            cursor += 1
+
+    return {seg: pd.DataFrame(rows) for seg, rows in segment_vehicle_rows.items()}
 
 
 def select_second_run_order_ids(
@@ -1153,6 +1268,7 @@ def assign_multi_runs_nearest(
     vehicle_list: List[Dict[str, object]],
     supply_chain: str,
     warehouse_id: str,
+    segment: str,
     start_run_number: int,
     route_neighbors: Dict[str, List[str]],
     config: RunSheetConfig,
@@ -1186,7 +1302,7 @@ def assign_multi_runs_nearest(
             log_warning(f"Safety break triggered for extra runs in {supply_chain}/{warehouse_id}.")
             break
 
-        bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, run_number, config)
+        bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, run_number, config)
         assigned_ids: set = set()
         for bin_obj in bins:
             if not remaining:
@@ -1325,6 +1441,7 @@ def assign_scoped_orders(
     scoped_vehicles: pd.DataFrame,
     supply_chain: str,
     warehouse_id: str,
+    segment: str,
     config: RunSheetConfig,
     route_neighbors: Dict[str, List[str]],
 ) -> Tuple[List[VehicleBin], List[Dict[str, object]], List[Dict[str, object]]]:
@@ -1363,7 +1480,7 @@ def assign_scoped_orders(
     capacity_unassigned: List[Dict[str, object]] = []
 
     # Step 2: assign first runs (run 1) polygon/route-first, nearest route expansion.
-    first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, 1, config)
+    first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, 1, config)
     first_run_assigned_ids = assign_single_first_run_route_first(first_run_orders, first_run_bins, route_neighbors, config)
     created_bins.extend([b for b in first_run_bins if b.orders])
 
@@ -1379,6 +1496,7 @@ def assign_scoped_orders(
         vehicle_list,
         supply_chain,
         warehouse_id,
+        segment,
         2,
         route_neighbors,
         config,
@@ -1410,72 +1528,136 @@ def build_runsheets(
         sort=True,
     ):
         scoped_vehicles = vehicles_by_chain_warehouse.get((supply_chain, warehouse_id), pd.DataFrame())
-        route_centers = build_route_centers(scoped_orders, kml_centroids)
-        route_neighbors = build_route_neighbors(route_centers, config.nearest_routes_per_seed)
+        segment_vehicle_pools = allocate_vehicles_to_segments(scoped_vehicles, scoped_orders)
+        for segment, segment_orders in scoped_orders.groupby("segment", sort=True):
+            segment_key = safe_str(segment, "") or "GENERAL"
+            segment_vehicles = segment_vehicle_pools.get(segment_key, pd.DataFrame(columns=scoped_vehicles.columns))
+            route_centers = build_route_centers(segment_orders, kml_centroids)
+            route_neighbors = build_route_neighbors(route_centers, config.nearest_routes_per_seed)
 
-        demand = float(scoped_orders["order_cbm"].sum())
-        weight_demand = float(scoped_orders["order_weight"].sum())
-        first_run_capacity = float(scoped_vehicles["capacity"].sum()) if not scoped_vehicles.empty else 0.0
-        first_run_weight_capacity = (
-            safe_sum_capacity(scoped_vehicles["weight_capacity"].astype(float).tolist())
-            if (not scoped_vehicles.empty and "weight_capacity" in scoped_vehicles.columns)
-            else float("inf")
-        )
-        overload_after_first_run = max(0.0, demand - first_run_capacity)
-        overload_weight_after_first_run = (
-            max(0.0, weight_demand - first_run_weight_capacity)
-            if is_finite_positive(first_run_weight_capacity)
-            else 0.0
-        )
-        runs_needed_by_cbm = int(math.ceil(demand / first_run_capacity)) if first_run_capacity > 0 else 0
-        runs_needed_by_weight = (
-            int(math.ceil(weight_demand / first_run_weight_capacity))
-            if is_finite_positive(first_run_weight_capacity)
-            else 0
-        )
-        estimated_runs_needed = max(runs_needed_by_cbm, runs_needed_by_weight)
-        capacity_plan_rows.append(
-            {
-                "supply_chain": supply_chain,
-                "warehouse_id": warehouse_id,
-                "orders_count": int(len(scoped_orders)),
-                "routes_count": int(scoped_orders["route"].nunique()),
-                "first_run_vehicles_count": int(len(scoped_vehicles)),
-                "max_runs_per_vehicle": int(max(1, config.max_runs_per_vehicle)),
-                "total_demand_cbm": demand,
-                "first_run_total_capacity_cbm": first_run_capacity,
-                "overload_after_first_run_cbm": overload_after_first_run,
-                "total_demand_weight": weight_demand,
-                "first_run_total_capacity_weight": format_capacity_value(first_run_weight_capacity),
-                "overload_after_first_run_weight": overload_weight_after_first_run,
-                "estimated_runs_by_cbm": runs_needed_by_cbm,
-                "estimated_runs_by_weight": runs_needed_by_weight,
-                "estimated_runs_needed": estimated_runs_needed,
-            }
-        )
+            demand = float(segment_orders["order_cbm"].sum())
+            weight_demand = float(segment_orders["order_weight"].sum())
+            first_run_capacity = float(segment_vehicles["capacity"].sum()) if not segment_vehicles.empty else 0.0
+            first_run_weight_capacity = (
+                safe_sum_capacity(segment_vehicles["weight_capacity"].astype(float).tolist())
+                if (not segment_vehicles.empty and "weight_capacity" in segment_vehicles.columns)
+                else float("inf")
+            )
+            overload_after_first_run = max(0.0, demand - first_run_capacity)
+            overload_weight_after_first_run = (
+                max(0.0, weight_demand - first_run_weight_capacity)
+                if is_finite_positive(first_run_weight_capacity)
+                else 0.0
+            )
+            runs_needed_by_cbm = int(math.ceil(demand / first_run_capacity)) if first_run_capacity > 0 else 0
+            runs_needed_by_weight = (
+                int(math.ceil(weight_demand / first_run_weight_capacity))
+                if is_finite_positive(first_run_weight_capacity)
+                else 0
+            )
+            estimated_runs_needed = max(runs_needed_by_cbm, runs_needed_by_weight)
+            capacity_plan_rows.append(
+                {
+                    "supply_chain": supply_chain,
+                    "warehouse_id": warehouse_id,
+                    "segment": segment_key,
+                    "orders_count": int(len(segment_orders)),
+                    "routes_count": int(segment_orders["route"].nunique()),
+                    "first_run_vehicles_count": int(len(segment_vehicles)),
+                    "max_runs_per_vehicle": int(max(1, config.max_runs_per_vehicle)),
+                    "total_demand_cbm": demand,
+                    "first_run_total_capacity_cbm": first_run_capacity,
+                    "overload_after_first_run_cbm": overload_after_first_run,
+                    "total_demand_weight": weight_demand,
+                    "first_run_total_capacity_weight": format_capacity_value(first_run_weight_capacity),
+                    "overload_after_first_run_weight": overload_weight_after_first_run,
+                    "estimated_runs_by_cbm": runs_needed_by_cbm,
+                    "estimated_runs_by_weight": runs_needed_by_weight,
+                    "estimated_runs_needed": estimated_runs_needed,
+                }
+            )
 
-        bins, leftover, capacity_unassigned = assign_scoped_orders(
-            scoped_orders,
-            scoped_vehicles,
-            supply_chain,
-            warehouse_id,
-            config,
-            route_neighbors,
-        )
+            bins, leftover, capacity_unassigned = assign_scoped_orders(
+                segment_orders,
+                segment_vehicles,
+                supply_chain,
+                warehouse_id,
+                segment_key,
+                config,
+                route_neighbors,
+            )
 
-        for b in bins:
-            high_count = 0
-            for order in b.orders:
-                is_high = get_order_cbm(order) >= (
-                    b.capacity * max(0.0, config.high_volume_min_load_ratio)
+            for b in bins:
+                high_count = 0
+                for order in b.orders:
+                    is_high = get_order_cbm(order) >= (
+                        b.capacity * max(0.0, config.high_volume_min_load_ratio)
+                    )
+                    if is_high:
+                        high_count += 1
+                    assignment_rows.append(
+                        {
+                            "order_id": order.get("_order_id", ""),
+                            "supply_chain": order.get("supply_chain", ""),
+                            "warehouse_id": order.get("warehouse_id", ""),
+                            "segment": order.get("segment", segment_key),
+                            "route": order.get("route", ""),
+                            "retailer_lat": order.get("lat", 0.0),
+                            "retailer_long": order.get("lon", 0.0),
+                            "order_load": order.get("order_load", 0.0),
+                            "order_cbm": order.get("order_cbm", order.get("order_load", 0.0)),
+                            "order_weight": order.get("order_weight", 0.0),
+                            "purchased_items": order.get("purchased_items", 0.0),
+                            "runsheet_id": b.runsheet_id,
+                            "run_number": b.run_number,
+                            "is_second_run": b.run_number > 1,
+                            "run_wave": "SECOND_RUN" if b.run_number > 1 else "FIRST_RUN",
+                            "vehicle_id": b.vehicle_id,
+                            "assigned_agent": b.assigned_agent,
+                            "vehicle_type": b.vehicle_type,
+                        }
+                    )
+                summary_rows.append(
+                    {
+                        "runsheet_id": b.runsheet_id,
+                        "supply_chain": b.supply_chain,
+                        "warehouse_id": b.warehouse_id,
+                        "segment": b.segment,
+                        "route_seed": b.route,
+                        "covered_routes": " | ".join(b.covered_routes),
+                        "run_number": b.run_number,
+                        "is_second_run": b.run_number > 1,
+                        "run_wave": "SECOND_RUN" if b.run_number > 1 else "FIRST_RUN",
+                        "vehicle_id": b.vehicle_id,
+                        "assigned_agent": b.assigned_agent,
+                        "vehicle_type": b.vehicle_type,
+                        "vehicle_capacity": b.capacity,
+                        "assigned_load": b.assigned_load,
+                        "remaining_capacity": b.remaining,
+                        "vehicle_weight_capacity": format_capacity_value(b.weight_capacity),
+                        "assigned_weight": b.assigned_weight,
+                        "remaining_weight_capacity": format_capacity_value(b.weight_remaining),
+                        "cbm_utilization_pct": b.cbm_utilization_pct,
+                        "weight_utilization_pct": b.weight_utilization_pct,
+                        "utilization_pct": b.utilization_pct,
+                        "orders_count": len(b.orders),
+                        "purchased_items_total": sum(
+                            safe_float(order.get("purchased_items", 0), 0.0) for order in b.orders
+                        ),
+                        "min_utilization_target_pct": config.min_utilization_target_pct,
+                        "meets_utilization_target": b.utilization_pct >= safe_float(config.min_utilization_target_pct, 0.0),
+                        "max_stops_per_run": config.max_stops_per_run,
+                        "high_volume_orders_count": high_count,
+                    }
                 )
-                if is_high:
-                    high_count += 1
-                assignment_rows.append(
+
+            for order in leftover:
+                unassigned_rows.append(
                     {
                         "order_id": order.get("_order_id", ""),
                         "supply_chain": order.get("supply_chain", ""),
                         "warehouse_id": order.get("warehouse_id", ""),
+                        "segment": order.get("segment", segment_key),
                         "route": order.get("route", ""),
                         "retailer_lat": order.get("lat", 0.0),
                         "retailer_long": order.get("lon", 0.0),
@@ -1483,80 +1665,26 @@ def build_runsheets(
                         "order_cbm": order.get("order_cbm", order.get("order_load", 0.0)),
                         "order_weight": order.get("order_weight", 0.0),
                         "purchased_items": order.get("purchased_items", 0.0),
-                        "runsheet_id": b.runsheet_id,
-                        "run_number": b.run_number,
-                        "is_second_run": b.run_number > 1,
-                        "run_wave": "SECOND_RUN" if b.run_number > 1 else "FIRST_RUN",
-                        "vehicle_id": b.vehicle_id,
-                        "assigned_agent": b.assigned_agent,
-                        "vehicle_type": b.vehicle_type,
+                        "reason": "No compatible vehicle/scheduling slot",
                     }
                 )
-            summary_rows.append(
-                {
-                    "runsheet_id": b.runsheet_id,
-                    "supply_chain": b.supply_chain,
-                    "warehouse_id": b.warehouse_id,
-                    "route_seed": b.route,
-                    "covered_routes": " | ".join(b.covered_routes),
-                    "run_number": b.run_number,
-                    "is_second_run": b.run_number > 1,
-                    "run_wave": "SECOND_RUN" if b.run_number > 1 else "FIRST_RUN",
-                    "vehicle_id": b.vehicle_id,
-                    "assigned_agent": b.assigned_agent,
-                    "vehicle_type": b.vehicle_type,
-                    "vehicle_capacity": b.capacity,
-                    "assigned_load": b.assigned_load,
-                    "remaining_capacity": b.remaining,
-                    "vehicle_weight_capacity": format_capacity_value(b.weight_capacity),
-                    "assigned_weight": b.assigned_weight,
-                    "remaining_weight_capacity": format_capacity_value(b.weight_remaining),
-                    "cbm_utilization_pct": b.cbm_utilization_pct,
-                    "weight_utilization_pct": b.weight_utilization_pct,
-                    "utilization_pct": b.utilization_pct,
-                    "orders_count": len(b.orders),
-                    "purchased_items_total": sum(
-                        safe_float(order.get("purchased_items", 0), 0.0) for order in b.orders
-                    ),
-                    "min_utilization_target_pct": config.min_utilization_target_pct,
-                    "meets_utilization_target": b.utilization_pct >= safe_float(config.min_utilization_target_pct, 0.0),
-                    "max_stops_per_run": config.max_stops_per_run,
-                    "high_volume_orders_count": high_count,
-                }
-            )
-
-        for order in leftover:
-            unassigned_rows.append(
-                {
-                    "order_id": order.get("_order_id", ""),
-                    "supply_chain": order.get("supply_chain", ""),
-                    "warehouse_id": order.get("warehouse_id", ""),
-                    "route": order.get("route", ""),
-                    "retailer_lat": order.get("lat", 0.0),
-                    "retailer_long": order.get("lon", 0.0),
-                    "order_load": order.get("order_load", 0.0),
-                    "order_cbm": order.get("order_cbm", order.get("order_load", 0.0)),
-                    "order_weight": order.get("order_weight", 0.0),
-                    "purchased_items": order.get("purchased_items", 0.0),
-                    "reason": "No compatible vehicle/scheduling slot",
-                }
-            )
-        for order in capacity_unassigned:
-            unassigned_rows.append(
-                {
-                    "order_id": order.get("_order_id", ""),
-                    "supply_chain": order.get("supply_chain", ""),
-                    "warehouse_id": order.get("warehouse_id", ""),
-                    "route": order.get("route", ""),
-                    "retailer_lat": order.get("lat", 0.0),
-                    "retailer_long": order.get("lon", 0.0),
-                    "order_load": order.get("order_load", 0.0),
-                    "order_cbm": order.get("order_cbm", order.get("order_load", 0.0)),
-                    "order_weight": order.get("order_weight", 0.0),
-                    "purchased_items": order.get("purchased_items", 0.0),
-                    "reason": safe_str(order.get("unassigned_reason", ""), "No compatible vehicle/scheduling slot"),
-                }
-            )
+            for order in capacity_unassigned:
+                unassigned_rows.append(
+                    {
+                        "order_id": order.get("_order_id", ""),
+                        "supply_chain": order.get("supply_chain", ""),
+                        "warehouse_id": order.get("warehouse_id", ""),
+                        "segment": order.get("segment", segment_key),
+                        "route": order.get("route", ""),
+                        "retailer_lat": order.get("lat", 0.0),
+                        "retailer_long": order.get("lon", 0.0),
+                        "order_load": order.get("order_load", 0.0),
+                        "order_cbm": order.get("order_cbm", order.get("order_load", 0.0)),
+                        "order_weight": order.get("order_weight", 0.0),
+                        "purchased_items": order.get("purchased_items", 0.0),
+                        "reason": safe_str(order.get("unassigned_reason", ""), "No compatible vehicle/scheduling slot"),
+                    }
+                )
 
     assignment_df = pd.DataFrame(assignment_rows)
     summary_df = pd.DataFrame(summary_rows)
