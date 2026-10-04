@@ -87,6 +87,10 @@ class RunSheetConfig:
     # - Weight-first means prioritize weight before CBM tie-break.
     cbm_first_supply_chains: Tuple[str, ...] = ("LAYS",)
     weight_first_supply_chains: Tuple[str, ...] = ("PEPSI",)
+    # Geographic compactness controls to avoid runsheet overlap.
+    allow_topup_distance_relaxation: bool = False
+    compactness_iterations: int = 3
+    compactness_min_improvement_km: float = 0.25
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
     max_retailer_pair_distance_km: float = 10.0
@@ -296,6 +300,83 @@ def order_within_bin_distance_limits(order: Dict[str, object], bin_obj: "Vehicle
     return True
 
 
+def distance_order_to_bin_centroid_km(order: Dict[str, object], bin_obj: "VehicleBin") -> float:
+    if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None:
+        return 0.0
+    lat = safe_float(order.get("lat", 0), 0.0)
+    lon = safe_float(order.get("lon", 0), 0.0)
+    return haversine_km(lat, lon, bin_obj.centroid_lat, bin_obj.centroid_lon)
+
+
+def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConfig) -> None:
+    active_bins = [b for b in bins if b.orders]
+    if len(active_bins) <= 1:
+        return
+    stop_cap = max(0, int(config.max_stops_per_run))
+    iterations = max(0, int(config.compactness_iterations))
+    if iterations <= 0:
+        return
+    min_gain = max(0.0, safe_float(config.compactness_min_improvement_km, 0.0))
+
+    for _ in range(iterations):
+        moved_any = False
+        move_candidates: List[Tuple[float, str, int, int]] = []
+        # Candidate format: (distance_gain, order_id, from_bin_idx, to_bin_idx)
+        for from_idx, from_bin in enumerate(active_bins):
+            for order in from_bin.orders:
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if not order_id:
+                    continue
+                current_distance = distance_order_to_bin_centroid_km(order, from_bin)
+                best_distance = current_distance
+                best_to_idx = -1
+                order_cbm = get_order_cbm(order)
+                order_weight = get_order_weight(order)
+                for to_idx, to_bin in enumerate(active_bins):
+                    if to_idx == from_idx:
+                        continue
+                    if not to_bin.can_fit(order_cbm, order_weight, stop_cap):
+                        continue
+                    if not order_within_bin_distance_limits(order, to_bin, config):
+                        continue
+                    candidate_distance = distance_order_to_bin_centroid_km(order, to_bin)
+                    if candidate_distance + min_gain < best_distance:
+                        best_distance = candidate_distance
+                        best_to_idx = to_idx
+                if best_to_idx >= 0:
+                    move_candidates.append((current_distance - best_distance, order_id, from_idx, best_to_idx))
+
+        if not move_candidates:
+            break
+        move_candidates.sort(key=lambda t: t[0], reverse=True)
+
+        for _, order_id, from_idx, to_idx in move_candidates:
+            from_bin = active_bins[from_idx]
+            to_bin = active_bins[to_idx]
+            if from_bin is to_bin:
+                continue
+            order = next(
+                (o for o in from_bin.orders if safe_str(o.get("_order_id", ""), "") == order_id),
+                None,
+            )
+            if order is None:
+                continue
+            order_cbm = get_order_cbm(order)
+            order_weight = get_order_weight(order)
+            if not to_bin.can_fit(order_cbm, order_weight, stop_cap):
+                continue
+            if not order_within_bin_distance_limits(order, to_bin, config):
+                continue
+            removed = from_bin.remove_order_by_id(order_id)
+            if removed is None:
+                continue
+            to_bin.add_order(removed)
+            moved_any = True
+
+        if not moved_any:
+            break
+
+
 def pick_topup_candidate(
     bin_obj: "VehicleBin",
     orders_pool: List[Dict[str, object]],
@@ -393,6 +474,9 @@ def top_up_bin_to_target_utilization(
             break
         bin_obj.add_order(candidate)
         assigned_ids.add(candidate_id)
+
+    if not bool(config.allow_topup_distance_relaxation):
+        return
 
     # Second pass: relax distance only if still below target.
     while bin_obj.utilization_pct < target_pct:
@@ -573,6 +657,46 @@ class VehicleBin:
         count = len(self.orders)
         self.centroid_lat = ((self.centroid_lat * (count - 1)) + lat) / count
         self.centroid_lon = ((self.centroid_lon * (count - 1)) + lon) / count
+
+    def recompute_state(self) -> None:
+        self.remaining = self.capacity
+        self.weight_remaining = self.weight_capacity
+        self.covered_routes = []
+        self.route = ""
+        self.centroid_lat = None
+        self.centroid_lon = None
+        for idx, order in enumerate(self.orders, start=1):
+            load = get_order_cbm(order)
+            load_weight = get_order_weight(order)
+            self.remaining -= load
+            if is_finite_positive(self.weight_capacity):
+                self.weight_remaining -= load_weight
+
+            order_route = safe_str(order.get("route", ""), "")
+            if order_route and order_route not in self.covered_routes:
+                self.covered_routes.append(order_route)
+            if not self.route and order_route:
+                self.route = order_route
+
+            lat = safe_float(order.get("lat", 0), 0.0)
+            lon = safe_float(order.get("lon", 0), 0.0)
+            if self.centroid_lat is None or self.centroid_lon is None:
+                self.centroid_lat = lat
+                self.centroid_lon = lon
+            else:
+                self.centroid_lat = ((self.centroid_lat * (idx - 1)) + lat) / idx
+                self.centroid_lon = ((self.centroid_lon * (idx - 1)) + lon) / idx
+
+    def remove_order_by_id(self, order_id: str) -> Optional[Dict[str, object]]:
+        target = safe_str(order_id, "")
+        if not target:
+            return None
+        for idx, order in enumerate(self.orders):
+            if safe_str(order.get("_order_id", ""), "") == target:
+                removed = self.orders.pop(idx)
+                self.recompute_state()
+                return removed
+        return None
 
     @property
     def assigned_load(self) -> float:
@@ -1260,6 +1384,7 @@ def assign_single_first_run_route_first(
             config,
         )
 
+    compact_bins_for_min_distance(bins, config)
     return assigned_ids
 
 
@@ -1422,6 +1547,7 @@ def assign_multi_runs_nearest(
             run_number += 1
             continue
 
+        compact_bins_for_min_distance(bins, config)
         created_bins.extend([b for b in bins if b.orders])
         remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
         run_number += 1
