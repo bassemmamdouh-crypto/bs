@@ -80,6 +80,11 @@ class RunSheetConfig:
     # Max dispatch waves per vehicle in the same planning cycle.
     # 1 = first run only, 2 = first + second run.
     max_runs_per_vehicle: int = 2
+    # Supply chain capacity-priority mode during packing:
+    # - CBM-first means prioritize filling CBM before weight tie-break.
+    # - Weight-first means prioritize weight before CBM tie-break.
+    cbm_first_supply_chains: Tuple[str, ...] = ("LAYS",)
+    weight_first_supply_chains: Tuple[str, ...] = ("PEPSI",)
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
     max_retailer_pair_distance_km: float = 10.0
@@ -214,11 +219,37 @@ def safe_sum_capacity(values: List[float]) -> float:
     return float(sum(finite_values))
 
 
-def order_capacity_pressure(order: Dict[str, object], cbm_capacity: float, weight_capacity: float) -> float:
+def normalize_chain_set(chains: Tuple[str, ...]) -> set:
+    return {normalize_key(c) for c in chains if safe_str(c, "")}
+
+
+def get_supply_chain_priority_mode(supply_chain: str, config: Optional[RunSheetConfig]) -> str:
+    if config is None:
+        return "BALANCED"
+    sc_key = normalize_key(supply_chain)
+    if sc_key in normalize_chain_set(config.weight_first_supply_chains):
+        return "WEIGHT_FIRST"
+    if sc_key in normalize_chain_set(config.cbm_first_supply_chains):
+        return "CBM_FIRST"
+    return "BALANCED"
+
+
+def order_capacity_pressure(
+    order: Dict[str, object],
+    cbm_capacity: float,
+    weight_capacity: float,
+    supply_chain: str = "",
+    config: Optional[RunSheetConfig] = None,
+) -> float:
     cbm = get_order_cbm(order)
     weight = get_order_weight(order)
     cbm_ratio = (cbm / cbm_capacity) if cbm_capacity > 0 else 0.0
     weight_ratio = (weight / weight_capacity) if is_finite_positive(weight_capacity) else 0.0
+    mode = get_supply_chain_priority_mode(supply_chain, config)
+    if mode == "WEIGHT_FIRST":
+        return (weight_ratio * 2.0) + cbm_ratio
+    if mode == "CBM_FIRST":
+        return (cbm_ratio * 2.0) + weight_ratio
     return max(cbm_ratio, weight_ratio)
 
 
@@ -306,7 +337,17 @@ def pick_topup_candidate(
             distance = haversine_km(lat, lon, bin_obj.centroid_lat, bin_obj.centroid_lon)
         route_penalty = route_proximity_penalty(safe_str(order.get("route", ""), ""), seed_route, route_neighbors)
         score = gap_to_target + (remaining_after * 0.2) + (distance * 0.05) + (route_penalty * 0.1)
-        rank = (score, -order_capacity_pressure(order, bin_obj.capacity, bin_obj.weight_capacity), order)
+        rank = (
+            score,
+            -order_capacity_pressure(
+                order,
+                bin_obj.capacity,
+                bin_obj.weight_capacity,
+                bin_obj.supply_chain,
+                config,
+            ),
+            order,
+        )
         if best is None or rank[0] < best[0] or (rank[0] == best[0] and rank[1] < best[1]):
             best = rank
     return best[2] if best is not None else None
@@ -582,7 +623,7 @@ def choose_best_bin(order: Dict[str, object], bins: List[VehicleBin], max_stops_
             distance = 0.0
         else:
             distance = haversine_km(lat, lon, b.centroid_lat, b.centroid_lon)
-        pressure = order_capacity_pressure(order, b.capacity, b.weight_capacity)
+        pressure = order_capacity_pressure(order, b.capacity, b.weight_capacity, b.supply_chain, None)
         score = (distance * 1.5) + remaining_after_cbm + (0.0 if not math.isfinite(remaining_after_weight) else remaining_after_weight * 0.01) - (pressure * 10.0)
         scored.append((score, b))
     scored.sort(key=lambda t: t[0])
@@ -927,6 +968,11 @@ def select_second_run_order_ids(
         weight = get_order_weight(order)
         cbm_part = (cbm / overload_cbm_base) if extra_cbm_target > 0 else 0.0
         weight_part = (weight / overload_weight_base) if extra_weight_target > 0 else 0.0
+        mode = get_supply_chain_priority_mode(safe_str(order.get("supply_chain", ""), ""), config)
+        if mode == "WEIGHT_FIRST":
+            return (weight_part * 2.0) + cbm_part
+        if mode == "CBM_FIRST":
+            return (cbm_part * 2.0) + weight_part
         return cbm_part + weight_part
 
     safety = 0
@@ -1020,7 +1066,13 @@ def assign_single_first_run_route_first(
                 and safe_str(o.get("_order_id", ""), "") not in assigned_ids
             ]
             route_orders.sort(
-                key=lambda o: order_capacity_pressure(o, bin_obj.capacity, bin_obj.weight_capacity),
+                key=lambda o: order_capacity_pressure(
+                    o,
+                    bin_obj.capacity,
+                    bin_obj.weight_capacity,
+                    bin_obj.supply_chain,
+                    config,
+                ),
                 reverse=True,
             )
             for order in route_orders:
@@ -1059,7 +1111,19 @@ def assign_single_first_run_route_first(
                     if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None
                     else haversine_km(lat, lon, bin_obj.centroid_lat, bin_obj.centroid_lon)
                 )
-                candidates.append((dist, -order_capacity_pressure(order, bin_obj.capacity, bin_obj.weight_capacity), order))
+                candidates.append(
+                    (
+                        dist,
+                        -order_capacity_pressure(
+                            order,
+                            bin_obj.capacity,
+                            bin_obj.weight_capacity,
+                            bin_obj.supply_chain,
+                            config,
+                        ),
+                        order,
+                    )
+                )
             if not candidates:
                 break
             candidates.sort(key=lambda t: (t[0], t[1]))
@@ -1127,7 +1191,16 @@ def assign_multi_runs_nearest(
         for bin_obj in bins:
             if not remaining:
                 break
-            seed = max(remaining, key=lambda o: order_capacity_pressure(o, bin_obj.capacity, bin_obj.weight_capacity))
+            seed = max(
+                remaining,
+                key=lambda o: order_capacity_pressure(
+                    o,
+                    bin_obj.capacity,
+                    bin_obj.weight_capacity,
+                    bin_obj.supply_chain,
+                    config,
+                ),
+            )
             seed_id = safe_str(seed.get("_order_id", ""), "")
             seed_load_cbm = get_order_cbm(seed)
             seed_load_weight = get_order_weight(seed)
@@ -1157,7 +1230,19 @@ def assign_multi_runs_nearest(
                     distance = haversine_km(lat, lon, safe_float(bin_obj.centroid_lat, 0.0), safe_float(bin_obj.centroid_lon, 0.0))
                     route_penalty = route_proximity_penalty(safe_str(order.get("route", ""), ""), seed_route, route_neighbors)
                     score = distance + route_penalty
-                    candidates.append((score, -order_capacity_pressure(order, bin_obj.capacity, bin_obj.weight_capacity), order))
+                    candidates.append(
+                        (
+                            score,
+                            -order_capacity_pressure(
+                                order,
+                                bin_obj.capacity,
+                                bin_obj.weight_capacity,
+                                bin_obj.supply_chain,
+                                config,
+                            ),
+                            order,
+                        )
+                    )
                 if not candidates:
                     break
                 candidates.sort(key=lambda t: (t[0], t[1]))
@@ -1182,7 +1267,13 @@ def assign_multi_runs_nearest(
             # Capacity-first fallback (still strict capacity).
             capacity_sorted = sorted(
                 remaining,
-                key=lambda o: order_capacity_pressure(o, max_vehicle_capacity, max_vehicle_weight_capacity),
+                key=lambda o: order_capacity_pressure(
+                    o,
+                    max_vehicle_capacity,
+                    max_vehicle_weight_capacity,
+                    supply_chain,
+                    config,
+                ),
                 reverse=True,
             )
             for order in capacity_sorted:
