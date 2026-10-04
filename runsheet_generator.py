@@ -77,6 +77,9 @@ class RunSheetConfig:
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
     min_utilization_target_pct: float = 98.0
+    # Max dispatch waves per vehicle in the same planning cycle.
+    # 1 = first run only, 2 = first + second run.
+    max_runs_per_vehicle: int = 2
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
     max_retailer_pair_distance_km: float = 10.0
@@ -804,42 +807,52 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
         vehicles = vehicles[vehicles[active_col].apply(lambda x: bool_from_value(x, default=True))]
 
     rows: List[Dict[str, object]] = []
-    if vehicle_id_col is not None:
-        for _, row in vehicles.iterrows():
-            vehicle_id = normalize_identifier(row.get(vehicle_id_col, ""), "")
-            if not vehicle_id:
-                continue
+    used_ids: set = set()
+
+    def unique_vehicle_id(base_id: str) -> str:
+        candidate = re.sub(r"[^A-Za-z0-9_]+", "", base_id)[:50] or "VEHICLE"
+        if candidate not in used_ids:
+            used_ids.add(candidate)
+            return candidate
+        suffix = 2
+        while True:
+            with_suffix = f"{candidate[:44]}_{suffix}"
+            if with_suffix not in used_ids:
+                used_ids.add(with_suffix)
+                return with_suffix
+            suffix += 1
+
+    for _, row in vehicles.iterrows():
+        chain = safe_str(row["_supply_chain"], "")
+        warehouse_id = safe_str(row["_warehouse_id"], "")
+        assigned_agent = safe_str(row["_assigned_agent"], "")
+        vehicle_type = safe_str(row["_vehicle_type"], "GENERIC") or "GENERIC"
+        base_vehicle_id = normalize_identifier(row.get(vehicle_id_col, ""), "") if vehicle_id_col is not None else ""
+
+        if count_col is not None:
+            count = int(max(0.0, safe_float(row.get(count_col, 0), 0.0)))
+            if count <= 0:
+                # If count is missing/zero but a concrete vehicle_id exists, treat it as 1 physical vehicle.
+                count = 1 if base_vehicle_id else 0
+        else:
+            count = 1 if base_vehicle_id else 0
+
+        for idx in range(1, count + 1):
+            if base_vehicle_id:
+                vehicle_id = base_vehicle_id if count == 1 else f"{base_vehicle_id}_{idx}"
+            else:
+                vehicle_id = f"{chain}_{warehouse_id}_{vehicle_type}_V{idx}"
             rows.append(
                 {
-                    "vehicle_id": vehicle_id,
-                    "supply_chain": row["_supply_chain"],
-                    "warehouse_id": row["_warehouse_id"],
-                    "assigned_agent": row["_assigned_agent"],
-                    "vehicle_type": row["_vehicle_type"],
+                    "vehicle_id": unique_vehicle_id(vehicle_id),
+                    "supply_chain": chain,
+                    "warehouse_id": warehouse_id,
+                    "assigned_agent": assigned_agent,
+                    "vehicle_type": vehicle_type,
                     "capacity": row["_capacity"],
                     "weight_capacity": row["_weight_capacity"],
                 }
             )
-    else:
-        for _, row in vehicles.iterrows():
-            count = int(max(0.0, safe_float(row.get(count_col, 0), 0.0)))
-            chain = safe_str(row["_supply_chain"], "")
-            warehouse_id = safe_str(row["_warehouse_id"], "")
-            assigned_agent = safe_str(row["_assigned_agent"], "")
-            vehicle_type = safe_str(row["_vehicle_type"], "GENERIC") or "GENERIC"
-            for idx in range(1, count + 1):
-                generated_id = f"{chain}_{warehouse_id}_{vehicle_type}_V{idx}"
-                rows.append(
-                    {
-                        "vehicle_id": re.sub(r"[^A-Za-z0-9_]+", "", generated_id)[:50],
-                        "supply_chain": chain,
-                        "warehouse_id": warehouse_id,
-                        "assigned_agent": assigned_agent,
-                        "vehicle_type": vehicle_type,
-                        "capacity": row["_capacity"],
-                        "weight_capacity": row["_weight_capacity"],
-                    }
-                )
     out = pd.DataFrame(rows)
     if out.empty:
         raise ValueError("No active vehicles available after preprocessing.")
@@ -1098,8 +1111,12 @@ def assign_multi_runs_nearest(
     run_number = start_run_number
     stop_cap = max(0, int(config.max_stops_per_run))
     safety_counter = 0
+    max_runs = max(1, int(config.max_runs_per_vehicle))
+    max_run_number = max_runs
+    if start_run_number > max_run_number:
+        return [], remaining, []
 
-    while remaining:
+    while remaining and run_number <= max_run_number:
         safety_counter += 1
         if safety_counter > 1000:
             log_warning(f"Safety break triggered for extra runs in {supply_chain}/{warehouse_id}.")
@@ -1201,6 +1218,13 @@ def assign_multi_runs_nearest(
         created_bins.extend([b for b in bins if b.orders])
         remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
         run_number += 1
+
+    if remaining and run_number > max_run_number:
+        for order in remaining:
+            tagged = dict(order)
+            tagged["unassigned_reason"] = "max_runs_per_vehicle_reached"
+            capacity_unassigned.append(tagged)
+        return created_bins, [], capacity_unassigned
 
     return created_bins, remaining, capacity_unassigned
 
@@ -1325,6 +1349,8 @@ def build_runsheets(
                 "warehouse_id": warehouse_id,
                 "orders_count": int(len(scoped_orders)),
                 "routes_count": int(scoped_orders["route"].nunique()),
+                "first_run_vehicles_count": int(len(scoped_vehicles)),
+                "max_runs_per_vehicle": int(max(1, config.max_runs_per_vehicle)),
                 "total_demand_cbm": demand,
                 "first_run_total_capacity_cbm": first_run_capacity,
                 "overload_after_first_run_cbm": overload_after_first_run,
@@ -1368,6 +1394,8 @@ def build_runsheets(
                         "purchased_items": order.get("purchased_items", 0.0),
                         "runsheet_id": b.runsheet_id,
                         "run_number": b.run_number,
+                        "is_second_run": b.run_number > 1,
+                        "run_wave": "SECOND_RUN" if b.run_number > 1 else "FIRST_RUN",
                         "vehicle_id": b.vehicle_id,
                         "assigned_agent": b.assigned_agent,
                         "vehicle_type": b.vehicle_type,
@@ -1381,6 +1409,8 @@ def build_runsheets(
                     "route_seed": b.route,
                     "covered_routes": " | ".join(b.covered_routes),
                     "run_number": b.run_number,
+                    "is_second_run": b.run_number > 1,
+                    "run_wave": "SECOND_RUN" if b.run_number > 1 else "FIRST_RUN",
                     "vehicle_id": b.vehicle_id,
                     "assigned_agent": b.assigned_agent,
                     "vehicle_type": b.vehicle_type,
