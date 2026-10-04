@@ -89,8 +89,8 @@ class RunSheetConfig:
     weight_first_supply_chains: Tuple[str, ...] = ("PEPSI",)
     # Geographic compactness controls to avoid runsheet overlap.
     allow_topup_distance_relaxation: bool = False
-    compactness_iterations: int = 3
-    compactness_min_improvement_km: float = 0.25
+    compactness_iterations: int = 6
+    compactness_min_improvement_km: float = 0.05
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
     max_retailer_pair_distance_km: float = 10.0
@@ -317,64 +317,143 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
     if iterations <= 0:
         return
     min_gain = max(0.0, safe_float(config.compactness_min_improvement_km, 0.0))
+    max_cbm_capacity = max((b.capacity for b in active_bins), default=0.0)
+    finite_weight_capacities = [b.weight_capacity for b in active_bins if math.isfinite(b.weight_capacity)]
+    max_weight_capacity = max(finite_weight_capacities) if finite_weight_capacities else float("inf")
+    chain_for_priority = safe_str(active_bins[0].supply_chain, "")
+
+    def snapshot_state() -> List[List[Dict[str, object]]]:
+        return [list(b.orders) for b in active_bins]
+
+    def restore_state(state: List[List[Dict[str, object]]]) -> None:
+        for bin_obj, orders in zip(active_bins, state):
+            bin_obj.orders = list(orders)
+            bin_obj.recompute_state()
+
+    def total_compactness_distance() -> float:
+        total = 0.0
+        for bin_obj in active_bins:
+            for order in bin_obj.orders:
+                total += distance_order_to_bin_centroid_km(order, bin_obj)
+        return total
+
+    all_orders: List[Dict[str, object]] = []
+    seen_ids: set = set()
+    for bin_obj in active_bins:
+        for order in bin_obj.orders:
+            order_id = safe_str(order.get("_order_id", ""), "")
+            if order_id and order_id in seen_ids:
+                continue
+            if order_id:
+                seen_ids.add(order_id)
+            all_orders.append(order)
+
+    best_state = snapshot_state()
+    best_distance = total_compactness_distance()
 
     for _ in range(iterations):
-        moved_any = False
-        move_candidates: List[Tuple[float, str, int, int]] = []
-        # Candidate format: (distance_gain, order_id, from_bin_idx, to_bin_idx)
-        for from_idx, from_bin in enumerate(active_bins):
-            for order in from_bin.orders:
-                order_id = safe_str(order.get("_order_id", ""), "")
-                if not order_id:
-                    continue
-                current_distance = distance_order_to_bin_centroid_km(order, from_bin)
-                best_distance = current_distance
-                best_to_idx = -1
-                order_cbm = get_order_cbm(order)
-                order_weight = get_order_weight(order)
-                for to_idx, to_bin in enumerate(active_bins):
-                    if to_idx == from_idx:
-                        continue
-                    if not to_bin.can_fit(order_cbm, order_weight, stop_cap):
-                        continue
-                    if not order_within_bin_distance_limits(order, to_bin, config):
-                        continue
-                    candidate_distance = distance_order_to_bin_centroid_km(order, to_bin)
-                    if candidate_distance + min_gain < best_distance:
-                        best_distance = candidate_distance
-                        best_to_idx = to_idx
-                if best_to_idx >= 0:
-                    move_candidates.append((current_distance - best_distance, order_id, from_idx, best_to_idx))
-
-        if not move_candidates:
-            break
-        move_candidates.sort(key=lambda t: t[0], reverse=True)
-
-        for _, order_id, from_idx, to_idx in move_candidates:
-            from_bin = active_bins[from_idx]
-            to_bin = active_bins[to_idx]
-            if from_bin is to_bin:
+        seed_centers: List[Tuple[float, float]] = []
+        for bin_obj in active_bins:
+            if bin_obj.centroid_lat is not None and bin_obj.centroid_lon is not None:
+                seed_centers.append((bin_obj.centroid_lat, bin_obj.centroid_lon))
                 continue
-            order = next(
-                (o for o in from_bin.orders if safe_str(o.get("_order_id", ""), "") == order_id),
-                None,
-            )
-            if order is None:
-                continue
+            if bin_obj.orders:
+                first = bin_obj.orders[0]
+                seed_centers.append((safe_float(first.get("lat", 0), 0.0), safe_float(first.get("lon", 0), 0.0)))
+            else:
+                seed_centers.append((0.0, 0.0))
+
+        for bin_obj in active_bins:
+            bin_obj.orders = []
+            bin_obj.recompute_state()
+
+        unassigned: List[Dict[str, object]] = []
+        orders_sorted = sorted(
+            all_orders,
+            key=lambda o: order_capacity_pressure(
+                o,
+                max_cbm_capacity,
+                max_weight_capacity,
+                chain_for_priority,
+                config,
+            ),
+            reverse=True,
+        )
+
+        for order in orders_sorted:
             order_cbm = get_order_cbm(order)
             order_weight = get_order_weight(order)
-            if not to_bin.can_fit(order_cbm, order_weight, stop_cap):
-                continue
-            if not order_within_bin_distance_limits(order, to_bin, config):
-                continue
-            removed = from_bin.remove_order_by_id(order_id)
-            if removed is None:
-                continue
-            to_bin.add_order(removed)
-            moved_any = True
+            lat = safe_float(order.get("lat", 0), 0.0)
+            lon = safe_float(order.get("lon", 0), 0.0)
+            candidates: List[Tuple[int, float, float, int]] = []
+            for idx, bin_obj in enumerate(active_bins):
+                if not bin_obj.can_fit(order_cbm, order_weight, stop_cap):
+                    continue
+                if bin_obj.orders:
+                    center_lat = safe_float(bin_obj.centroid_lat, 0.0)
+                    center_lon = safe_float(bin_obj.centroid_lon, 0.0)
+                    within_limits = order_within_bin_distance_limits(order, bin_obj, config)
+                else:
+                    center_lat, center_lon = seed_centers[idx]
+                    within_limits = True
+                distance = haversine_km(lat, lon, center_lat, center_lon)
+                candidates.append(
+                    (
+                        0 if within_limits else 1,
+                        distance,
+                        -bin_obj.utilization_pct,
+                        idx,
+                    )
+                )
 
-        if not moved_any:
-            break
+            if not candidates:
+                unassigned.append(order)
+                continue
+
+            candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+            best_idx = candidates[0][3]
+            active_bins[best_idx].add_order(order)
+
+        if unassigned:
+            # Retry remaining with relaxed distance guard but strict capacity/stops.
+            retry_unassigned: List[Dict[str, object]] = []
+            for order in unassigned:
+                order_cbm = get_order_cbm(order)
+                order_weight = get_order_weight(order)
+                lat = safe_float(order.get("lat", 0), 0.0)
+                lon = safe_float(order.get("lon", 0), 0.0)
+                candidates: List[Tuple[float, float, int]] = []
+                for idx, bin_obj in enumerate(active_bins):
+                    if not bin_obj.can_fit(order_cbm, order_weight, stop_cap):
+                        continue
+                    if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None:
+                        center_lat, center_lon = seed_centers[idx]
+                    else:
+                        center_lat, center_lon = bin_obj.centroid_lat, bin_obj.centroid_lon
+                    distance = haversine_km(lat, lon, safe_float(center_lat, 0.0), safe_float(center_lon, 0.0))
+                    candidates.append((distance, -bin_obj.utilization_pct, idx))
+                if not candidates:
+                    retry_unassigned.append(order)
+                    continue
+                candidates.sort(key=lambda t: (t[0], t[1]))
+                active_bins[candidates[0][2]].add_order(order)
+
+            if retry_unassigned:
+                # Keep previous best if reassignment could not place all orders.
+                restore_state(best_state)
+                break
+
+        current_distance = total_compactness_distance()
+        if current_distance + min_gain < best_distance:
+            best_distance = current_distance
+            best_state = snapshot_state()
+            continue
+
+        # No meaningful gain this iteration.
+        restore_state(best_state)
+        break
+
+    restore_state(best_state)
 
 
 def pick_topup_candidate(
