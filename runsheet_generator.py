@@ -38,6 +38,9 @@ class RunSheetConfig:
     carton_cbm_candidates: Tuple[str, ...] = ("carton_cbm", "cbm_per_carton", "carton_volume", "item_cbm")
     order_weight_candidates: Tuple[str, ...] = ("order_weight", "weight", "total_weight", "weight_kg", "kg")
     carton_weight_candidates: Tuple[str, ...] = ("carton_weight", "weight_per_carton", "item_weight", "carton_kg")
+    # In this project, order cbm/weight columns are often per-carton metrics.
+    order_cbm_is_per_carton: bool = True
+    order_weight_is_per_carton: bool = True
     purchased_items_candidates: Tuple[str, ...] = ("purchased_item_count", "qty", "quantity", "item_qty")
     # Fallback only when CBM column is missing/empty.
     order_volume_fallback_candidates: Tuple[str, ...] = (
@@ -643,15 +646,27 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         if load_fallback_col is not None
         else pd.Series(0.0, index=orders.index)
     )
-    orders["_line_cbm"] = direct_cbm_series.where(
-        direct_cbm_series > 0,
-        (carton_cbm_series * orders["_line_items"]).where(
+    direct_cbm_total = (
+        (direct_cbm_series * orders["_line_items"]).where(orders["_line_items"] > 0, direct_cbm_series)
+        if config.order_cbm_is_per_carton
+        else direct_cbm_series
+    )
+    carton_cbm_total = (carton_cbm_series * orders["_line_items"]).where(
+        orders["_line_items"] > 0,
+        carton_cbm_series,
+    )
+    orders["_line_cbm"] = direct_cbm_total.where(
+        direct_cbm_total > 0,
+        carton_cbm_total.where(
             (carton_cbm_series > 0) & (orders["_line_items"] > 0),
             fallback_cbm_series,
         ),
     )
     if cbm_col is not None:
-        log_info(f"Using order-level CBM column when available: {cbm_col}")
+        if config.order_cbm_is_per_carton:
+            log_info(f"Using per-carton CBM column and multiplying by purchased items: {cbm_col}")
+        else:
+            log_info(f"Using order-level CBM column when available: {cbm_col}")
     elif carton_cbm_col is not None:
         log_info(f"Order CBM will be derived from carton CBM x purchased items: {carton_cbm_col}")
     elif load_fallback_col is not None:
@@ -670,15 +685,27 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         if carton_weight_col is not None
         else pd.Series(0.0, index=orders.index)
     )
-    orders["_line_weight"] = direct_weight_series.where(
-        direct_weight_series > 0,
-        (carton_weight_series * orders["_line_items"]).where(
+    direct_weight_total = (
+        (direct_weight_series * orders["_line_items"]).where(orders["_line_items"] > 0, direct_weight_series)
+        if config.order_weight_is_per_carton
+        else direct_weight_series
+    )
+    carton_weight_total = (carton_weight_series * orders["_line_items"]).where(
+        orders["_line_items"] > 0,
+        carton_weight_series,
+    )
+    orders["_line_weight"] = direct_weight_total.where(
+        direct_weight_total > 0,
+        carton_weight_total.where(
             (carton_weight_series > 0) & (orders["_line_items"] > 0),
             0.0,
         ),
     )
     if weight_col is not None:
-        log_info(f"Using order-level weight column when available: {weight_col}")
+        if config.order_weight_is_per_carton:
+            log_info(f"Using per-carton weight column and multiplying by purchased items: {weight_col}")
+        else:
+            log_info(f"Using order-level weight column when available: {weight_col}")
     elif carton_weight_col is not None:
         log_info(f"Order weight will be derived from carton weight x purchased items: {carton_weight_col}")
     else:
@@ -703,8 +730,9 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
             route=("_route", "first"),
             lat=("_lat", "first"),
             lon=("_lon", "first"),
-            order_cbm=("_line_cbm", aggregate_order_measure),
-            order_weight=("_line_weight", aggregate_order_measure),
+            # _line_cbm/_line_weight are line totals, so order totals must be summed.
+            order_cbm=("_line_cbm", "sum"),
+            order_weight=("_line_weight", "sum"),
             purchased_items=("_line_items", "sum"),
             delivery_date=("_delivery_date", "max"),
         )
