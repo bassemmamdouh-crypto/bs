@@ -1852,6 +1852,16 @@ def build_runsheets(
                 config,
                 route_neighbors,
             )
+            post_validation_overflow = enforce_hard_limits_on_bins(bins, config)
+            if post_validation_overflow:
+                log_warning(
+                    f"Post-validation trimmed {len(post_validation_overflow)} overflow orders "
+                    f"in {supply_chain}/{warehouse_id}/{segment_key}."
+                )
+                for overflow_order in post_validation_overflow:
+                    tagged = dict(overflow_order)
+                    tagged["unassigned_reason"] = "post_validation_vehicle_capacity_exceeded"
+                    capacity_unassigned.append(tagged)
 
             for b in bins:
                 high_count = 0
