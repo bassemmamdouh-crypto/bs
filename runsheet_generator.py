@@ -456,6 +456,49 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
     restore_state(best_state)
 
 
+def enforce_hard_limits_on_bins(
+    bins: List["VehicleBin"],
+    config: RunSheetConfig,
+) -> List[Dict[str, object]]:
+    overflow_orders: List[Dict[str, object]] = []
+    stop_cap = max(0, int(config.max_stops_per_run))
+    tolerance = 1e-9
+
+    for bin_obj in bins:
+        if not bin_obj.orders:
+            continue
+
+        while True:
+            over_cbm = bin_obj.remaining < -tolerance
+            over_weight = is_finite_positive(bin_obj.weight_capacity) and (bin_obj.weight_remaining < -tolerance)
+            over_stops = stop_cap > 0 and len(bin_obj.orders) > stop_cap
+            if not (over_cbm or over_weight or over_stops):
+                break
+
+            # Remove the order with the weakest geographical fit / highest capacity burden.
+            scored: List[Tuple[float, int]] = []
+            for idx, order in enumerate(bin_obj.orders):
+                distance = distance_order_to_bin_centroid_km(order, bin_obj)
+                pressure = order_capacity_pressure(
+                    order,
+                    max(bin_obj.capacity, 1e-9),
+                    bin_obj.weight_capacity,
+                    bin_obj.supply_chain,
+                    config,
+                )
+                score = (distance * 3.0) + pressure
+                scored.append((score, idx))
+            if not scored:
+                break
+            scored.sort(key=lambda t: t[0], reverse=True)
+            drop_idx = scored[0][1]
+            removed = bin_obj.orders.pop(drop_idx)
+            bin_obj.recompute_state()
+            overflow_orders.append(removed)
+
+    return overflow_orders
+
+
 def pick_topup_candidate(
     bin_obj: "VehicleBin",
     orders_pool: List[Dict[str, object]],
@@ -1627,8 +1670,14 @@ def assign_multi_runs_nearest(
             continue
 
         compact_bins_for_min_distance(bins, config)
+        overflow_orders = enforce_hard_limits_on_bins(bins, config)
+        overflow_ids = {safe_str(o.get("_order_id", ""), "") for o in overflow_orders}
         created_bins.extend([b for b in bins if b.orders])
-        remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in assigned_ids]
+        remaining = [
+            o
+            for o in remaining
+            if safe_str(o.get("_order_id", ""), "") not in assigned_ids or safe_str(o.get("_order_id", ""), "") in overflow_ids
+        ]
         run_number += 1
 
     if remaining and run_number > max_run_number:
@@ -1687,13 +1736,25 @@ def assign_scoped_orders(
     # Step 2: assign first runs (run 1) polygon/route-first, nearest route expansion.
     first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, 1, config)
     first_run_assigned_ids = assign_single_first_run_route_first(first_run_orders, first_run_bins, route_neighbors, config)
+    first_run_overflow = enforce_hard_limits_on_bins(first_run_bins, config)
+    if first_run_overflow:
+        overflow_ids = {safe_str(o.get("_order_id", ""), "") for o in first_run_overflow}
+        first_run_assigned_ids = {oid for oid in first_run_assigned_ids if oid and oid not in overflow_ids}
     created_bins.extend([b for b in first_run_bins if b.orders])
 
     leftover_first_run = [
         o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
     ]
     # Anything not placed in run 1 must flow to additional runs.
-    second_run_pool = second_run_orders + leftover_first_run
+    second_run_pool_raw = second_run_orders + leftover_first_run + first_run_overflow
+    seen_second_pool: set = set()
+    second_run_pool: List[Dict[str, object]] = []
+    for order in second_run_pool_raw:
+        oid = safe_str(order.get("_order_id", ""), "")
+        if not oid or oid in seen_second_pool:
+            continue
+        seen_second_pool.add(oid)
+        second_run_pool.append(order)
 
     # Step 3: assign second/extra runs with nearest + largest packing.
     extra_bins, extra_leftover, extra_unassigned = assign_multi_runs_nearest(
