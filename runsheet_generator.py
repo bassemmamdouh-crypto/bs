@@ -961,16 +961,21 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     orders["_route"] = orders[route_col].apply(lambda x: normalize_key(x))
     orders["_lat"] = orders[lat_col].apply(lambda x: safe_float(x, 0.0))
     orders["_lon"] = orders[lon_col].apply(lambda x: safe_float(x, 0.0))
-    if items_col is not None:
-        orders["_line_items"] = orders[items_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
-    else:
-        orders["_line_items"] = 0.0
-        log_warning("Purchased-items column not found. Summary purchased items will be zero.")
-
     if order_load_col is not None:
         orders["_line_order_load"] = orders[order_load_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
         log_info(f"Using order load (items count) column: {order_load_col}")
     else:
+        orders["_line_order_load"] = 0.0
+    if items_col is not None:
+        orders["_line_items"] = orders[items_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+    elif order_load_col is not None:
+        orders["_line_items"] = orders["_line_order_load"]
+        log_info("Purchased-items column not found. Using order_load as purchased_items source.")
+    else:
+        orders["_line_items"] = 0.0
+        log_warning("Purchased-items and order_load columns were not found. Summary purchased items will be zero.")
+
+    if order_load_col is None:
         orders["_line_order_load"] = orders["_line_items"]
         log_warning("Order load column not found. Falling back to purchased-items for order_load.")
     orders["_qty_for_carton"] = orders["_line_items"].where(orders["_line_items"] > 0, orders["_line_order_load"])
@@ -1003,7 +1008,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     orders["_line_cbm"] = direct_cbm_total.where(
         direct_cbm_total > 0,
         carton_cbm_total.where(
-            (carton_cbm_series > 0) & (orders["_line_items"] > 0),
+            (carton_cbm_series > 0) & (orders["_qty_for_carton"] > 0),
             fallback_cbm_series,
         ),
     )
@@ -1042,7 +1047,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     orders["_line_weight"] = direct_weight_total.where(
         direct_weight_total > 0,
         carton_weight_total.where(
-            (carton_weight_series > 0) & (orders["_line_items"] > 0),
+            (carton_weight_series > 0) & (orders["_qty_for_carton"] > 0),
             0.0,
         ),
     )
