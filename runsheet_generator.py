@@ -67,6 +67,9 @@ class RunSheetConfig:
     vehicle_capacity_candidates: Tuple[str, ...] = (
         "cbm_capcity",
         "cbm_capacity",
+        "cbm",
+        "cbm_m3",
+        "cbm_capacity_m3",
         "vehicle_capacity",
         "capacity_cbm",
         "load_capacity",
@@ -74,6 +77,11 @@ class RunSheetConfig:
     )
     vehicle_weight_capacity_candidates: Tuple[str, ...] = (
         "weight_kg_capacity",
+        "weight_kg_capcity",
+        "weight_capacity_kg",
+        "weight_capcity_kg",
+        "weight_capacitykg",
+        "weightkgcapcity",
         "weightkgcapacity",
         "vehicle_weight_capacity",
         "weight_capacity",
@@ -81,7 +89,14 @@ class RunSheetConfig:
         "max_weight",
         "max_weight_kg",
     )
-    vehicle_stop_candidates: Tuple[str, ...] = ("number_of_stops", "max_stops", "stops_capacity", "stops_limit")
+    vehicle_stop_candidates: Tuple[str, ...] = (
+        "number_of_stops",
+        "number_of_stops_per_vehicle",
+        "stops_per_vehicle",
+        "max_stops",
+        "stops_capacity",
+        "stops_limit",
+    )
     vehicle_count_candidates: Tuple[str, ...] = ("vehicle_count", "count", "qty")
     vehicle_active_candidates: Tuple[str, ...] = ("active", "is_active", "enabled")
 
@@ -1202,6 +1217,15 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
     out = pd.DataFrame(rows)
     if out.empty:
         raise ValueError("No active vehicles available after preprocessing.")
+    total_cbm_capacity = float(out["capacity"].sum()) if "capacity" in out.columns else 0.0
+    finite_weight_caps = [safe_float(x, float("inf")) for x in out.get("weight_capacity", pd.Series(dtype=float)).tolist()]
+    total_weight_capacity = safe_sum_capacity(finite_weight_caps) if finite_weight_caps else float("inf")
+    total_stops_capacity = int(out["max_stops"].sum()) if "max_stops" in out.columns else 0
+    log_info(
+        "Vehicle capacity on hand (count-adjusted): "
+        f"vehicles={len(out)}, cbm={round(total_cbm_capacity, 3)}, "
+        f"weight={format_capacity_value(total_weight_capacity)}, stops={total_stops_capacity}"
+    )
     return out
 
 
@@ -1878,6 +1902,20 @@ def build_runsheets(
         sort=True,
     ):
         scoped_vehicles = vehicles_by_chain_warehouse.get((supply_chain, warehouse_id), pd.DataFrame())
+        warehouse_total_vehicles_on_hand = int(len(scoped_vehicles))
+        warehouse_total_cbm_capacity_on_hand = (
+            float(scoped_vehicles["capacity"].sum()) if not scoped_vehicles.empty else 0.0
+        )
+        warehouse_total_weight_capacity_on_hand = (
+            safe_sum_capacity(scoped_vehicles["weight_capacity"].astype(float).tolist())
+            if (not scoped_vehicles.empty and "weight_capacity" in scoped_vehicles.columns)
+            else float("inf")
+        )
+        warehouse_total_stops_capacity_on_hand = (
+            int(scoped_vehicles["max_stops"].sum())
+            if (not scoped_vehicles.empty and "max_stops" in scoped_vehicles.columns)
+            else 0
+        )
         segment_vehicle_pools = allocate_vehicles_to_segments(scoped_vehicles, scoped_orders)
         for segment, segment_orders in scoped_orders.groupby("segment", sort=True):
             segment_key = safe_str(segment, "") or "GENERAL"
@@ -1911,6 +1949,10 @@ def build_runsheets(
                     "supply_chain": supply_chain,
                     "warehouse_id": warehouse_id,
                     "segment": segment_key,
+                    "warehouse_total_vehicles_on_hand": warehouse_total_vehicles_on_hand,
+                    "warehouse_total_capacity_cbm_on_hand": warehouse_total_cbm_capacity_on_hand,
+                    "warehouse_total_capacity_weight_on_hand": format_capacity_value(warehouse_total_weight_capacity_on_hand),
+                    "warehouse_total_stops_on_hand": warehouse_total_stops_capacity_on_hand,
                     "orders_count": int(len(segment_orders)),
                     "routes_count": int(segment_orders["route"].nunique()),
                     "first_run_vehicles_count": int(len(segment_vehicles)),
