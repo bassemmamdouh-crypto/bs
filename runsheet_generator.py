@@ -119,6 +119,9 @@ class RunSheetConfig:
     allow_topup_distance_relaxation: bool = False
     compactness_iterations: int = 6
     compactness_min_improvement_km: float = 0.05
+    # Consolidate sparse runsheets by moving orders into nearby feasible fuller runsheets.
+    consolidation_min_utilization_pct: float = 65.0
+    consolidation_iterations: int = 4
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
     max_retailer_pair_distance_km: float = 10.0
@@ -515,6 +518,80 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
 
 def effective_stop_cap_for_bin(bin_obj: "VehicleBin", fallback_stop_cap: int) -> int:
     return bin_obj.stop_capacity if bin_obj.stop_capacity > 0 else max(0, int(fallback_stop_cap))
+
+
+def consolidate_sparse_bins(
+    bins: List["VehicleBin"],
+    config: RunSheetConfig,
+) -> None:
+    active_bins = [b for b in bins if b.orders]
+    if len(active_bins) <= 1:
+        return
+
+    min_util = max(0.0, min(100.0, safe_float(config.consolidation_min_utilization_pct, 65.0)))
+    max_iterations = max(0, int(config.consolidation_iterations))
+    if max_iterations <= 0:
+        return
+
+    fallback_stop_cap = max(0, int(config.max_stops_per_run))
+
+    for _ in range(max_iterations):
+        moved_any = False
+        donors = [
+            b
+            for b in active_bins
+            if b.orders and (len(b.orders) <= 1 or b.utilization_pct < min_util)
+        ]
+        donors.sort(key=lambda b: (len(b.orders), b.utilization_pct))
+        if not donors:
+            break
+
+        for donor in donors:
+            if not donor.orders:
+                continue
+            donor_orders = sorted(
+                list(donor.orders),
+                key=lambda o: order_capacity_pressure(
+                    o,
+                    max(donor.capacity, 1e-9),
+                    donor.weight_capacity,
+                    donor.supply_chain,
+                    config,
+                ),
+            )
+            for order in donor_orders:
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if not order_id:
+                    continue
+                recipients = [b for b in active_bins if b is not donor and b.orders]
+                best_recipient: Optional[Tuple[float, "VehicleBin"]] = None
+                for recipient in recipients:
+                    local_stop_cap = effective_stop_cap_for_bin(recipient, fallback_stop_cap)
+                    order_cbm = get_order_cbm(order)
+                    order_weight = get_order_weight(order)
+                    if not recipient.can_fit(order_cbm, order_weight, local_stop_cap):
+                        continue
+                    if not order_within_bin_distance_limits(order, recipient, config):
+                        continue
+                    util_gap, bottleneck_remaining = projected_fill_quality(recipient, order, config)
+                    distance = distance_order_to_bin_centroid_km(order, recipient)
+                    score = (util_gap * 1.0) + (bottleneck_remaining * 0.6) + (distance * 0.4)
+                    rank = (score, recipient)
+                    if best_recipient is None or rank[0] < best_recipient[0]:
+                        best_recipient = rank
+                if best_recipient is None:
+                    continue
+                removed = donor.remove_order_by_id(order_id)
+                if removed is None:
+                    continue
+                best_recipient[1].add_order(removed)
+                moved_any = True
+
+        if not moved_any:
+            break
+        active_bins = [b for b in bins if b.orders]
+        if len(active_bins) <= 1:
+            break
 
 
 def enforce_hard_limits_on_bins(
@@ -1780,6 +1857,7 @@ def assign_scoped_orders(
     )
     created_bins.extend(extra_bins)
     capacity_unassigned.extend(extra_unassigned)
+    consolidate_sparse_bins(created_bins, config)
 
     return created_bins, extra_leftover, capacity_unassigned
 
@@ -1895,6 +1973,8 @@ def build_runsheets(
                     capacity_unassigned.append(tagged)
 
             for b in bins:
+                if not b.orders:
+                    continue
                 is_second_run_value, run_wave_value = build_run_wave_fields(b.run_number, config)
                 high_count = 0
                 for order in b.orders:
