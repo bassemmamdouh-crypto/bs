@@ -104,7 +104,7 @@ class RunSheetConfig:
     high_volume_min_load_ratio: float = 0.60
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
-    min_utilization_target_pct: float = 98.0
+    min_utilization_target_pct: float = 90.0
     # Max dispatch waves per vehicle in the same planning cycle.
     # <=0 means unlimited waves until all orders are assigned.
     max_runs_per_vehicle: int = 0
@@ -120,7 +120,7 @@ class RunSheetConfig:
     compactness_iterations: int = 6
     compactness_min_improvement_km: float = 0.05
     # Consolidate sparse runsheets by moving orders into nearby feasible fuller runsheets.
-    consolidation_min_utilization_pct: float = 65.0
+    consolidation_min_utilization_pct: float = 90.0
     consolidation_iterations: int = 4
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
