@@ -27,21 +27,22 @@ class RunSheetConfig:
     kml_file: str = KML_FILE
 
     # Order columns
-    order_id_candidates: Tuple[str, ...] = ("order_id", "order_number", "order_no", "orderid")
+    order_id_candidates: Tuple[str, ...] = ("sales_order_id", "order_id", "order_number", "order_no", "orderid")
     supply_chain_candidates: Tuple[str, ...] = ("supply_chain", "supply chain", "supply_chain_name", "supplychain")
     warehouse_candidates: Tuple[str, ...] = ("warehouse_id", "warehouse", "warehouse_name", "wh_id", "depot")
     segment_candidates: Tuple[str, ...] = ("segment", "retailer_segment", "customer_segment", "channel", "trade_channel")
-    route_candidates: Tuple[str, ...] = ("route", "route_name", "delivery_route", "route_text")
+    route_candidates: Tuple[str, ...] = ("polygon_name", "route", "route_name", "delivery_route", "route_text", "district_name")
     latitude_candidates: Tuple[str, ...] = ("retailer_lat", "latitude", "lat", "customer_lat", "store_lat")
     longitude_candidates: Tuple[str, ...] = ("retailer_long", "longitude", "long", "lng", "customer_long", "store_long")
     # CBM is prioritized for planning load/capacity.
     order_cbm_candidates: Tuple[str, ...] = ("order_cbm", "cbm", "total_cbm", "volume_cbm", "volume")
     carton_cbm_candidates: Tuple[str, ...] = ("carton_cbm", "cbm_per_carton", "carton_volume", "item_cbm")
-    order_weight_candidates: Tuple[str, ...] = ("order_weight", "weight", "total_weight", "weight_kg", "kg")
+    order_weight_candidates: Tuple[str, ...] = ("order_weight_kg", "order_weight", "weight", "total_weight", "weight_kg", "kg")
+    order_load_candidates: Tuple[str, ...] = ("order_load", "order_items", "items_count", "item_count")
     carton_weight_candidates: Tuple[str, ...] = ("carton_weight", "weight_per_carton", "item_weight", "carton_kg")
     # In this project, order cbm/weight columns are often per-carton metrics.
-    order_cbm_is_per_carton: bool = True
-    order_weight_is_per_carton: bool = True
+    order_cbm_is_per_carton: bool = False
+    order_weight_is_per_carton: bool = False
     purchased_items_candidates: Tuple[str, ...] = ("purchased_item_count", "qty", "quantity", "item_qty")
     # Fallback only when CBM column is missing/empty.
     order_volume_fallback_candidates: Tuple[str, ...] = (
@@ -63,14 +64,24 @@ class RunSheetConfig:
     vehicle_segment_candidates: Tuple[str, ...] = ("segment", "assigned_segment", "vehicle_segment", "channel")
     vehicle_agent_candidates: Tuple[str, ...] = ("assigned_agent", "agent", "driver", "route_agent", "agent_name")
     vehicle_type_candidates: Tuple[str, ...] = ("vehicle_type", "type", "truck_type")
-    vehicle_capacity_candidates: Tuple[str, ...] = ("vehicle_capacity", "capacity", "load_capacity", "max_load")
+    vehicle_capacity_candidates: Tuple[str, ...] = (
+        "cbm_capcity",
+        "cbm_capacity",
+        "vehicle_capacity",
+        "capacity_cbm",
+        "load_capacity",
+        "max_load",
+    )
     vehicle_weight_capacity_candidates: Tuple[str, ...] = (
+        "weight_kg_capacity",
+        "weightkgcapacity",
         "vehicle_weight_capacity",
         "weight_capacity",
         "capacity_weight",
         "max_weight",
         "max_weight_kg",
     )
+    vehicle_stop_candidates: Tuple[str, ...] = ("number_of_stops", "max_stops", "stops_capacity", "stops_limit")
     vehicle_count_candidates: Tuple[str, ...] = ("vehicle_count", "count", "qty")
     vehicle_active_candidates: Tuple[str, ...] = ("active", "is_active", "enabled")
 
@@ -456,17 +467,21 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
     restore_state(best_state)
 
 
+def effective_stop_cap_for_bin(bin_obj: "VehicleBin", fallback_stop_cap: int) -> int:
+    return bin_obj.stop_capacity if bin_obj.stop_capacity > 0 else max(0, int(fallback_stop_cap))
+
+
 def enforce_hard_limits_on_bins(
     bins: List["VehicleBin"],
     config: RunSheetConfig,
 ) -> List[Dict[str, object]]:
     overflow_orders: List[Dict[str, object]] = []
-    stop_cap = max(0, int(config.max_stops_per_run))
     tolerance = 1e-9
 
     for bin_obj in bins:
         if not bin_obj.orders:
             continue
+        stop_cap = bin_obj.stop_capacity if bin_obj.stop_capacity > 0 else max(0, int(config.max_stops_per_run))
 
         while True:
             over_cbm = bin_obj.remaining < -tolerance
@@ -573,10 +588,11 @@ def top_up_bin_to_target_utilization(
     target_pct = min(target_pct, 100.0)
     if bin_obj.utilization_pct >= target_pct:
         return
+    local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
 
     # First pass: keep strict distance guards.
     while bin_obj.utilization_pct < target_pct:
-        if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+        if local_stop_cap > 0 and len(bin_obj.orders) >= local_stop_cap:
             break
         candidate = pick_topup_candidate(
             bin_obj,
@@ -585,7 +601,7 @@ def top_up_bin_to_target_utilization(
             target_pct,
             seed_route,
             route_neighbors,
-            stop_cap,
+            local_stop_cap,
             config,
             enforce_distance=True,
         )
@@ -602,7 +618,7 @@ def top_up_bin_to_target_utilization(
 
     # Second pass: relax distance only if still below target.
     while bin_obj.utilization_pct < target_pct:
-        if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+        if local_stop_cap > 0 and len(bin_obj.orders) >= local_stop_cap:
             break
         candidate = pick_topup_candidate(
             bin_obj,
@@ -611,7 +627,7 @@ def top_up_bin_to_target_utilization(
             target_pct,
             seed_route,
             route_neighbors,
-            stop_cap,
+            local_stop_cap,
             config,
             enforce_distance=False,
         )
@@ -729,6 +745,7 @@ class VehicleBin:
         run_number: int,
         capacity: float,
         weight_capacity: float,
+        stop_capacity: int,
         runsheet_id: str,
     ):
         self.vehicle_id = vehicle_id
@@ -744,13 +761,15 @@ class VehicleBin:
         self.remaining = max(0.0, capacity)
         self.weight_capacity = weight_capacity if is_finite_positive(weight_capacity) else float("inf")
         self.weight_remaining = self.weight_capacity
+        self.stop_capacity = max(0, int(stop_capacity))
         self.runsheet_id = runsheet_id
         self.orders: List[Dict[str, object]] = []
         self.centroid_lat: Optional[float] = None
         self.centroid_lon: Optional[float] = None
 
     def can_fit(self, cbm_load: float, weight_load: float, max_stops_per_run: int = 0) -> bool:
-        if max_stops_per_run > 0 and len(self.orders) >= max_stops_per_run:
+        stop_limit = self.stop_capacity if self.stop_capacity > 0 else max(0, int(max_stops_per_run))
+        if stop_limit > 0 and len(self.orders) >= stop_limit:
             return False
         if self.remaining < cbm_load:
             return False
@@ -896,6 +915,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     cbm_col = find_existing_column(raw, config.order_cbm_candidates)
     carton_cbm_col = find_existing_column(raw, config.carton_cbm_candidates)
     weight_col = find_existing_column(raw, config.order_weight_candidates)
+    order_load_col = find_existing_column(raw, config.order_load_candidates)
     carton_weight_col = find_existing_column(raw, config.carton_weight_candidates)
     items_col = find_existing_column(raw, config.purchased_items_candidates)
     load_fallback_col = find_existing_column(raw, config.order_volume_fallback_candidates)
@@ -932,6 +952,15 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         orders["_line_items"] = 0.0
         log_warning("Purchased-items column not found. Summary purchased items will be zero.")
 
+    if order_load_col is not None:
+        orders["_line_order_load"] = orders[order_load_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+        log_info(f"Using order load (items count) column: {order_load_col}")
+    else:
+        orders["_line_order_load"] = orders["_line_items"]
+        log_warning("Order load column not found. Falling back to purchased-items for order_load.")
+    orders["_qty_for_carton"] = orders["_line_items"].where(orders["_line_items"] > 0, orders["_line_order_load"])
+    orders["_line_load_count"] = orders["_line_order_load"].where(orders["_line_order_load"] > 0, orders["_line_items"])
+
     direct_cbm_series = (
         orders[cbm_col].apply(lambda x: max(0.0, safe_float(x, 0.0)))
         if cbm_col is not None
@@ -948,12 +977,12 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         else pd.Series(0.0, index=orders.index)
     )
     direct_cbm_total = (
-        (direct_cbm_series * orders["_line_items"]).where(orders["_line_items"] > 0, direct_cbm_series)
+        (direct_cbm_series * orders["_qty_for_carton"]).where(orders["_qty_for_carton"] > 0, direct_cbm_series)
         if config.order_cbm_is_per_carton
         else direct_cbm_series
     )
-    carton_cbm_total = (carton_cbm_series * orders["_line_items"]).where(
-        orders["_line_items"] > 0,
+    carton_cbm_total = (carton_cbm_series * orders["_qty_for_carton"]).where(
+        orders["_qty_for_carton"] > 0,
         carton_cbm_series,
     )
     orders["_line_cbm"] = direct_cbm_total.where(
@@ -987,12 +1016,12 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
         else pd.Series(0.0, index=orders.index)
     )
     direct_weight_total = (
-        (direct_weight_series * orders["_line_items"]).where(orders["_line_items"] > 0, direct_weight_series)
+        (direct_weight_series * orders["_qty_for_carton"]).where(orders["_qty_for_carton"] > 0, direct_weight_series)
         if config.order_weight_is_per_carton
         else direct_weight_series
     )
-    carton_weight_total = (carton_weight_series * orders["_line_items"]).where(
-        orders["_line_items"] > 0,
+    carton_weight_total = (carton_weight_series * orders["_qty_for_carton"]).where(
+        orders["_qty_for_carton"] > 0,
         carton_weight_series,
     )
     orders["_line_weight"] = direct_weight_total.where(
@@ -1035,13 +1064,16 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
             # _line_cbm/_line_weight are line totals, so order totals must be summed.
             order_cbm=("_line_cbm", "sum"),
             order_weight=("_line_weight", "sum"),
-            purchased_items=("_line_items", "sum"),
+            order_load=("_line_load_count", "sum"),
+            purchased_items=("_line_load_count", "sum"),
             delivery_date=("_delivery_date", "max"),
         )
     )
     grouped["order_cbm"] = grouped["order_cbm"].apply(lambda x: max(0.0, safe_float(x, 0.0)))
     grouped["order_weight"] = grouped["order_weight"].apply(lambda x: max(0.0, safe_float(x, 0.0)))
-    grouped["order_load"] = grouped["order_cbm"]
+    grouped["order_load"] = grouped["order_load"].apply(lambda x: max(0.0, safe_float(x, 0.0)))
+    grouped["order_load"] = grouped["order_load"].where(grouped["order_load"] > 0, grouped["purchased_items"])
+    grouped["order_load"] = grouped["order_load"].where(grouped["order_load"] > 0, grouped["order_cbm"])
     grouped["purchased_items"] = grouped["purchased_items"].apply(lambda x: max(0.0, safe_float(x, 0.0)))
     grouped = grouped[grouped["order_cbm"] > 0]
     if grouped.empty:
@@ -1063,6 +1095,7 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
     type_col = find_existing_column(raw, config.vehicle_type_candidates)
     capacity_col = find_existing_column(raw, config.vehicle_capacity_candidates)
     weight_capacity_col = find_existing_column(raw, config.vehicle_weight_capacity_candidates)
+    stops_col = find_existing_column(raw, config.vehicle_stop_candidates)
     count_col = find_existing_column(raw, config.vehicle_count_candidates)
     active_col = find_existing_column(raw, config.vehicle_active_candidates)
 
@@ -1102,6 +1135,11 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
     else:
         vehicles["_weight_capacity"] = float("inf")
         log_warning("Vehicle weight capacity column not found. Weight capacity will be treated as unlimited.")
+    vehicles["_max_stops"] = (
+        vehicles[stops_col].apply(lambda x: int(max(0.0, safe_float(x, 0.0))))
+        if stops_col is not None
+        else int(max(0, config.max_stops_per_run))
+    )
     vehicles = vehicles[
         (vehicles["_supply_chain"] != "")
         & (vehicles["_warehouse_id"] != "")
@@ -1158,6 +1196,7 @@ def load_vehicles(config: RunSheetConfig) -> pd.DataFrame:
                     "vehicle_type": vehicle_type,
                     "capacity": row["_capacity"],
                     "weight_capacity": row["_weight_capacity"],
+                    "max_stops": int(row["_max_stops"]) if safe_float(row["_max_stops"], 0.0) > 0 else int(config.max_stops_per_run),
                 }
             )
     out = pd.DataFrame(rows)
@@ -1201,6 +1240,7 @@ def create_vehicle_bins(
                 run_number=run_number,
                 capacity=safe_float(v["capacity"], 0.0),
                 weight_capacity=safe_float(v.get("weight_capacity", float("inf")), float("inf")),
+                stop_capacity=int(max(0.0, safe_float(v.get("max_stops", config.max_stops_per_run), config.max_stops_per_run))),
                 runsheet_id=build_runsheet_id(
                     config.runsheet_prefix,
                     supply_chain,
@@ -1323,18 +1363,22 @@ def select_second_run_order_ids(
 
     overload_cbm_base = max(extra_cbm_target, 1e-9)
     overload_weight_base = max(extra_weight_target, 1e-9) if extra_weight_target > 0 else 1.0
+    max_item_load = max((safe_float(o.get("order_load", 0), 0.0) for o in orders), default=0.0)
+    overload_item_base = max(max_item_load, 1e-9)
 
     def overload_score(order: Dict[str, object]) -> float:
         cbm = get_order_cbm(order)
         weight = get_order_weight(order)
+        item_load = max(0.0, safe_float(order.get("order_load", 0), 0.0))
         cbm_part = (cbm / overload_cbm_base) if extra_cbm_target > 0 else 0.0
         weight_part = (weight / overload_weight_base) if extra_weight_target > 0 else 0.0
+        items_part = item_load / overload_item_base
         mode = get_supply_chain_priority_mode(safe_str(order.get("supply_chain", ""), ""), config)
         if mode == "WEIGHT_FIRST":
-            return (weight_part * 2.0) + cbm_part
+            return (items_part * 3.0) + (weight_part * 2.0) + cbm_part
         if mode == "CBM_FIRST":
-            return (cbm_part * 2.0) + weight_part
-        return cbm_part + weight_part
+            return (items_part * 3.0) + (cbm_part * 2.0) + weight_part
+        return (items_part * 3.0) + cbm_part + weight_part
 
     safety = 0
     while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining:
@@ -1362,6 +1406,7 @@ def select_second_run_order_ids(
             if not order_id or order_id in selected_ids:
                 continue
             pressure = overload_score(order)
+            item_load = max(0.0, safe_float(order.get("order_load", 0), 0.0))
             lat = safe_float(order.get("lat", 0), 0.0)
             lon = safe_float(order.get("lon", 0), 0.0)
             distance = haversine_km(seed_lat, seed_lon, lat, lon)
@@ -1371,10 +1416,10 @@ def select_second_run_order_ids(
                 route_neighbors,
             )
             score = distance + (route_penalty * 1.5)
-            scored.append((score, -pressure, order))
-        scored.sort(key=lambda t: (t[0], t[1]))
+            scored.append((score, -item_load, -pressure, order))
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
 
-        for _, _, order in scored:
+        for _, _, _, order in scored:
             if selected_cbm >= extra_cbm_target and selected_weight >= extra_weight_target:
                 break
             order_id = safe_str(order.get("_order_id", ""), "")
@@ -1399,6 +1444,7 @@ def assign_single_first_run_route_first(
     stop_cap = max(0, int(config.max_stops_per_run))
 
     for bin_obj in bins:
+        local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
         remaining = [
             o
             for o in first_run_orders
@@ -1437,22 +1483,22 @@ def assign_single_first_run_route_first(
                 reverse=True,
             )
             for order in route_orders:
-                if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                if local_stop_cap > 0 and len(bin_obj.orders) >= local_stop_cap:
                     break
                 load_cbm = get_order_cbm(order)
                 load_weight = get_order_weight(order)
-                if not bin_obj.can_fit(load_cbm, load_weight, stop_cap):
+                if not bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                     continue
                 if not order_within_bin_distance_limits(order, bin_obj, config):
                     continue
                 bin_obj.add_order(order)
                 assigned_ids.add(safe_str(order.get("_order_id", ""), ""))
-            if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+            if local_stop_cap > 0 and len(bin_obj.orders) >= local_stop_cap:
                 break
 
         # Final fill for this first-run vehicle: nearest feasible orders if capacity still exists.
         while True:
-            if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+            if local_stop_cap > 0 and len(bin_obj.orders) >= local_stop_cap:
                 break
             candidates: List[Tuple[float, float, Dict[str, object]]] = []
             for order in first_run_orders:
@@ -1461,7 +1507,7 @@ def assign_single_first_run_route_first(
                     continue
                 load_cbm = get_order_cbm(order)
                 load_weight = get_order_weight(order)
-                if not bin_obj.can_fit(load_cbm, load_weight, stop_cap):
+                if not bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                     continue
                 if not order_within_bin_distance_limits(order, bin_obj, config):
                     continue
@@ -1502,7 +1548,7 @@ def assign_single_first_run_route_first(
             assigned_ids,
             seed_route,
             route_neighbors,
-            stop_cap,
+            local_stop_cap,
             config,
         )
 
@@ -1552,6 +1598,7 @@ def assign_multi_runs_nearest(
         bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, run_number, config)
         assigned_ids: set = set()
         for bin_obj in bins:
+            local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
             if not remaining:
                 break
             seed = max(
@@ -1567,13 +1614,13 @@ def assign_multi_runs_nearest(
             seed_id = safe_str(seed.get("_order_id", ""), "")
             seed_load_cbm = get_order_cbm(seed)
             seed_load_weight = get_order_weight(seed)
-            if seed_id and bin_obj.can_fit(seed_load_cbm, seed_load_weight, stop_cap):
+            if seed_id and bin_obj.can_fit(seed_load_cbm, seed_load_weight, local_stop_cap):
                 bin_obj.add_order(seed)
                 assigned_ids.add(seed_id)
             seed_route = safe_str(seed.get("route", ""), "")
 
             while True:
-                if stop_cap > 0 and len(bin_obj.orders) >= stop_cap:
+                if local_stop_cap > 0 and len(bin_obj.orders) >= local_stop_cap:
                     break
                 if not bin_obj.orders:
                     break
@@ -1584,7 +1631,7 @@ def assign_multi_runs_nearest(
                         continue
                     load_cbm = get_order_cbm(order)
                     load_weight = get_order_weight(order)
-                    if not bin_obj.can_fit(load_cbm, load_weight, stop_cap):
+                    if not bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                         continue
                     if not order_within_bin_distance_limits(order, bin_obj, config):
                         continue
@@ -1622,7 +1669,7 @@ def assign_multi_runs_nearest(
                 assigned_ids,
                 seed_route,
                 route_neighbors,
-                stop_cap,
+                local_stop_cap,
                 config,
             )
 
@@ -1646,7 +1693,8 @@ def assign_multi_runs_nearest(
                 load_cbm = get_order_cbm(order)
                 load_weight = get_order_weight(order)
                 for bin_obj in bins:
-                    if bin_obj.can_fit(load_cbm, load_weight, stop_cap):
+                    local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
+                    if bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                         bin_obj.add_order(order)
                         assigned_ids.add(order_id)
                         break
@@ -1718,6 +1766,7 @@ def assign_scoped_orders(
         if is_finite_positive(first_run_total_weight_capacity)
         else 0.0
     )
+    has_first_run_overload = (extra_load_target > 0) or (extra_weight_target > 0)
 
     # Step 1: carve second-run pool first (based on overload).
     second_run_order_ids = select_second_run_order_ids(
@@ -1745,6 +1794,41 @@ def assign_scoped_orders(
     leftover_first_run = [
         o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
     ]
+
+    if not has_first_run_overload and (leftover_first_run or first_run_overflow):
+        # If total demand fits first-run capacity, try to place leftovers in run-1 bins
+        # before considering any extra run.
+        fallback_stop_cap = max(0, int(config.max_stops_per_run))
+        missing_from_run1 = leftover_first_run + first_run_overflow
+        seen_missing: set = set()
+        dedup_missing: List[Dict[str, object]] = []
+        for order in missing_from_run1:
+            oid = safe_str(order.get("_order_id", ""), "")
+            if not oid or oid in seen_missing:
+                continue
+            seen_missing.add(oid)
+            dedup_missing.append(order)
+
+        for order in dedup_missing:
+            best_bin = choose_best_bin(order, first_run_bins, fallback_stop_cap)
+            if best_bin is None:
+                continue
+            best_bin.add_order(order)
+            oid = safe_str(order.get("_order_id", ""), "")
+            if oid:
+                first_run_assigned_ids.add(oid)
+        first_run_overflow = enforce_hard_limits_on_bins(first_run_bins, config)
+        overflow_ids = {safe_str(o.get("_order_id", ""), "") for o in first_run_overflow}
+        first_run_assigned_ids = {oid for oid in first_run_assigned_ids if oid and oid not in overflow_ids}
+        leftover_first_run = [
+            o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
+        ]
+        if leftover_first_run:
+            for order in leftover_first_run:
+                tagged = dict(order)
+                tagged["unassigned_reason"] = "first_run_capacity_or_stops_limit"
+                capacity_unassigned.append(tagged)
+            return created_bins, [], capacity_unassigned
     # Anything not placed in run 1 must flow to additional runs.
     second_run_pool_raw = second_run_orders + leftover_first_run + first_run_overflow
     seen_second_pool: set = set()
@@ -1922,7 +2006,7 @@ def build_runsheets(
                         ),
                         "min_utilization_target_pct": config.min_utilization_target_pct,
                         "meets_utilization_target": b.utilization_pct >= safe_float(config.min_utilization_target_pct, 0.0),
-                        "max_stops_per_run": config.max_stops_per_run,
+                        "max_stops_per_run": b.stop_capacity if b.stop_capacity > 0 else config.max_stops_per_run,
                         "high_volume_orders_count": high_count,
                     }
                 )
