@@ -637,6 +637,75 @@ def recycle_underutilized_first_run_bins(
     return recycled_orders
 
 
+def optimize_second_run_utilization(
+    bins: List["VehicleBin"],
+    config: RunSheetConfig,
+) -> None:
+    target = max(0.0, min(100.0, safe_float(config.second_run_min_utilization_target_pct, 70.0)))
+    max_iterations = 6
+    fallback_stop_cap = max(0, int(config.max_stops_per_run))
+
+    for _ in range(max_iterations):
+        second_bins = [b for b in bins if b.run_number > 1 and b.orders]
+        if len(second_bins) <= 1:
+            break
+        moved_any = False
+        donors = sorted(
+            [b for b in second_bins if b.utilization_pct < target or len(b.orders) <= 1],
+            key=lambda b: (b.utilization_pct, len(b.orders)),
+        )
+        if not donors:
+            break
+
+        for donor in donors:
+            if not donor.orders:
+                continue
+            donor_orders = sorted(
+                list(donor.orders),
+                key=lambda o: (
+                    safe_float(o.get("order_load", 0), 0.0),
+                    get_order_cbm(o),
+                    get_order_weight(o),
+                ),
+                reverse=True,
+            )
+            for order in donor_orders:
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if not order_id:
+                    continue
+                order_cbm = get_order_cbm(order)
+                order_weight = get_order_weight(order)
+                strict_candidates: List[Tuple[float, "VehicleBin"]] = []
+                relaxed_candidates: List[Tuple[float, "VehicleBin"]] = []
+                for recipient in second_bins:
+                    if recipient is donor or not recipient.orders:
+                        continue
+                    local_stop_cap = effective_stop_cap_for_bin(recipient, fallback_stop_cap, config)
+                    if not recipient.can_fit(order_cbm, order_weight, local_stop_cap):
+                        continue
+                    distance = distance_order_to_bin_centroid_km(order, recipient)
+                    util_gap, bottleneck_remaining = projected_fill_quality(recipient, order, config)
+                    score = (util_gap * 1.2) + (bottleneck_remaining * 0.8) + (distance * 0.3)
+                    if order_within_bin_distance_limits(order, recipient, config):
+                        strict_candidates.append((score, recipient))
+                    else:
+                        relaxed_candidates.append((score + 1.5, recipient))
+
+                candidates = strict_candidates if strict_candidates else relaxed_candidates
+                if not candidates:
+                    continue
+                candidates.sort(key=lambda t: t[0])
+                best_recipient = candidates[0][1]
+                removed = donor.remove_order_by_id(order_id)
+                if removed is None:
+                    continue
+                best_recipient.add_order(removed)
+                moved_any = True
+
+        if not moved_any:
+            break
+
+
 def enforce_hard_limits_on_bins(
     bins: List["VehicleBin"],
     config: RunSheetConfig,
@@ -778,7 +847,8 @@ def top_up_bin_to_target_utilization(
         bin_obj.add_order(candidate)
         assigned_ids.add(candidate_id)
 
-    if not bool(config.allow_topup_distance_relaxation):
+    allow_relax = bool(config.allow_topup_distance_relaxation) or (bin_obj.run_number > 1)
+    if not allow_relax:
         return
 
     # Second pass: relax distance only if still below target.
@@ -1807,7 +1877,8 @@ def assign_multi_runs_nearest(
                     break
                 if not bin_obj.orders:
                     break
-                candidates: List[Tuple[float, float, float, float, Dict[str, object]]] = []
+                strict_candidates: List[Tuple[float, float, float, float, Dict[str, object]]] = []
+                relaxed_candidates: List[Tuple[float, float, float, float, Dict[str, object]]] = []
                 for order in remaining:
                     order_id = safe_str(order.get("_order_id", ""), "")
                     if not order_id or order_id in assigned_ids:
@@ -1816,7 +1887,8 @@ def assign_multi_runs_nearest(
                     load_weight = get_order_weight(order)
                     if not bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                         continue
-                    if not order_within_bin_distance_limits(order, bin_obj, config):
+                    within_limits = order_within_bin_distance_limits(order, bin_obj, config)
+                    if (not within_limits) and bin_obj.run_number <= 1:
                         continue
                     lat = safe_float(order.get("lat", 0), 0.0)
                     lon = safe_float(order.get("lon", 0), 0.0)
@@ -1824,21 +1896,24 @@ def assign_multi_runs_nearest(
                     route_penalty = route_proximity_penalty(safe_str(order.get("route", ""), ""), seed_route, route_neighbors)
                     util_gap, bottleneck_remaining = projected_fill_quality(bin_obj, order, config)
                     score = distance + route_penalty
-                    candidates.append(
-                        (
-                            util_gap,
-                            bottleneck_remaining,
-                            score,
-                            -order_capacity_pressure(
-                                order,
-                                bin_obj.capacity,
-                                bin_obj.weight_capacity,
-                                bin_obj.supply_chain,
-                                config,
-                            ),
+                    rank_tuple = (
+                        util_gap,
+                        bottleneck_remaining,
+                        score + (0.0 if within_limits else 2.0),
+                        -order_capacity_pressure(
                             order,
-                        )
+                            bin_obj.capacity,
+                            bin_obj.weight_capacity,
+                            bin_obj.supply_chain,
+                            config,
+                        ),
+                        order,
                     )
+                    if within_limits:
+                        strict_candidates.append(rank_tuple)
+                    else:
+                        relaxed_candidates.append(rank_tuple)
+                candidates = strict_candidates if strict_candidates else relaxed_candidates
                 if not candidates:
                     break
                 candidates.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
@@ -2011,6 +2086,7 @@ def assign_scoped_orders(
         config,
     )
     created_bins.extend(extra_bins)
+    optimize_second_run_utilization(created_bins, config)
     capacity_unassigned.extend(extra_unassigned)
     consolidate_sparse_bins(created_bins, config)
 
