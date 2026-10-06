@@ -109,7 +109,8 @@ class RunSheetConfig:
     second_run_min_utilization_target_pct: float = 70.0
     second_run_max_orders: int = 6
     recycle_first_run_below_utilization_pct: float = 70.0
-    second_run_seed_orders_per_district: int = 1
+    first_run_strict_same_route: bool = True
+    second_run_strict_same_route: bool = True
     # Max dispatch waves per vehicle in the same planning cycle.
     # <=0 means unlimited runs until all feasible orders are assigned.
     max_runs_per_vehicle: int = 0
@@ -395,6 +396,17 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
     max_weight_capacity = max(finite_weight_capacities) if finite_weight_capacities else float("inf")
     chain_for_priority = safe_str(active_bins[0].supply_chain, "")
 
+    def route_lock_allows(order: Dict[str, object], bin_obj: "VehicleBin") -> bool:
+        order_route = safe_str(order.get("route", ""), "")
+        bin_route = safe_str(bin_obj.route, "")
+        if not bin_route or not order_route:
+            return True
+        if bin_obj.run_number <= 1 and bool(config.first_run_strict_same_route):
+            return order_route == bin_route
+        if bin_obj.run_number > 1 and bool(config.second_run_strict_same_route):
+            return order_route == bin_route
+        return True
+
     def snapshot_state() -> List[List[Dict[str, object]]]:
         return [list(b.orders) for b in active_bins]
 
@@ -462,6 +474,8 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
             for idx, bin_obj in enumerate(active_bins):
                 if not bin_obj.can_fit(order_cbm, order_weight, stop_cap):
                     continue
+                if not route_lock_allows(order, bin_obj):
+                    continue
                 if bin_obj.orders:
                     center_lat = safe_float(bin_obj.centroid_lat, 0.0)
                     center_lon = safe_float(bin_obj.centroid_lon, 0.0)
@@ -498,6 +512,8 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
                 candidates: List[Tuple[float, float, int]] = []
                 for idx, bin_obj in enumerate(active_bins):
                     if not bin_obj.can_fit(order_cbm, order_weight, stop_cap):
+                        continue
+                    if not route_lock_allows(order, bin_obj):
                         continue
                     if bin_obj.centroid_lat is None or bin_obj.centroid_lon is None:
                         center_lat, center_lon = seed_centers[idx]
@@ -594,6 +610,13 @@ def consolidate_sparse_bins(
                     local_stop_cap = effective_stop_cap_for_bin(recipient, fallback_stop_cap, config)
                     order_cbm = get_order_cbm(order)
                     order_weight = get_order_weight(order)
+                    order_route = safe_str(order.get("route", ""), "")
+                    recipient_route = safe_str(recipient.route, "")
+                    if recipient_route and order_route:
+                        if recipient.run_number <= 1 and bool(config.first_run_strict_same_route) and order_route != recipient_route:
+                            continue
+                        if recipient.run_number > 1 and bool(config.second_run_strict_same_route) and order_route != recipient_route:
+                            continue
                     if not recipient.can_fit(order_cbm, order_weight, local_stop_cap):
                         continue
                     if not order_within_bin_distance_limits(order, recipient, config):
@@ -682,6 +705,11 @@ def optimize_second_run_utilization(
                 for recipient in second_bins:
                     if recipient is donor or not recipient.orders:
                         continue
+                    if bool(config.second_run_strict_same_route):
+                        donor_route = safe_str(donor.route, "")
+                        recipient_route = safe_str(recipient.route, "")
+                        if donor_route and recipient_route and donor_route != recipient_route:
+                            continue
                     local_stop_cap = effective_stop_cap_for_bin(recipient, fallback_stop_cap, config)
                     if not recipient.can_fit(order_cbm, order_weight, local_stop_cap):
                         continue
@@ -761,6 +789,7 @@ def pick_topup_candidate(
     stop_cap: int,
     config: RunSheetConfig,
     enforce_distance: bool,
+    strict_same_route: bool = False,
 ) -> Optional[Dict[str, object]]:
     best: Optional[Tuple[float, float, Dict[str, object]]] = None
     for order in orders_pool:
@@ -771,6 +800,9 @@ def pick_topup_candidate(
         order_weight = get_order_weight(order)
         if not bin_obj.can_fit(order_cbm, order_weight, stop_cap):
             continue
+        if strict_same_route and seed_route:
+            if safe_str(order.get("route", ""), "") != seed_route:
+                continue
         if enforce_distance and (not order_within_bin_distance_limits(order, bin_obj, config)):
             continue
         projected_cbm = bin_obj.assigned_load + order_cbm
@@ -818,6 +850,7 @@ def top_up_bin_to_target_utilization(
     route_neighbors: Dict[str, List[str]],
     stop_cap: int,
     config: RunSheetConfig,
+    strict_same_route: bool = False,
 ) -> None:
     target_pct = get_utilization_target_for_bin(bin_obj, config)
     if target_pct <= 0 or bin_obj.capacity <= 0:
@@ -840,6 +873,7 @@ def top_up_bin_to_target_utilization(
             local_stop_cap,
             config,
             enforce_distance=True,
+            strict_same_route=strict_same_route,
         )
         if candidate is None:
             break
@@ -867,6 +901,7 @@ def top_up_bin_to_target_utilization(
             local_stop_cap,
             config,
             enforce_distance=False,
+            strict_same_route=strict_same_route,
         )
         if candidate is None:
             break
@@ -902,7 +937,6 @@ def select_second_run_order_ids(
     selected_cbm = 0.0
     selected_weight = 0.0
     cluster_limit = max(1, int(max(1.0, safe_float(config.second_run_max_orders, 6.0))))
-    seeds_per_district = max(1, int(max(1.0, safe_float(config.second_run_seed_orders_per_district, 1.0))))
 
     def load_score(order: Dict[str, object]) -> Tuple[float, float, float]:
         return (
@@ -911,59 +945,13 @@ def select_second_run_order_ids(
             get_order_weight(order),
         )
 
-    # 1) Tag highest-load orders per district as potential second-run seeds.
-    district_groups: Dict[str, List[Dict[str, object]]] = {}
-    for order in orders:
-        district = safe_str(order.get("district", ""), "") or safe_str(order.get("route", ""), "")
-        district_groups.setdefault(district, []).append(order)
-
-    candidate_orders: List[Dict[str, object]] = []
-    seen_candidate_ids: set = set()
-    for _, group_orders in district_groups.items():
-        ranked = sorted(group_orders, key=load_score, reverse=True)
-        for order in ranked[:seeds_per_district]:
-            oid = safe_str(order.get("_order_id", ""), "")
-            if not oid or oid in seen_candidate_ids:
-                continue
-            seen_candidate_ids.add(oid)
-            candidate_orders.append(order)
-    if not candidate_orders:
-        candidate_orders = list(orders)
-
-    max_pair_km = safe_float(config.max_retailer_pair_distance_km, 0.0)
-    near_threshold = max_pair_km if max_pair_km > 0 else 6.0
-    candidate_density: Dict[str, int] = {}
-    for order in candidate_orders:
-        oid = safe_str(order.get("_order_id", ""), "")
-        if not oid:
-            continue
-        lat1 = safe_float(order.get("lat", 0), 0.0)
-        lon1 = safe_float(order.get("lon", 0), 0.0)
-        nearby = 0
-        for other in candidate_orders:
-            other_id = safe_str(other.get("_order_id", ""), "")
-            if not other_id or other_id == oid:
-                continue
-            lat2 = safe_float(other.get("lat", 0), 0.0)
-            lon2 = safe_float(other.get("lon", 0), 0.0)
-            if haversine_km(lat1, lon1, lat2, lon2) <= near_threshold:
-                nearby += 1
-        candidate_density[oid] = nearby
-
-    def seed_priority(order: Dict[str, object]) -> Tuple[float, float, float, float]:
-        oid = safe_str(order.get("_order_id", ""), "")
-        return (
-            max(0.0, safe_float(order.get("order_load", 0), 0.0)),
-            float(candidate_density.get(oid, 0)),
-            get_order_cbm(order),
-            get_order_weight(order),
-        )
-
-    remaining_candidates = sorted(candidate_orders, key=seed_priority, reverse=True)
-    while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining_candidates:
-        seed = remaining_candidates.pop(0)
+    remaining_orders = list(orders)
+    while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining_orders:
+        # Pick nearest-largest seed dynamically (no predefined second-run tags).
+        seed = max(remaining_orders, key=load_score)
         seed_id = safe_str(seed.get("_order_id", ""), "")
         if not seed_id or seed_id in selected_ids:
+            remaining_orders = [o for o in remaining_orders if safe_str(o.get("_order_id", ""), "") != seed_id]
             continue
 
         selected_ids.add(seed_id)
@@ -976,7 +964,7 @@ def select_second_run_order_ids(
         cluster_count = 1
 
         scored: List[Tuple[float, float, float, Dict[str, object]]] = []
-        for order in remaining_candidates:
+        for order in remaining_orders:
             order_id = safe_str(order.get("_order_id", ""), "")
             if not order_id or order_id in selected_ids:
                 continue
@@ -1005,54 +993,9 @@ def select_second_run_order_ids(
             selected_weight += get_order_weight(order)
             cluster_count += 1
 
-        remaining_candidates = [
-            o for o in remaining_candidates if safe_str(o.get("_order_id", ""), "") not in selected_ids
+        remaining_orders = [
+            o for o in remaining_orders if safe_str(o.get("_order_id", ""), "") not in selected_ids
         ]
-
-    # Fallback: if district candidates are not enough for overload, expand with nearest biggest orders.
-    if selected_cbm < extra_cbm_target or selected_weight < extra_weight_target:
-        remaining_all = [
-            o for o in orders if safe_str(o.get("_order_id", ""), "") not in selected_ids
-        ]
-        while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining_all:
-            anchor = (
-                max(
-                    (o for o in orders if safe_str(o.get("_order_id", ""), "") in selected_ids),
-                    key=load_score,
-                )
-                if selected_ids
-                else max(remaining_all, key=load_score)
-            )
-            a_lat = safe_float(anchor.get("lat", 0), 0.0)
-            a_lon = safe_float(anchor.get("lon", 0), 0.0)
-            a_route = safe_str(anchor.get("route", ""), "")
-
-            scored_extra: List[Tuple[float, float, float, Dict[str, object]]] = []
-            for order in remaining_all:
-                order_id = safe_str(order.get("_order_id", ""), "")
-                if not order_id or order_id in selected_ids:
-                    continue
-                lat = safe_float(order.get("lat", 0), 0.0)
-                lon = safe_float(order.get("lon", 0), 0.0)
-                distance = haversine_km(a_lat, a_lon, lat, lon)
-                route_penalty = route_proximity_penalty(
-                    safe_str(order.get("route", ""), ""),
-                    a_route,
-                    route_neighbors,
-                )
-                item_load = max(0.0, safe_float(order.get("order_load", 0), 0.0))
-                scored_extra.append((distance + (route_penalty * 1.2), -item_load, -get_order_cbm(order), order))
-            if not scored_extra:
-                break
-            scored_extra.sort(key=lambda t: (t[0], t[1], t[2]))
-            pick = scored_extra[0][3]
-            pick_id = safe_str(pick.get("_order_id", ""), "")
-            if not pick_id:
-                break
-            selected_ids.add(pick_id)
-            selected_cbm += get_order_cbm(pick)
-            selected_weight += get_order_weight(pick)
-            remaining_all = [o for o in remaining_all if safe_str(o.get("_order_id", ""), "") != pick_id]
 
     return selected_ids
 
@@ -1812,10 +1755,13 @@ def assign_single_first_run_route_first(
         if not route_loads:
             continue
         seed_route = max(route_loads.items(), key=lambda t: t[1])[0]
-        route_sequence = [seed_route] + [r for r in route_neighbors.get(seed_route, []) if r != seed_route]
-        for route_name in sorted(route_loads.keys(), key=lambda r: route_loads[r], reverse=True):
-            if route_name not in route_sequence:
-                route_sequence.append(route_name)
+        if bool(config.first_run_strict_same_route):
+            route_sequence = [seed_route]
+        else:
+            route_sequence = [seed_route] + [r for r in route_neighbors.get(seed_route, []) if r != seed_route]
+            for route_name in sorted(route_loads.keys(), key=lambda r: route_loads[r], reverse=True):
+                if route_name not in route_sequence:
+                    route_sequence.append(route_name)
 
         for route_name in route_sequence:
             route_orders = [
@@ -1857,6 +1803,9 @@ def assign_single_first_run_route_first(
                 order_id = safe_str(order.get("_order_id", ""), "")
                 if not order_id or order_id in assigned_ids:
                     continue
+                if bool(config.first_run_strict_same_route) and seed_route:
+                    if safe_str(order.get("route", ""), "") != seed_route:
+                        continue
                 load_cbm = get_order_cbm(order)
                 load_weight = get_order_weight(order)
                 if not bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
@@ -1905,6 +1854,7 @@ def assign_single_first_run_route_first(
             route_neighbors,
             local_stop_cap,
             config,
+            strict_same_route=bool(config.first_run_strict_same_route),
         )
 
     compact_bins_for_min_distance(bins, config)
@@ -1983,6 +1933,9 @@ def assign_multi_runs_nearest(
                     order_id = safe_str(order.get("_order_id", ""), "")
                     if not order_id or order_id in assigned_ids:
                         continue
+                    if bool(config.second_run_strict_same_route) and seed_route:
+                        if safe_str(order.get("route", ""), "") != seed_route:
+                            continue
                     load_cbm = get_order_cbm(order)
                     load_weight = get_order_weight(order)
                     if not bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
@@ -2032,6 +1985,7 @@ def assign_multi_runs_nearest(
                 route_neighbors,
                 local_stop_cap,
                 config,
+                strict_same_route=bool(config.second_run_strict_same_route),
             )
 
         if not assigned_ids:
@@ -2055,6 +2009,11 @@ def assign_multi_runs_nearest(
                 load_weight = get_order_weight(order)
                 for bin_obj in bins:
                     local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
+                    if bool(config.second_run_strict_same_route):
+                        bin_route = safe_str(bin_obj.route, "")
+                        order_route = safe_str(order.get("route", ""), "")
+                        if bin_route and order_route and order_route != bin_route:
+                            continue
                     if bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                         bin_obj.add_order(order)
                         assigned_ids.add(order_id)
