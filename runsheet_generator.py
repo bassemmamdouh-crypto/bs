@@ -106,7 +106,7 @@ class RunSheetConfig:
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
     min_utilization_target_pct: float = 100.0
-    second_run_min_utilization_target_pct: float = 80.0
+    second_run_min_utilization_target_pct: float = 100.0
     # <=0 means no additional cap on second-run order count (vehicle stops still apply).
     second_run_max_orders: int = 0
     recycle_first_run_below_utilization_pct: float = 80.0
@@ -115,8 +115,8 @@ class RunSheetConfig:
     # Max dispatch waves per vehicle in the same planning cycle.
     # <=0 means unlimited runs until all feasible orders are assigned.
     max_runs_per_vehicle: int = 0
-    # Flag first/second runs explicitly in output.
-    label_run_wave_as_first_second: bool = True
+    # Keep run wave neutral; all runs follow first-run rules.
+    label_run_wave_as_first_second: bool = False
     # Supply chain capacity-priority mode during packing:
     # - CBM-first means prioritize filling CBM before weight tie-break.
     # - Weight-first means prioritize weight before CBM tie-break.
@@ -305,14 +305,11 @@ def build_run_wave_fields(run_number: int, config: RunSheetConfig) -> Tuple[obje
     if bool(config.label_run_wave_as_first_second):
         is_second = run_number > 1
         return is_second, ("SECOND_RUN" if is_second else "FIRST_RUN")
-    return "", "TO_BE_DECIDED"
+    return False, "FIRST_RUN_RULES"
 
 
 def get_utilization_target_for_bin(bin_obj: "VehicleBin", config: RunSheetConfig) -> float:
-    if bin_obj.run_number > 1:
-        target = safe_float(config.second_run_min_utilization_target_pct, safe_float(config.min_utilization_target_pct, 0.0))
-    else:
-        target = safe_float(config.min_utilization_target_pct, 0.0)
+    target = safe_float(config.min_utilization_target_pct, 0.0)
     return min(100.0, max(0.0, target))
 
 
@@ -402,9 +399,7 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
         bin_route = safe_str(bin_obj.route, "")
         if not bin_route or not order_route:
             return True
-        if bin_obj.run_number <= 1 and bool(config.first_run_strict_same_route):
-            return order_route == bin_route
-        if bin_obj.run_number > 1 and bool(config.second_run_strict_same_route):
+        if bool(config.first_run_strict_same_route):
             return order_route == bin_route
         return True
 
@@ -566,7 +561,6 @@ def consolidate_sparse_bins(
         return
 
     first_run_min_util = max(0.0, min(100.0, safe_float(config.consolidation_min_utilization_pct, 65.0)))
-    second_run_min_util = max(0.0, min(100.0, safe_float(config.second_run_min_utilization_target_pct, first_run_min_util)))
     max_iterations = max(0, int(config.consolidation_iterations))
     if max_iterations <= 0:
         return
@@ -581,7 +575,7 @@ def consolidate_sparse_bins(
             if b.orders
             and (
                 len(b.orders) <= 1
-                or b.utilization_pct < (second_run_min_util if b.run_number > 1 else first_run_min_util)
+                or b.utilization_pct < first_run_min_util
             )
         ]
         donors.sort(key=lambda b: (len(b.orders), b.utilization_pct))
@@ -614,9 +608,7 @@ def consolidate_sparse_bins(
                     order_route = safe_str(order.get("route", ""), "")
                     recipient_route = safe_str(recipient.route, "")
                     if recipient_route and order_route:
-                        if recipient.run_number <= 1 and bool(config.first_run_strict_same_route) and order_route != recipient_route:
-                            continue
-                        if recipient.run_number > 1 and bool(config.second_run_strict_same_route) and order_route != recipient_route:
+                        if bool(config.first_run_strict_same_route) and order_route != recipient_route:
                             continue
                     if not recipient.can_fit(order_cbm, order_weight, local_stop_cap):
                         continue
@@ -706,7 +698,7 @@ def optimize_second_run_utilization(
                 for recipient in second_bins:
                     if recipient is donor or not recipient.orders:
                         continue
-                    if bool(config.second_run_strict_same_route):
+                    if bool(config.first_run_strict_same_route):
                         donor_route = safe_str(donor.route, "")
                         recipient_route = safe_str(recipient.route, "")
                         if donor_route and recipient_route and donor_route != recipient_route:
@@ -884,7 +876,7 @@ def top_up_bin_to_target_utilization(
         bin_obj.add_order(candidate)
         assigned_ids.add(candidate_id)
 
-    allow_relax = bool(config.allow_topup_distance_relaxation) or (bin_obj.run_number > 1)
+    allow_relax = bool(config.allow_topup_distance_relaxation)
     if not allow_relax:
         return
 
@@ -1934,7 +1926,7 @@ def assign_multi_runs_nearest(
                     order_id = safe_str(order.get("_order_id", ""), "")
                     if not order_id or order_id in assigned_ids:
                         continue
-                    if bool(config.second_run_strict_same_route) and seed_route:
+                    if bool(config.first_run_strict_same_route) and seed_route:
                         if safe_str(order.get("route", ""), "") != seed_route:
                             continue
                     load_cbm = get_order_cbm(order)
@@ -1987,7 +1979,7 @@ def assign_multi_runs_nearest(
                 route_neighbors,
                 local_stop_cap,
                 config,
-                strict_same_route=bool(config.second_run_strict_same_route),
+                strict_same_route=bool(config.first_run_strict_same_route),
             )
 
         if not assigned_ids:
@@ -2011,7 +2003,7 @@ def assign_multi_runs_nearest(
                 load_weight = get_order_weight(order)
                 for bin_obj in bins:
                     local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
-                    if bool(config.second_run_strict_same_route):
+                    if bool(config.first_run_strict_same_route):
                         bin_route = safe_str(bin_obj.route, "")
                         order_route = safe_str(order.get("route", ""), "")
                         if bin_route and order_route and order_route != bin_route:
@@ -2078,18 +2070,6 @@ def assign_scoped_orders(
 
     created_bins: List[VehicleBin] = []
     capacity_unassigned: List[Dict[str, object]] = []
-    first_run_total_capacity = sum(safe_float(v["capacity"], 0.0) for v in vehicle_list)
-    first_run_total_weight_capacity = safe_sum_capacity(
-        [safe_float(v.get("weight_capacity", float("inf")), float("inf")) for v in vehicle_list]
-    )
-    total_demand_cbm = sum(get_order_cbm(o) for o in all_orders)
-    total_demand_weight = sum(get_order_weight(o) for o in all_orders)
-    extra_cbm_target = max(0.0, total_demand_cbm - first_run_total_capacity)
-    extra_weight_target = (
-        max(0.0, total_demand_weight - first_run_total_weight_capacity)
-        if is_finite_positive(first_run_total_weight_capacity)
-        else 0.0
-    )
 
     # 1) Build first runs from all orders with highest utilization target.
     first_run_orders = list(all_orders)
@@ -2126,7 +2106,7 @@ def assign_scoped_orders(
         seen_remaining.add(oid)
         remaining_pool.append(order)
 
-    # 2) Assign remaining orders into additional second runs.
+    # 2) Assign remaining orders into additional runs using the same rule set.
     extra_bins, extra_leftover, extra_unassigned = assign_multi_runs_nearest(
         remaining_pool,
         vehicle_list,
@@ -2138,7 +2118,6 @@ def assign_scoped_orders(
         config,
     )
     created_bins.extend(extra_bins)
-    optimize_second_run_utilization(created_bins, config)
     capacity_unassigned.extend(extra_unassigned)
     consolidate_sparse_bins(created_bins, config)
 
