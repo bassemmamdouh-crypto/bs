@@ -31,6 +31,7 @@ class RunSheetConfig:
     supply_chain_candidates: Tuple[str, ...] = ("supply_chain", "supply chain", "supply_chain_name", "supplychain")
     warehouse_candidates: Tuple[str, ...] = ("warehouse_id", "warehouse", "warehouse_name", "wh_id", "depot")
     segment_candidates: Tuple[str, ...] = ("segment", "retailer_segment", "customer_segment", "channel", "trade_channel")
+    district_candidates: Tuple[str, ...] = ("district_name", "district", "district_id")
     route_candidates: Tuple[str, ...] = ("polygon_name", "route", "route_name", "delivery_route", "route_text", "district_name")
     latitude_candidates: Tuple[str, ...] = ("retailer_lat", "latitude", "lat", "customer_lat", "store_lat")
     longitude_candidates: Tuple[str, ...] = ("retailer_long", "longitude", "long", "lng", "customer_long", "store_long")
@@ -108,6 +109,7 @@ class RunSheetConfig:
     second_run_min_utilization_target_pct: float = 70.0
     second_run_max_orders: int = 6
     recycle_first_run_below_utilization_pct: float = 70.0
+    second_run_seed_orders_per_district: int = 1
     # Max dispatch waves per vehicle in the same planning cycle.
     # <=0 means unlimited runs until all feasible orders are assigned.
     max_runs_per_vehicle: int = 0
@@ -896,12 +898,11 @@ def select_second_run_order_ids(
     if extra_cbm_target <= 0 and extra_weight_target <= 0:
         return set()
 
-    remaining = list(orders)
     selected_ids: set = set()
     selected_cbm = 0.0
     selected_weight = 0.0
     cluster_limit = max(1, int(max(1.0, safe_float(config.second_run_max_orders, 6.0))))
-    safety = 0
+    seeds_per_district = max(1, int(max(1.0, safe_float(config.second_run_seed_orders_per_district, 1.0))))
 
     def load_score(order: Dict[str, object]) -> Tuple[float, float, float]:
         return (
@@ -910,29 +911,72 @@ def select_second_run_order_ids(
             get_order_weight(order),
         )
 
-    while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining:
-        safety += 1
-        if safety > 10000:
-            break
+    # 1) Tag highest-load orders per district as potential second-run seeds.
+    district_groups: Dict[str, List[Dict[str, object]]] = {}
+    for order in orders:
+        district = safe_str(order.get("district", ""), "") or safe_str(order.get("route", ""), "")
+        district_groups.setdefault(district, []).append(order)
 
-        seed = max(remaining, key=load_score)
+    candidate_orders: List[Dict[str, object]] = []
+    seen_candidate_ids: set = set()
+    for _, group_orders in district_groups.items():
+        ranked = sorted(group_orders, key=load_score, reverse=True)
+        for order in ranked[:seeds_per_district]:
+            oid = safe_str(order.get("_order_id", ""), "")
+            if not oid or oid in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(oid)
+            candidate_orders.append(order)
+    if not candidate_orders:
+        candidate_orders = list(orders)
+
+    max_pair_km = safe_float(config.max_retailer_pair_distance_km, 0.0)
+    near_threshold = max_pair_km if max_pair_km > 0 else 6.0
+    candidate_density: Dict[str, int] = {}
+    for order in candidate_orders:
+        oid = safe_str(order.get("_order_id", ""), "")
+        if not oid:
+            continue
+        lat1 = safe_float(order.get("lat", 0), 0.0)
+        lon1 = safe_float(order.get("lon", 0), 0.0)
+        nearby = 0
+        for other in candidate_orders:
+            other_id = safe_str(other.get("_order_id", ""), "")
+            if not other_id or other_id == oid:
+                continue
+            lat2 = safe_float(other.get("lat", 0), 0.0)
+            lon2 = safe_float(other.get("lon", 0), 0.0)
+            if haversine_km(lat1, lon1, lat2, lon2) <= near_threshold:
+                nearby += 1
+        candidate_density[oid] = nearby
+
+    def seed_priority(order: Dict[str, object]) -> Tuple[float, float, float, float]:
+        oid = safe_str(order.get("_order_id", ""), "")
+        return (
+            max(0.0, safe_float(order.get("order_load", 0), 0.0)),
+            float(candidate_density.get(oid, 0)),
+            get_order_cbm(order),
+            get_order_weight(order),
+        )
+
+    remaining_candidates = sorted(candidate_orders, key=seed_priority, reverse=True)
+    while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining_candidates:
+        seed = remaining_candidates.pop(0)
         seed_id = safe_str(seed.get("_order_id", ""), "")
-        if not seed_id:
-            remaining = [o for o in remaining if o is not seed]
+        if not seed_id or seed_id in selected_ids:
             continue
 
-        if seed_id not in selected_ids:
-            selected_ids.add(seed_id)
-            selected_cbm += get_order_cbm(seed)
-            selected_weight += get_order_weight(seed)
+        selected_ids.add(seed_id)
+        selected_cbm += get_order_cbm(seed)
+        selected_weight += get_order_weight(seed)
 
         seed_lat = safe_float(seed.get("lat", 0), 0.0)
         seed_lon = safe_float(seed.get("lon", 0), 0.0)
         seed_route = safe_str(seed.get("route", ""), "")
         cluster_count = 1
 
-        candidates: List[Tuple[float, float, float, Dict[str, object]]] = []
-        for order in remaining:
+        scored: List[Tuple[float, float, float, Dict[str, object]]] = []
+        for order in remaining_candidates:
             order_id = safe_str(order.get("_order_id", ""), "")
             if not order_id or order_id in selected_ids:
                 continue
@@ -945,10 +989,10 @@ def select_second_run_order_ids(
                 route_neighbors,
             )
             item_load = max(0.0, safe_float(order.get("order_load", 0), 0.0))
-            candidates.append((distance + (route_penalty * 1.3), -item_load, -get_order_cbm(order), order))
-        candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+            scored.append((distance + (route_penalty * 1.3), -item_load, -get_order_cbm(order), order))
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
 
-        for _, _, _, order in candidates:
+        for _, _, _, order in scored:
             if selected_cbm >= extra_cbm_target and selected_weight >= extra_weight_target:
                 break
             if cluster_count >= cluster_limit:
@@ -961,7 +1005,54 @@ def select_second_run_order_ids(
             selected_weight += get_order_weight(order)
             cluster_count += 1
 
-        remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in selected_ids]
+        remaining_candidates = [
+            o for o in remaining_candidates if safe_str(o.get("_order_id", ""), "") not in selected_ids
+        ]
+
+    # Fallback: if district candidates are not enough for overload, expand with nearest biggest orders.
+    if selected_cbm < extra_cbm_target or selected_weight < extra_weight_target:
+        remaining_all = [
+            o for o in orders if safe_str(o.get("_order_id", ""), "") not in selected_ids
+        ]
+        while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining_all:
+            anchor = (
+                max(
+                    (o for o in orders if safe_str(o.get("_order_id", ""), "") in selected_ids),
+                    key=load_score,
+                )
+                if selected_ids
+                else max(remaining_all, key=load_score)
+            )
+            a_lat = safe_float(anchor.get("lat", 0), 0.0)
+            a_lon = safe_float(anchor.get("lon", 0), 0.0)
+            a_route = safe_str(anchor.get("route", ""), "")
+
+            scored_extra: List[Tuple[float, float, float, Dict[str, object]]] = []
+            for order in remaining_all:
+                order_id = safe_str(order.get("_order_id", ""), "")
+                if not order_id or order_id in selected_ids:
+                    continue
+                lat = safe_float(order.get("lat", 0), 0.0)
+                lon = safe_float(order.get("lon", 0), 0.0)
+                distance = haversine_km(a_lat, a_lon, lat, lon)
+                route_penalty = route_proximity_penalty(
+                    safe_str(order.get("route", ""), ""),
+                    a_route,
+                    route_neighbors,
+                )
+                item_load = max(0.0, safe_float(order.get("order_load", 0), 0.0))
+                scored_extra.append((distance + (route_penalty * 1.2), -item_load, -get_order_cbm(order), order))
+            if not scored_extra:
+                break
+            scored_extra.sort(key=lambda t: (t[0], t[1], t[2]))
+            pick = scored_extra[0][3]
+            pick_id = safe_str(pick.get("_order_id", ""), "")
+            if not pick_id:
+                break
+            selected_ids.add(pick_id)
+            selected_cbm += get_order_cbm(pick)
+            selected_weight += get_order_weight(pick)
+            remaining_all = [o for o in remaining_all if safe_str(o.get("_order_id", ""), "") != pick_id]
 
     return selected_ids
 
@@ -1235,6 +1326,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     chain_col = find_existing_column(raw, config.supply_chain_candidates)
     warehouse_col = find_existing_column(raw, config.warehouse_candidates)
     segment_col = find_existing_column(raw, config.segment_candidates)
+    district_col = find_existing_column(raw, config.district_candidates)
     route_col = find_existing_column(raw, config.route_candidates)
     lat_col = find_existing_column(raw, config.latitude_candidates)
     lon_col = find_existing_column(raw, config.longitude_candidates)
@@ -1269,7 +1361,14 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
     else:
         orders["_segment"] = "GENERAL"
         log_warning("Order segment column not found. All orders will be treated as segment GENERAL.")
+    if district_col is not None:
+        orders["_district"] = orders[district_col].apply(lambda x: normalize_key(x))
+        orders["_district"] = orders["_district"].apply(lambda s: s if s else "UNSPECIFIED")
+    else:
+        orders["_district"] = "UNSPECIFIED"
+        log_warning("District column not found. Using route value as district fallback.")
     orders["_route"] = orders[route_col].apply(lambda x: normalize_key(x))
+    orders["_district"] = orders["_district"].where(orders["_district"] != "UNSPECIFIED", orders["_route"])
     orders["_lat"] = orders[lat_col].apply(lambda x: safe_float(x, 0.0))
     orders["_lon"] = orders[lon_col].apply(lambda x: safe_float(x, 0.0))
     if order_load_col is not None:
@@ -1389,6 +1488,7 @@ def load_orders(config: RunSheetConfig) -> pd.DataFrame:
             supply_chain=("_supply_chain", "first"),
             warehouse_id=("_warehouse_id", "first"),
             segment=("_segment", "first"),
+            district=("_district", "first"),
             route=("_route", "first"),
             lat=("_lat", "first"),
             lon=("_lon", "first"),
@@ -2238,6 +2338,7 @@ def build_runsheets(
                             "supply_chain": order.get("supply_chain", ""),
                             "warehouse_id": order.get("warehouse_id", ""),
                             "segment": order.get("segment", segment_key),
+                            "district": order.get("district", ""),
                             "route": order.get("route", ""),
                             "retailer_lat": order.get("lat", 0.0),
                             "retailer_long": order.get("lon", 0.0),
@@ -2261,6 +2362,7 @@ def build_runsheets(
                         "supply_chain": b.supply_chain,
                         "warehouse_id": b.warehouse_id,
                         "segment": b.segment,
+                        "district_seed": (safe_str(b.orders[0].get("district", ""), "") if b.orders else ""),
                         "route_seed": b.route,
                         "covered_routes": " | ".join(b.covered_routes),
                         "run_number": b.run_number,
@@ -2297,6 +2399,7 @@ def build_runsheets(
                         "supply_chain": order.get("supply_chain", ""),
                         "warehouse_id": order.get("warehouse_id", ""),
                         "segment": order.get("segment", segment_key),
+                        "district": order.get("district", ""),
                         "route": order.get("route", ""),
                         "retailer_lat": order.get("lat", 0.0),
                         "retailer_long": order.get("lon", 0.0),
@@ -2314,6 +2417,7 @@ def build_runsheets(
                         "supply_chain": order.get("supply_chain", ""),
                         "warehouse_id": order.get("warehouse_id", ""),
                         "segment": order.get("segment", segment_key),
+                        "district": order.get("district", ""),
                         "route": order.get("route", ""),
                         "retailer_lat": order.get("lat", 0.0),
                         "retailer_long": order.get("lon", 0.0),
