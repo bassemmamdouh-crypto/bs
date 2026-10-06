@@ -109,8 +109,8 @@ class RunSheetConfig:
     second_run_max_orders: int = 6
     recycle_first_run_below_utilization_pct: float = 70.0
     # Max dispatch waves per vehicle in the same planning cycle.
-    # 2 means first and second runs only.
-    max_runs_per_vehicle: int = 2
+    # <=0 means unlimited runs until all feasible orders are assigned.
+    max_runs_per_vehicle: int = 0
     # Flag first/second runs explicitly in output.
     label_run_wave_as_first_second: bool = True
     # Supply chain capacity-priority mode during packing:
@@ -1770,11 +1770,11 @@ def assign_multi_runs_nearest(
     stop_cap = max(0, int(config.max_stops_per_run))
     safety_counter = 0
     configured_max_runs = int(config.max_runs_per_vehicle)
-    max_run_number = configured_max_runs if configured_max_runs > 0 else 999
+    max_run_number = configured_max_runs if configured_max_runs > 0 else None
 
-    while remaining and run_number <= max_run_number:
+    while remaining and (max_run_number is None or run_number <= max_run_number):
         safety_counter += 1
-        if safety_counter > 1000:
+        if safety_counter > 10000:
             log_warning(f"Safety break triggered for extra runs in {supply_chain}/{warehouse_id}.")
             break
 
@@ -1914,7 +1914,7 @@ def assign_multi_runs_nearest(
         ]
         run_number += 1
 
-    if remaining and run_number > max_run_number:
+    if remaining and max_run_number is not None and run_number > max_run_number:
         for order in remaining:
             tagged = dict(order)
             tagged["unassigned_reason"] = "max_runs_per_vehicle_reached"
@@ -2119,12 +2119,30 @@ def build_runsheets(
             post_validation_overflow = enforce_hard_limits_on_bins(bins, config)
             if post_validation_overflow:
                 log_warning(
-                    f"Post-validation trimmed {len(post_validation_overflow)} overflow orders "
-                    f"in {supply_chain}/{warehouse_id}/{segment_key}."
+                    f"Post-validation trimmed {len(post_validation_overflow)} overflow orders; "
+                    f"retrying assignment in additional runs for {supply_chain}/{warehouse_id}/{segment_key}."
                 )
-                for overflow_order in post_validation_overflow:
-                    tagged = dict(overflow_order)
-                    tagged["unassigned_reason"] = "post_validation_vehicle_capacity_exceeded"
+                vehicle_records = segment_vehicles.sort_values("vehicle_id").to_dict("records")
+                next_run_number = (
+                    (max((b.run_number for b in bins), default=1) + 1)
+                    if bins
+                    else 2
+                )
+                recovered_bins, recovered_leftover, recovered_unassigned = assign_multi_runs_nearest(
+                    post_validation_overflow,
+                    vehicle_records,
+                    supply_chain,
+                    warehouse_id,
+                    segment_key,
+                    next_run_number,
+                    route_neighbors,
+                    config,
+                )
+                bins.extend(recovered_bins)
+                capacity_unassigned.extend(recovered_unassigned)
+                for order in recovered_leftover:
+                    tagged = dict(order)
+                    tagged["unassigned_reason"] = "post_validation_reassignment_failed"
                     capacity_unassigned.append(tagged)
 
             for b in bins:
