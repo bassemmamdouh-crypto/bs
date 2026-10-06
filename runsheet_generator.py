@@ -107,6 +107,7 @@ class RunSheetConfig:
     min_utilization_target_pct: float = 90.0
     second_run_min_utilization_target_pct: float = 70.0
     second_run_max_orders: int = 6
+    recycle_first_run_below_utilization_pct: float = 70.0
     # Max dispatch waves per vehicle in the same planning cycle.
     # 2 means first and second runs only.
     max_runs_per_vehicle: int = 2
@@ -614,6 +615,26 @@ def consolidate_sparse_bins(
         active_bins = [b for b in bins if b.orders]
         if len(active_bins) <= 1:
             break
+
+
+def recycle_underutilized_first_run_bins(
+    bins: List["VehicleBin"],
+    config: RunSheetConfig,
+) -> List[Dict[str, object]]:
+    recycled_orders: List[Dict[str, object]] = []
+    threshold = max(
+        0.0,
+        min(100.0, safe_float(config.recycle_first_run_below_utilization_pct, 70.0)),
+    )
+    for bin_obj in bins:
+        if bin_obj.run_number != 1 or not bin_obj.orders:
+            continue
+        if bin_obj.utilization_pct >= threshold:
+            continue
+        recycled_orders.extend(list(bin_obj.orders))
+        bin_obj.orders = []
+        bin_obj.recompute_state()
+    return recycled_orders
 
 
 def enforce_hard_limits_on_bins(
@@ -1950,12 +1971,25 @@ def assign_scoped_orders(
     if first_run_overflow:
         overflow_ids = {safe_str(o.get("_order_id", ""), "") for o in first_run_overflow}
         first_run_assigned_ids = {oid for oid in first_run_assigned_ids if oid and oid not in overflow_ids}
+    recycled_first_run_orders = recycle_underutilized_first_run_bins(first_run_bins, config)
+    if recycled_first_run_orders:
+        recycled_ids = {safe_str(o.get("_order_id", ""), "") for o in recycled_first_run_orders}
+        first_run_assigned_ids = {oid for oid in first_run_assigned_ids if oid and oid not in recycled_ids}
+        log_info(
+            f"Recycled {len(recycled_first_run_orders)} orders from underutilized first runs "
+            f"into second-run pool for {supply_chain}/{warehouse_id}/{segment}."
+        )
     created_bins.extend([b for b in first_run_bins if b.orders])
 
     remaining_after_first_wave = [
         o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
     ]
-    remaining_pool_raw = preselected_second_run_orders + remaining_after_first_wave + first_run_overflow
+    remaining_pool_raw = (
+        preselected_second_run_orders
+        + remaining_after_first_wave
+        + first_run_overflow
+        + recycled_first_run_orders
+    )
     seen_remaining: set = set()
     remaining_pool: List[Dict[str, object]] = []
     for order in remaining_pool_raw:
