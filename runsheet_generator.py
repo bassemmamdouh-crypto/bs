@@ -105,10 +105,10 @@ class RunSheetConfig:
     high_volume_min_load_ratio: float = 0.60
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
-    min_utilization_target_pct: float = 90.0
+    min_utilization_target_pct: float = 100.0
     second_run_min_utilization_target_pct: float = 70.0
     second_run_max_orders: int = 6
-    recycle_first_run_below_utilization_pct: float = 70.0
+    recycle_first_run_below_utilization_pct: float = 99.0
     first_run_strict_same_route: bool = True
     second_run_strict_same_route: bool = True
     # Max dispatch waves per vehicle in the same planning cycle.
@@ -126,7 +126,7 @@ class RunSheetConfig:
     compactness_iterations: int = 6
     compactness_min_improvement_km: float = 0.05
     # Consolidate sparse runsheets by moving orders into nearby feasible fuller runsheets.
-    consolidation_min_utilization_pct: float = 90.0
+    consolidation_min_utilization_pct: float = 99.0
     consolidation_iterations: int = 4
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
@@ -1904,16 +1904,26 @@ def assign_multi_runs_nearest(
             local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
             if not remaining:
                 break
-            seed = max(
-                remaining,
-                key=lambda o: order_capacity_pressure(
-                    o,
-                    bin_obj.capacity,
-                    bin_obj.weight_capacity,
-                    bin_obj.supply_chain,
-                    config,
-                ),
-            )
+            if run_number > 1:
+                seed = min(
+                    remaining,
+                    key=lambda o: (
+                        safe_float(o.get("order_load", 0), 0.0),
+                        get_order_cbm(o),
+                        get_order_weight(o),
+                    ),
+                )
+            else:
+                seed = max(
+                    remaining,
+                    key=lambda o: order_capacity_pressure(
+                        o,
+                        bin_obj.capacity,
+                        bin_obj.weight_capacity,
+                        bin_obj.supply_chain,
+                        config,
+                    ),
+                )
             seed_id = safe_str(seed.get("_order_id", ""), "")
             seed_load_cbm = get_order_cbm(seed)
             seed_load_weight = get_order_weight(seed)
@@ -1949,17 +1959,18 @@ def assign_multi_runs_nearest(
                     route_penalty = route_proximity_penalty(safe_str(order.get("route", ""), ""), seed_route, route_neighbors)
                     util_gap, bottleneck_remaining = projected_fill_quality(bin_obj, order, config)
                     score = distance + route_penalty
+                    pressure_rank = order_capacity_pressure(
+                        order,
+                        bin_obj.capacity,
+                        bin_obj.weight_capacity,
+                        bin_obj.supply_chain,
+                        config,
+                    )
                     rank_tuple = (
                         util_gap,
                         bottleneck_remaining,
                         score + (0.0 if within_limits else 2.0),
-                        -order_capacity_pressure(
-                            order,
-                            bin_obj.capacity,
-                            bin_obj.weight_capacity,
-                            bin_obj.supply_chain,
-                            config,
-                        ),
+                        pressure_rank if run_number > 1 else -pressure_rank,
                         order,
                     )
                     if within_limits:
@@ -1999,7 +2010,7 @@ def assign_multi_runs_nearest(
                     supply_chain,
                     config,
                 ),
-                reverse=True,
+                reverse=(run_number <= 1),
             )
             for order in capacity_sorted:
                 order_id = safe_str(order.get("_order_id", ""), "")
