@@ -105,11 +105,13 @@ class RunSheetConfig:
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
     min_utilization_target_pct: float = 90.0
+    second_run_min_utilization_target_pct: float = 70.0
+    second_run_max_orders: int = 6
     # Max dispatch waves per vehicle in the same planning cycle.
-    # <=0 means unlimited waves until all orders are assigned.
-    max_runs_per_vehicle: int = 0
-    # Keep run-wave labeling neutral so planners can decide first/second later.
-    label_run_wave_as_first_second: bool = False
+    # 2 means first and second runs only.
+    max_runs_per_vehicle: int = 2
+    # Flag first/second runs explicitly in output.
+    label_run_wave_as_first_second: bool = True
     # Supply chain capacity-priority mode during packing:
     # - CBM-first means prioritize filling CBM before weight tie-break.
     # - Weight-first means prioritize weight before CBM tie-break.
@@ -301,6 +303,14 @@ def build_run_wave_fields(run_number: int, config: RunSheetConfig) -> Tuple[obje
     return "", "TO_BE_DECIDED"
 
 
+def get_utilization_target_for_bin(bin_obj: "VehicleBin", config: RunSheetConfig) -> float:
+    if bin_obj.run_number > 1:
+        target = safe_float(config.second_run_min_utilization_target_pct, safe_float(config.min_utilization_target_pct, 0.0))
+    else:
+        target = safe_float(config.min_utilization_target_pct, 0.0)
+    return min(100.0, max(0.0, target))
+
+
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1 = math.radians(lat1)
@@ -354,7 +364,7 @@ def projected_fill_quality(
     projected_cbm = bin_obj.assigned_load + get_order_cbm(order)
     projected_weight = bin_obj.assigned_weight + get_order_weight(order)
     projected_util = bin_obj.projected_utilization_pct(projected_cbm, projected_weight)
-    target = min(100.0, max(0.0, safe_float(config.min_utilization_target_pct, 0.0)))
+    target = get_utilization_target_for_bin(bin_obj, config)
     util_gap = abs(target - projected_util)
 
     cbm_remaining_ratio = (
@@ -516,8 +526,15 @@ def compact_bins_for_min_distance(bins: List["VehicleBin"], config: RunSheetConf
     restore_state(best_state)
 
 
-def effective_stop_cap_for_bin(bin_obj: "VehicleBin", fallback_stop_cap: int) -> int:
-    return bin_obj.stop_capacity if bin_obj.stop_capacity > 0 else max(0, int(fallback_stop_cap))
+def effective_stop_cap_for_bin(bin_obj: "VehicleBin", fallback_stop_cap: int, config: RunSheetConfig) -> int:
+    base = bin_obj.stop_capacity if bin_obj.stop_capacity > 0 else max(0, int(fallback_stop_cap))
+    if bin_obj.run_number > 1:
+        second_run_cap = int(max(0, safe_float(config.second_run_max_orders, 0.0)))
+        if second_run_cap > 0:
+            if base > 0:
+                return min(base, second_run_cap)
+            return second_run_cap
+    return base
 
 
 def consolidate_sparse_bins(
@@ -528,7 +545,8 @@ def consolidate_sparse_bins(
     if len(active_bins) <= 1:
         return
 
-    min_util = max(0.0, min(100.0, safe_float(config.consolidation_min_utilization_pct, 65.0)))
+    first_run_min_util = max(0.0, min(100.0, safe_float(config.consolidation_min_utilization_pct, 65.0)))
+    second_run_min_util = max(0.0, min(100.0, safe_float(config.second_run_min_utilization_target_pct, first_run_min_util)))
     max_iterations = max(0, int(config.consolidation_iterations))
     if max_iterations <= 0:
         return
@@ -540,7 +558,11 @@ def consolidate_sparse_bins(
         donors = [
             b
             for b in active_bins
-            if b.orders and (len(b.orders) <= 1 or b.utilization_pct < min_util)
+            if b.orders
+            and (
+                len(b.orders) <= 1
+                or b.utilization_pct < (second_run_min_util if b.run_number > 1 else first_run_min_util)
+            )
         ]
         donors.sort(key=lambda b: (len(b.orders), b.utilization_pct))
         if not donors:
@@ -566,7 +588,7 @@ def consolidate_sparse_bins(
                 recipients = [b for b in active_bins if b is not donor and b.orders]
                 best_recipient: Optional[Tuple[float, "VehicleBin"]] = None
                 for recipient in recipients:
-                    local_stop_cap = effective_stop_cap_for_bin(recipient, fallback_stop_cap)
+                    local_stop_cap = effective_stop_cap_for_bin(recipient, fallback_stop_cap, config)
                     order_cbm = get_order_cbm(order)
                     order_weight = get_order_weight(order)
                     if not recipient.can_fit(order_cbm, order_weight, local_stop_cap):
@@ -604,7 +626,7 @@ def enforce_hard_limits_on_bins(
     for bin_obj in bins:
         if not bin_obj.orders:
             continue
-        stop_cap = bin_obj.stop_capacity if bin_obj.stop_capacity > 0 else max(0, int(config.max_stops_per_run))
+        stop_cap = effective_stop_cap_for_bin(bin_obj, max(0, int(config.max_stops_per_run)), config)
 
         while True:
             over_cbm = bin_obj.remaining < -tolerance
@@ -705,13 +727,12 @@ def top_up_bin_to_target_utilization(
     stop_cap: int,
     config: RunSheetConfig,
 ) -> None:
-    target_pct = safe_float(config.min_utilization_target_pct, 0.0)
+    target_pct = get_utilization_target_for_bin(bin_obj, config)
     if target_pct <= 0 or bin_obj.capacity <= 0:
         return
-    target_pct = min(target_pct, 100.0)
     if bin_obj.utilization_pct >= target_pct:
         return
-    local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
+    local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
 
     # First pass: keep strict distance guards.
     while bin_obj.utilization_pct < target_pct:
@@ -772,6 +793,86 @@ def route_proximity_penalty(route_name: str, seed_route: str, route_neighbors: D
     if route_name in neighbors:
         return (neighbors.index(route_name) + 1) * 0.25
     return 3.0
+
+
+def select_second_run_order_ids(
+    orders: List[Dict[str, object]],
+    extra_cbm_target: float,
+    extra_weight_target: float,
+    route_neighbors: Dict[str, List[str]],
+    config: RunSheetConfig,
+) -> set:
+    if extra_cbm_target <= 0 and extra_weight_target <= 0:
+        return set()
+
+    remaining = list(orders)
+    selected_ids: set = set()
+    selected_cbm = 0.0
+    selected_weight = 0.0
+    cluster_limit = max(1, int(max(1.0, safe_float(config.second_run_max_orders, 6.0))))
+    safety = 0
+
+    def load_score(order: Dict[str, object]) -> Tuple[float, float, float]:
+        return (
+            max(0.0, safe_float(order.get("order_load", 0), 0.0)),
+            get_order_cbm(order),
+            get_order_weight(order),
+        )
+
+    while (selected_cbm < extra_cbm_target or selected_weight < extra_weight_target) and remaining:
+        safety += 1
+        if safety > 10000:
+            break
+
+        seed = max(remaining, key=load_score)
+        seed_id = safe_str(seed.get("_order_id", ""), "")
+        if not seed_id:
+            remaining = [o for o in remaining if o is not seed]
+            continue
+
+        if seed_id not in selected_ids:
+            selected_ids.add(seed_id)
+            selected_cbm += get_order_cbm(seed)
+            selected_weight += get_order_weight(seed)
+
+        seed_lat = safe_float(seed.get("lat", 0), 0.0)
+        seed_lon = safe_float(seed.get("lon", 0), 0.0)
+        seed_route = safe_str(seed.get("route", ""), "")
+        cluster_count = 1
+
+        candidates: List[Tuple[float, float, float, Dict[str, object]]] = []
+        for order in remaining:
+            order_id = safe_str(order.get("_order_id", ""), "")
+            if not order_id or order_id in selected_ids:
+                continue
+            lat = safe_float(order.get("lat", 0), 0.0)
+            lon = safe_float(order.get("lon", 0), 0.0)
+            distance = haversine_km(seed_lat, seed_lon, lat, lon)
+            route_penalty = route_proximity_penalty(
+                safe_str(order.get("route", ""), ""),
+                seed_route,
+                route_neighbors,
+            )
+            item_load = max(0.0, safe_float(order.get("order_load", 0), 0.0))
+            candidates.append((distance + (route_penalty * 1.3), -item_load, -get_order_cbm(order), order))
+        candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+
+        for _, _, _, order in candidates:
+            if selected_cbm >= extra_cbm_target and selected_weight >= extra_weight_target:
+                break
+            if cluster_count >= cluster_limit:
+                break
+            order_id = safe_str(order.get("_order_id", ""), "")
+            if not order_id or order_id in selected_ids:
+                continue
+            selected_ids.add(order_id)
+            selected_cbm += get_order_cbm(order)
+            selected_weight += get_order_weight(order)
+            cluster_count += 1
+
+        remaining = [o for o in remaining if safe_str(o.get("_order_id", ""), "") not in selected_ids]
+
+    return selected_ids
 
 
 def parse_kml_route_centroids(kml_path: str) -> Dict[str, Tuple[float, float]]:
@@ -1504,7 +1605,7 @@ def assign_single_first_run_route_first(
     stop_cap = max(0, int(config.max_stops_per_run))
 
     for bin_obj in bins:
-        local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
+        local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
         remaining = [
             o
             for o in first_run_orders
@@ -1659,7 +1760,7 @@ def assign_multi_runs_nearest(
         bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, run_number, config)
         assigned_ids: set = set()
         for bin_obj in bins:
-            local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
+            local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
             if not remaining:
                 break
             seed = max(
@@ -1757,7 +1858,7 @@ def assign_multi_runs_nearest(
                 load_cbm = get_order_cbm(order)
                 load_weight = get_order_weight(order)
                 for bin_obj in bins:
-                    local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap)
+                    local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
                     if bin_obj.can_fit(load_cbm, load_weight, local_stop_cap):
                         bin_obj.add_order(order)
                         assigned_ids.add(order_id)
@@ -1820,9 +1921,29 @@ def assign_scoped_orders(
 
     created_bins: List[VehicleBin] = []
     capacity_unassigned: List[Dict[str, object]] = []
+    first_run_total_capacity = sum(safe_float(v["capacity"], 0.0) for v in vehicle_list)
+    first_run_total_weight_capacity = safe_sum_capacity(
+        [safe_float(v.get("weight_capacity", float("inf")), float("inf")) for v in vehicle_list]
+    )
+    total_demand_cbm = sum(get_order_cbm(o) for o in all_orders)
+    total_demand_weight = sum(get_order_weight(o) for o in all_orders)
+    extra_cbm_target = max(0.0, total_demand_cbm - first_run_total_capacity)
+    extra_weight_target = (
+        max(0.0, total_demand_weight - first_run_total_weight_capacity)
+        if is_finite_positive(first_run_total_weight_capacity)
+        else 0.0
+    )
 
-    # Assign all orders without pre-labeling second-run pool.
-    first_run_orders = list(all_orders)
+    second_run_order_ids = select_second_run_order_ids(
+        all_orders,
+        extra_cbm_target,
+        extra_weight_target,
+        route_neighbors,
+        config,
+    )
+    first_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") not in second_run_order_ids]
+    preselected_second_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") in second_run_order_ids]
+
     first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, 1, config)
     first_run_assigned_ids = assign_single_first_run_route_first(first_run_orders, first_run_bins, route_neighbors, config)
     first_run_overflow = enforce_hard_limits_on_bins(first_run_bins, config)
@@ -1834,7 +1955,7 @@ def assign_scoped_orders(
     remaining_after_first_wave = [
         o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
     ]
-    remaining_pool_raw = remaining_after_first_wave + first_run_overflow
+    remaining_pool_raw = preselected_second_run_orders + remaining_after_first_wave + first_run_overflow
     seen_remaining: set = set()
     remaining_pool: List[Dict[str, object]] = []
     for order in remaining_pool_raw:
