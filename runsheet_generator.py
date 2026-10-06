@@ -106,10 +106,10 @@ class RunSheetConfig:
     max_stops_per_run: int = 23
     nearest_routes_per_seed: int = 8
     min_utilization_target_pct: float = 100.0
-    second_run_min_utilization_target_pct: float = 70.0
+    second_run_min_utilization_target_pct: float = 80.0
     # <=0 means no additional cap on second-run order count (vehicle stops still apply).
     second_run_max_orders: int = 0
-    recycle_first_run_below_utilization_pct: float = 99.0
+    recycle_first_run_below_utilization_pct: float = 80.0
     first_run_strict_same_route: bool = True
     second_run_strict_same_route: bool = True
     # Max dispatch waves per vehicle in the same planning cycle.
@@ -127,7 +127,7 @@ class RunSheetConfig:
     compactness_iterations: int = 6
     compactness_min_improvement_km: float = 0.05
     # Consolidate sparse runsheets by moving orders into nearby feasible fuller runsheets.
-    consolidation_min_utilization_pct: float = 99.0
+    consolidation_min_utilization_pct: float = 80.0
     consolidation_iterations: int = 4
     # Retailer proximity guardrails (set <=0 to disable a guard).
     max_retailer_distance_to_centroid_km: float = 7.0
@@ -1905,26 +1905,16 @@ def assign_multi_runs_nearest(
             local_stop_cap = effective_stop_cap_for_bin(bin_obj, stop_cap, config)
             if not remaining:
                 break
-            if run_number > 1:
-                seed = min(
-                    remaining,
-                    key=lambda o: (
-                        safe_float(o.get("order_load", 0), 0.0),
-                        get_order_cbm(o),
-                        get_order_weight(o),
-                    ),
-                )
-            else:
-                seed = max(
-                    remaining,
-                    key=lambda o: order_capacity_pressure(
-                        o,
-                        bin_obj.capacity,
-                        bin_obj.weight_capacity,
-                        bin_obj.supply_chain,
-                        config,
-                    ),
-                )
+            seed = max(
+                remaining,
+                key=lambda o: order_capacity_pressure(
+                    o,
+                    bin_obj.capacity,
+                    bin_obj.weight_capacity,
+                    bin_obj.supply_chain,
+                    config,
+                ),
+            )
             seed_id = safe_str(seed.get("_order_id", ""), "")
             seed_load_cbm = get_order_cbm(seed)
             seed_load_weight = get_order_weight(seed)
@@ -1971,7 +1961,7 @@ def assign_multi_runs_nearest(
                         util_gap,
                         bottleneck_remaining,
                         score + (0.0 if within_limits else 2.0),
-                        pressure_rank if run_number > 1 else -pressure_rank,
+                        -pressure_rank,
                         order,
                     )
                     if within_limits:
@@ -2011,7 +2001,7 @@ def assign_multi_runs_nearest(
                     supply_chain,
                     config,
                 ),
-                reverse=(run_number <= 1),
+                reverse=True,
             )
             for order in capacity_sorted:
                 order_id = safe_str(order.get("_order_id", ""), "")
@@ -2101,41 +2091,8 @@ def assign_scoped_orders(
         else 0.0
     )
 
-    second_run_order_ids = select_second_run_order_ids(
-        all_orders,
-        extra_cbm_target,
-        extra_weight_target,
-        route_neighbors,
-        config,
-    )
-    preselected_second_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") in second_run_order_ids]
-
-    # 1) Build second runs first from overload-focused nearest-largest clusters.
-    second_seed_bins, second_seed_leftover, second_seed_unassigned = assign_multi_runs_nearest(
-        preselected_second_run_orders,
-        vehicle_list,
-        supply_chain,
-        warehouse_id,
-        segment,
-        2,
-        route_neighbors,
-        config,
-    )
-    created_bins.extend(second_seed_bins)
-    capacity_unassigned.extend(second_seed_unassigned)
-    second_assigned_ids = {
-        safe_str(order.get("_order_id", ""), "")
-        for b in second_seed_bins
-        for order in b.orders
-        if safe_str(order.get("_order_id", ""), "")
-    }
-
-    # 2) Build first runs from orders not already assigned in second runs.
-    first_run_orders = [
-        o
-        for o in all_orders
-        if safe_str(o.get("_order_id", ""), "") not in second_assigned_ids
-    ]
+    # 1) Build first runs from all orders with highest utilization target.
+    first_run_orders = list(all_orders)
     first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, 1, config)
     first_run_assigned_ids = assign_single_first_run_route_first(first_run_orders, first_run_bins, route_neighbors, config)
     first_run_overflow = enforce_hard_limits_on_bins(first_run_bins, config)
@@ -2155,13 +2112,8 @@ def assign_scoped_orders(
     remaining_after_first_wave = [
         o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
     ]
-    unresolved_second_seed_orders = [
-        o for o in preselected_second_run_orders if safe_str(o.get("_order_id", ""), "") not in second_assigned_ids
-    ]
     remaining_pool_raw = (
-        unresolved_second_seed_orders
-        + second_seed_leftover
-        + remaining_after_first_wave
+        remaining_after_first_wave
         + first_run_overflow
         + recycled_first_run_orders
     )
@@ -2174,17 +2126,14 @@ def assign_scoped_orders(
         seen_remaining.add(oid)
         remaining_pool.append(order)
 
-    # 3) Assign remaining orders into additional second runs.
-    next_second_run_number = (
-        max((b.run_number for b in created_bins if b.run_number > 1), default=1) + 1
-    )
+    # 2) Assign remaining orders into additional second runs.
     extra_bins, extra_leftover, extra_unassigned = assign_multi_runs_nearest(
         remaining_pool,
         vehicle_list,
         supply_chain,
         warehouse_id,
         segment,
-        max(2, next_second_run_number),
+        2,
         route_neighbors,
         config,
     )
