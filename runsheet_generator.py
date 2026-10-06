@@ -2107,9 +2107,34 @@ def assign_scoped_orders(
         route_neighbors,
         config,
     )
-    first_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") not in second_run_order_ids]
     preselected_second_run_orders = [o for o in all_orders if safe_str(o.get("_order_id", ""), "") in second_run_order_ids]
 
+    # 1) Build second runs first from overload-focused nearest-largest clusters.
+    second_seed_bins, second_seed_leftover, second_seed_unassigned = assign_multi_runs_nearest(
+        preselected_second_run_orders,
+        vehicle_list,
+        supply_chain,
+        warehouse_id,
+        segment,
+        2,
+        route_neighbors,
+        config,
+    )
+    created_bins.extend(second_seed_bins)
+    capacity_unassigned.extend(second_seed_unassigned)
+    second_assigned_ids = {
+        safe_str(order.get("_order_id", ""), "")
+        for b in second_seed_bins
+        for order in b.orders
+        if safe_str(order.get("_order_id", ""), "")
+    }
+
+    # 2) Build first runs from orders not already assigned in second runs.
+    first_run_orders = [
+        o
+        for o in all_orders
+        if safe_str(o.get("_order_id", ""), "") not in second_assigned_ids
+    ]
     first_run_bins = create_vehicle_bins(vehicle_list, supply_chain, warehouse_id, segment, 1, config)
     first_run_assigned_ids = assign_single_first_run_route_first(first_run_orders, first_run_bins, route_neighbors, config)
     first_run_overflow = enforce_hard_limits_on_bins(first_run_bins, config)
@@ -2129,8 +2154,12 @@ def assign_scoped_orders(
     remaining_after_first_wave = [
         o for o in first_run_orders if safe_str(o.get("_order_id", ""), "") not in first_run_assigned_ids
     ]
+    unresolved_second_seed_orders = [
+        o for o in preselected_second_run_orders if safe_str(o.get("_order_id", ""), "") not in second_assigned_ids
+    ]
     remaining_pool_raw = (
-        preselected_second_run_orders
+        unresolved_second_seed_orders
+        + second_seed_leftover
         + remaining_after_first_wave
         + first_run_overflow
         + recycled_first_run_orders
@@ -2144,14 +2173,17 @@ def assign_scoped_orders(
         seen_remaining.add(oid)
         remaining_pool.append(order)
 
-    # Assign remaining orders to additional runsheets with strict capacity controls.
+    # 3) Assign remaining orders into additional second runs.
+    next_second_run_number = (
+        max((b.run_number for b in created_bins if b.run_number > 1), default=1) + 1
+    )
     extra_bins, extra_leftover, extra_unassigned = assign_multi_runs_nearest(
         remaining_pool,
         vehicle_list,
         supply_chain,
         warehouse_id,
         segment,
-        2,
+        max(2, next_second_run_number),
         route_neighbors,
         config,
     )
