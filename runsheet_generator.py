@@ -107,7 +107,8 @@ class RunSheetConfig:
     nearest_routes_per_seed: int = 8
     min_utilization_target_pct: float = 100.0
     second_run_min_utilization_target_pct: float = 70.0
-    second_run_max_orders: int = 6
+    # <=0 means no additional cap on second-run order count (vehicle stops still apply).
+    second_run_max_orders: int = 0
     recycle_first_run_below_utilization_pct: float = 99.0
     first_run_strict_same_route: bool = True
     second_run_strict_same_route: bool = True
@@ -936,7 +937,7 @@ def select_second_run_order_ids(
     selected_ids: set = set()
     selected_cbm = 0.0
     selected_weight = 0.0
-    cluster_limit = max(1, int(max(1.0, safe_float(config.second_run_max_orders, 6.0))))
+    cluster_limit = int(max(0.0, safe_float(config.second_run_max_orders, 0.0)))
 
     def load_score(order: Dict[str, object]) -> Tuple[float, float, float]:
         return (
@@ -983,7 +984,7 @@ def select_second_run_order_ids(
         for _, _, _, order in scored:
             if selected_cbm >= extra_cbm_target and selected_weight >= extra_weight_target:
                 break
-            if cluster_count >= cluster_limit:
+            if cluster_limit > 0 and cluster_count >= cluster_limit:
                 break
             order_id = safe_str(order.get("_order_id", ""), "")
             if not order_id or order_id in selected_ids:
